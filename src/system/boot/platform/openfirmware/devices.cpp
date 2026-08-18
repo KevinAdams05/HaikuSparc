@@ -101,7 +101,25 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 	} else
 		puts("open kernel succeeded");
 */
-	int handle = of_open(sBootPath);
+	// The boot path may name a file within a filesystem, as in
+	// "/pci@1fe,0/.../disk@0:a,\loader.elf". Opening that path yields an
+	// instance of the *file*, not of the block device, and the partition scan
+	// that follows then issues block reads against a filesystem instance --
+	// which traps inside the firmware rather than failing cleanly.
+	//
+	// Keep the ":partition" suffix, drop the ",file" argument. Note the comma
+	// must be looked for after the last colon: Open Firmware device paths
+	// contain commas of their own, as in "pci@1fe,0".
+	char devicePath[sizeof(sBootPath)];
+	strlcpy(devicePath, sBootPath, sizeof(devicePath));
+	char* deviceArguments = strrchr(devicePath, ':');
+	if (deviceArguments != NULL) {
+		char* file = strchr(deviceArguments, ',');
+		if (file != NULL)
+			file[0] = '\0';
+	}
+
+	int handle = of_open(devicePath);
 	if (handle == OF_FAILED) {
 		puts("\t\t(open failed)");
 		return B_ERROR;

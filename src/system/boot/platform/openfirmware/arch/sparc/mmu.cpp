@@ -25,8 +25,21 @@
 #include "support.h"
 
 
-#define PAGE_READ_ONLY	0x0002
-#define PAGE_READ_WRITE	0x0001
+// Mode passed to the Open Firmware MMU node's "map" method.
+//
+// These were 0x0002 and 0x0001, which are the PowerPC PTE PP protection bits
+// and mean nothing to a sun4u MMU. On UltraSPARC the mode argument is a TTE
+// data value, where bit 1 is Writable (UltraSPARC-IIi User's Manual,
+// FIGURE 15-1) -- so the old constants asked for a read-only mapping when
+// write access was wanted, and every write to the loader's heap took a
+// fast_data_access_protection trap.
+//
+// -1 asks the firmware for its own default mode, which is what SunOS does and
+// what NetBSD copied ("-1/* sunos does this */", sys/arch/sparc64/sparc64/
+// pmap.c). It yields a cacheable, privileged, writable mapping. Spelling out
+// TTE bits by hand would also have to get CP, CV and P right, with no benefit
+// to a loader whose mappings the kernel is about to take over anyway.
+#define PAGE_DEFAULT_MODE	((int64)-1)
 
 // NULL is actually a possible physical address, so use -1 (which is
 // misaligned, so not a valid address) as the invalid physical address.
@@ -160,7 +173,7 @@ is_physical_memory(void *address, size_t size = 1)
 
 
 static bool
-map_range(void *virtualAddress, void *physicalAddress, size_t size, uint16 mode)
+map_range(void *virtualAddress, void *physicalAddress, size_t size, int64 mode)
 {
 	// everything went fine, so lets mark the space as used.
 	int status = of_call_method(sMmuInstance, "map", 5, 0, (uint64)mode, size,
@@ -203,14 +216,9 @@ find_allocated_ranges(void **_exceptionHandlers)
 			return (void*)p;
 		}
 
-		int16_t Mode() {
-			int16_t mode;
-			if (data & 2)
-				mode = PAGE_READ_WRITE;
-			else
-				mode = PAGE_READ_ONLY;
-			return mode;
-		}
+		// Bit 1 of the TTE data is Writable (UltraSPARC-IIi User's Manual,
+		// FIGURE 15-1). Only used for tracing.
+		bool IsWritable() { return (data & 2) != 0; }
 
 		void	*virtual_address;
 		intptr_t length;
@@ -230,9 +238,9 @@ find_allocated_ranges(void **_exceptionHandlers)
 	for (int i = 0; i < length; i++) {
 		struct translation_map *map = &translations[i];
 		bool keepRange = true;
-		TRACE("%i: map: %p, length %ld -> phy %p mode %d: ", i,
+		TRACE("%i: map: %p, length %ld -> phy %p writable %d: ", i,
 			map->virtual_address, map->length,
-			map->PhysicalAddress(), map->Mode());
+			map->PhysicalAddress(), map->IsWritable());
 
 		// insert range in physical allocated, if it points to physical memory
 
@@ -370,11 +378,11 @@ arch_mmu_allocate(void *_virtualAddress, size_t size, uint8 _protection,
 	// we only know page sizes
 	size = ROUNDUP(size, B_PAGE_SIZE);
 
-	uint8 protection = 0;
-	if (_protection & B_WRITE_AREA)
-		protection = PAGE_READ_WRITE;
-	else
-		protection = PAGE_READ_ONLY;
+	// The firmware's default mode is writable, so a read-only request is
+	// simply not honoured here. The loader does not depend on it, and the
+	// kernel installs its own translations shortly afterwards.
+	int64 protection = PAGE_DEFAULT_MODE;
+	(void)_protection;
 
 	// If no address is given, use the KERNEL_BASE as base address, since
 	// that avoids trouble in the kernel, when we decide to keep the region.
