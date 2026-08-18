@@ -251,7 +251,14 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 			}
 			case R_SPARC_RELATIVE:
 			{
-				write_word32(P, B + A);
+				// A 64-bit relocation: on ELF64 the field is a full address, not
+				// a word. Writing only 32 bits of it left the other half of the
+				// slot untouched, and because SPARC is big-endian the value
+				// landed in the *high* half -- so a GOT entry that should have
+				// held 0x80217fc8 held 0x80217fc800000000 instead, and the first
+				// dereference of it faulted. The kernel image carries 1153 of
+				// these relocations, so most of the GOT was wrong.
+				write_word64(P, B + A);
 				break;
 			}
 			case R_SPARC_64:
