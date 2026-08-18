@@ -151,6 +151,46 @@ the **IOMMU's own software-managed TSB** for DVMA — a completely separate tabl
 different TTE format from the CPU MMU's in Chapter 15. That one is not needed until PCI DMA in
 Phase 7, but it should not come as a surprise when it arrives.
 
+#### The failure mode that ends the machine
+
+This is worth stating in full, because it is the specific hazard that makes §4.1 and §4.2
+*compose* into something worse than either alone. PulkoMandy, the port's last active developer,
+named exactly this as the reason he stopped:
+
+> I stopped when I found out how bad the MMU architecture for SPARC is (no hardware page table
+> walk, so everything needs to be done in software, which itself can trigger various other type
+> of exceptions such as register spills and so on)
+
+The mechanism, from the UltraSPARC-IIi User's Manual §14.1.3 (printed p.224):
+
+> UltraSPARC-IIi supports five trap levels; that is, MAXTL=5. […] Traps at MAXTL−1 cause the CPU
+> to enter RED_state. **If a trap is generated while the CPU is operating at TL = MAXTL, the CPU
+> will enter error_state and generate a Watchdog Reset (WDR).**
+
+So the trap budget is finite and shallow. A TLB miss takes us to TL1. If that handler makes a
+call deep enough to spill a register window, that is a second trap at TL2 — and the spill writes
+to a stack that **may itself miss the TLB**, taking a third. Run out of levels and the machine
+does not report an error; it resets.
+
+Three design constraints follow, and they are not negotiable:
+
+- The TLB-miss fast path must be **assembly that cannot fault**: no stack, no calls, only the
+  alternate global registers the hardware swaps in on the way to the handler, touching only
+  memory that is guaranteed mapped. It must also handle the **TL>0 half of the trap table**,
+  which the hardware vectors to separately (`FIGURE 12-4` in the UA2005 spec — a full privileged
+  trap table is 32 KB precisely because TL=0 and TL>0 each get 512 entries).
+- Kernel stacks and the TSB must be mapped by **locked or large-page translations** that cannot
+  themselves miss, or the recursion above is reachable from ordinary code.
+- **Debugging this requires the backtrace to work first.** A window-state bug corrupts silently
+  and kills the machine somewhere unrelated with no diagnostic. That is why Phase 5 starts during
+  Phase 2 rather than after it, and why the QEMU gdb stub (§5.2) is the most valuable tool we
+  have — on real hardware a watchdog reset tells you nothing at all.
+
+None of this is unsolved: OpenBSD's `sparc64/locore.s` and `pmap.c` are a working, battle-tested
+implementation of exactly this, under a licence we can port from (§3.2). But it explains why
+Phase 2 carries the schedule risk, and why it must not be reported as nearly-done until a
+deliberately provoked nested fault has been survived.
+
 ### 4.2 Register windows
 
 ![Register windows and what they mean for context switching](diagrams/register-windows.svg)
