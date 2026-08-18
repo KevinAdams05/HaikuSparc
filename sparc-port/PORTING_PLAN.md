@@ -4,7 +4,8 @@
 **Targets:** Sun Blade 150 and Sun Ultra 10 (`sun4u`, UltraSPARC IIe / IIi), developed against QEMU `sun4u`
 **Status of this document:** initial plan, August 2026. Supersedes the earlier scratch notes in the parent directory.
 
-**Companion documents:** [Hardware support matrix](HARDWARE_MATRIX.md)
+**Companion documents:** [Hardware support matrix](HARDWARE_MATRIX.md) ·
+[Phase 2 MMU design](PHASE2_MMU_DESIGN.md) · [Progress log](PROGRESS.md)
 
 ---
 

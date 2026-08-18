@@ -892,6 +892,8 @@ gate described in the plan's §4.1 and §4.2.
 6. **Allocate and populate a kernel-owned TSB.** §18 settles that this must come first rather
    than after the trap table: `early_map` cannot keep delegating to firmware. Once the TSB
    exists, `early_map` becomes a few stores into it.
+   The mechanism, the sizing, and the QEMU-fidelity verification are all worked out in
+   [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) — read that first.
 7. **Then the trap table and the TLB-miss fast path**, to service misses against our own TSB,
    plus window spill/fill and a real `struct iframe`. Port closely from OpenBSD's `pmap.c` and
    `locore.s` rather than inventing. Open Firmware's own mappings must survive the cutover:
