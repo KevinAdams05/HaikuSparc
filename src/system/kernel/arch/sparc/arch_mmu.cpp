@@ -8,6 +8,7 @@
 
 #include <arch_cpu.h>
 #include <debug.h>
+#include <platform/openfirmware/openfirmware.h>
 
 
 // Address space identifiers for the MMUs
@@ -53,10 +54,16 @@ extern void sparc_get_instruction_tsb(TsbEntry **_pageTable, size_t *_size)
 		: [destination] "=r"(tsbEntry)
 		: [mmuRegister] "r"(tsb));
 
-	*_pageTable = (TsbEntry*)(tsbEntry & ~((1ll << 13) - 1));
-	*_size = 512 * (1 << (tsbEntry & 3)) * sizeof(TsbEntry);
-	if (tsbEntry & (1 << 12))
+	// TSB_Size is a four-bit field, not two: it ranges 0..7, giving 512 to
+	// 65536 entries. Masking with 3 silently reported the wrong size for any
+	// TSB larger than 4096 entries. See FIGURE 15-9, printed p.227.
+	*_pageTable = (TsbEntry*)(tsbEntry & TSB_BASE_MASK);
+	*_size = TSB_ENTRIES(tsbEntry & TSB_SIZE_MASK) * sizeof(TsbEntry);
+	if ((tsbEntry & TSB_SPLIT) != 0) {
+		// When split, TSB_Size gives the size of *each* of the two abutting
+		// TSBs, so the region spans twice that.
 		*_size *= 2;
+	}
 }
 
 
@@ -67,10 +74,79 @@ extern void sparc_get_data_tsb(TsbEntry **_pageTable, size_t *_size)
 		: [destination] "=r"(tsbEntry)
 		: [mmuRegister] "r"(tsb));
 
-	*_pageTable = (TsbEntry*)(tsbEntry & ~((1ll << 13) - 1));
-	*_size = 512 * (1 << (tsbEntry & 3)) * sizeof(TsbEntry);
-	if (tsbEntry & (1 << 12))
+	// TSB_Size is a four-bit field, not two: it ranges 0..7, giving 512 to
+	// 65536 entries. Masking with 3 silently reported the wrong size for any
+	// TSB larger than 4096 entries. See FIGURE 15-9, printed p.227.
+	*_pageTable = (TsbEntry*)(tsbEntry & TSB_BASE_MASK);
+	*_size = TSB_ENTRIES(tsbEntry & TSB_SIZE_MASK) * sizeof(TsbEntry);
+	if ((tsbEntry & TSB_SPLIT) != 0) {
+		// When split, TSB_Size gives the size of *each* of the two abutting
+		// TSBs, so the region spans twice that.
 		*_size *= 2;
+	}
 }
 
 
+
+
+/*!	Dumps the translations Open Firmware currently has installed.
+
+	These are the mappings the kernel inherits and, crucially, the ones that
+	must be carried into its own TSB before %tba is repointed: Open Firmware's
+	trap handlers are servicing every TLB miss the kernel takes right now, and
+	they stop being reachable the moment the kernel takes over. Knowing exactly
+	what is in that set -- with real physical addresses and modes rather than
+	the virtual ranges kernel_args carries -- is the input to that cutover.
+
+	Read from the firmware rather than from kernel_args because
+	arch_kernel_args only records virtual_ranges_to_keep, which has no physical
+	address and no mode.
+*/
+void
+sparc_dump_openfirmware_translations()
+{
+	int mmuInstance;
+	if (of_getprop(gChosen, "mmu", &mmuInstance, sizeof(int)) == OF_FAILED) {
+		dprintf("sparc_mmu: no Open Firmware mmu instance\n");
+		return;
+	}
+
+	intptr_t mmu = of_instance_to_package(mmuInstance);
+	if (mmu == OF_FAILED) {
+		dprintf("sparc_mmu: cannot resolve the mmu package\n");
+		return;
+	}
+
+	// Same layout the boot loader parses: virtual address, length, and the
+	// TTE data half.
+	struct translation {
+		void*		virtual_address;
+		intptr_t	length;
+		intptr_t	data;
+	} translations[64];
+
+	int length = of_getprop(mmu, "translations", &translations,
+		sizeof(translations));
+	if (length == OF_FAILED) {
+		dprintf("sparc_mmu: no \"translations\" property\n");
+		return;
+	}
+
+	length /= sizeof(struct translation);
+	dprintf("sparc_mmu: %d Open Firmware translations to preserve:\n", length);
+
+	for (int i = 0; i < length; i++) {
+		struct translation* map = &translations[i];
+		uint64 data = (uint64)map->data;
+
+		dprintf("  va %#18lx len %#10lx -> pa %#12llx  %c%c%c%c%c size %d\n",
+			(addr_t)map->virtual_address, (long)map->length,
+			(unsigned long long)(data & TTE_PA_MASK),
+			(data & TTE_VALID) != 0 ? 'v' : '-',
+			(data & TTE_WRITABLE) != 0 ? 'w' : '-',
+			(data & TTE_PRIVILEGED) != 0 ? 'p' : '-',
+			(data & TTE_LOCKED) != 0 ? 'l' : '-',
+			(data & TTE_GLOBAL) != 0 ? 'g' : '-',
+			(int)((data >> TTE_SIZE_SHIFT) & TTE_SIZE_MASK));
+	}
+}

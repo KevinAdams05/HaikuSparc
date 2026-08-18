@@ -11,6 +11,7 @@
 
 
 #include <KernelExport.h>
+#include <arch_mmu.h>
 #include <kernel.h>
 #include <platform/openfirmware/openfirmware.h>
 #include <vm/vm.h>
@@ -67,6 +68,11 @@ arch_vm_translation_map_init(kernel_args *args,
 		TRACE("  %#10" B_PRIxADDR " - %#10" B_PRIxADDR "\n", start, end);
 	}
 #endif
+
+	// What Open Firmware currently has mapped, with physical addresses and
+	// modes. This is the set that has to be carried into the kernel's own TSB
+	// before %tba is repointed -- see sparc-port/PHASE2_MMU_DESIGN.md.
+	sparc_dump_openfirmware_translations();
 
 	return B_OK;
 }
