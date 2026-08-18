@@ -70,6 +70,47 @@ python3 make-sun-image.py --payload fs.ext2 --output disk.img --start-cylinder 1
 python3 make-sun-image.py --inspect disk.img
 ```
 
+## `gdb-kernel.sh`
+
+Boots the kernel under QEMU with gdb attached and the serial console driven automatically. The
+workhorse for Phase 2.
+
+```sh
+./gdb-kernel.sh                                    # interactive
+./gdb-kernel.sh --interrupt-on 'Unhandled Exception' \
+    --batch 'continue; info registers pc; bt'      # scripted
+./gdb-kernel.sh --cpu iie                          # as a Blade 150
+```
+
+**Read PROGRESS.md §14 before relying on this.** In short: `set endian big` is mandatory or every
+register reads byte-swapped; the kernel's symbols load with `symbol-file`, *not*
+`add-symbol-file … 0x80000000`; QEMU halts on an unhandled trap without telling gdb, hence
+`--interrupt-on`; and **breakpoints on kernel addresses never fire**, software or hardware. For
+trap and MMU work use QEMU's tracing instead:
+
+```sh
+qemu-system-sparc64 ... -d int,mmu -D trace.log
+```
+
+which logs every trap with the complete register file, window state and `tbr`.
+
+## `serial-driver.py`
+
+Drives the Open Firmware prompt and Haiku's boot menu over a Unix socket, so serial is available
+while gdb owns the terminal. Steps wait on patterns rather than sleeping, because the loader's
+device scan takes a variable number of seconds.
+
+```sh
+serial-driver.py --socket /tmp/ser.sock --log serial.log --script boot-kernel
+```
+
+Scripts: `boot-kernel` (all the way into the kernel), `boot-loader` (stop at the menu),
+`of-prompt`. Extend any of them with `--expect`/`--send` pairs.
+
+Two things it has to compensate for: the menu embeds ANSI escapes *inside* the strings worth
+matching on (`Current: <ESC>[0mHaiku`), and those escapes straddle socket reads, so patterns are
+matched against a stripped copy with partial escapes carried between chunks.
+
 ## `style-check.py`
 
 Haiku coding-style checker scoped to this fork's own code — full files for what we wrote, only

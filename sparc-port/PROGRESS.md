@@ -497,16 +497,110 @@ The cdrom and floppy media are the empty-drive workarounds from §7a, not option
 
 ---
 
+## 14. Debugging the kernel: what works, and what does not
+
+`tools/gdb-kernel.sh` boots the kernel with gdb attached and serial driven
+automatically by `tools/serial-driver.py`. Four things about this were learned the hard way and
+every one of them will waste an afternoon if forgotten.
+
+### `set endian big` is mandatory
+
+`set architecture sparc:v9` alone is not enough. Without the explicit endian setting **every
+register reads byte-swapped**: the reset PC appears as `0x200000f0ff010000` instead of
+`0x1fff0000020`, which is the sun4u reset vector. Reversing those bytes by hand is how the
+problem was spotted, and nothing about the symptom says "endianness".
+
+### `symbol-file`, never `add-symbol-file kernel 0x80000000`
+
+The kernel is an ELF `DYN`, which invites the assumption that it needs relocating for gdb. It
+does not: it is *linked* at `KERNEL_LOAD_BASE` and `nm` shows absolute `0x8000xxxx` addresses.
+Passing `0x80000000` to `add-symbol-file` relocates on top of that, and gdb then reports **wrong
+symbols silently** — `0x800f36c0` resolved to `inet_ntop` rather than `create_debug_alloc_pool`.
+Cross-checking one address against `addr2line` is what caught it.
+
+### QEMU halts on an unhandled trap but does not tell gdb
+
+The console prints `Stopping execution`, the CPU stops, and gdb sits in `continue` forever. Hence
+`--interrupt-on PATTERN`: a watcher greps the serial log and sends gdb `SIGINT` once the pattern
+appears, which interrupts the target and, in batch mode, carries on with the remaining commands.
+
+Note that by the time `Unhandled Exception` is printed the machine is already spinning in
+OpenBIOS's error handler at `0x1fff000d914` (`b .` at the RED_state vector), so the faulting
+context is gone from the CPU. `%g1` there holds the trap type, which is a small consolation.
+
+### Breakpoints on kernel addresses do not work at all
+
+Neither software (`break`) nor hardware (`hbreak`) breakpoints on kernel addresses ever fire.
+gdb accepts both without complaint. The kernel is not in memory when gdb attaches at reset, so
+software breakpoint insertion cannot write the trap instruction, and QEMU's sparc64 stub appears
+to accept hardware breakpoint requests without implementing them. Setting them later loses a race
+against the loader, which jumps into the kernel within milliseconds of printing `video mode:`.
+
+**So do not plan Phase 2 around breakpoints.** Two things work instead:
+
+1. **`-d int,mmu` tracing**, which is better than a breakpoint for this work anyway — see below.
+2. **A deliberate spin loop** at the point of interest, then `--interrupt-on` and inspect. Ugly,
+   deterministic, and reliable.
+
+### `-d int,mmu` is the real Phase 2 instrument
+
+`qemu-system-sparc64 -d int,mmu -D trace.log` logs every trap with the **complete** register
+file, and that is exactly what trap-table and window work needs. The fault we are stuck on, in
+full:
+
+```
+172300: Data Access Fault (v=0030)
+pc: 00000000800f36c0  npc: 00000000800f36c4
+%g0-3: 0000000000000000 00000000000003ff 0000000000000401 80217fc800000000
+%g4-7: 80217fc7fffffff8 0000000000000000 0000000000000000 00000000802106d8
+pstate: 00000014  asi: 00  tl: 0  pil: 0  gl: 2
+tbr: 00000000ffd00000
+cansave: 0 canrestore: 6 otherwin: 0 wstate: 0 cleanwin: 7 cwp: 1
+fprs: 0000000000000005
+```
+
+Three things to read out of that:
+
+- The faulting instruction is `ld [%g3], %g2`, and **`%g3` is `0x80217fc800000000`** — which is
+  `0x80217fc8` shifted left by 32. `0x80217fc8` is a plausible kernel address, and `%g4` holds
+  the same value minus 8. So a 64-bit address is being assembled or moved wrongly, not merely
+  pointing somewhere unmapped.
+- **`tbr` is still `0xffd00000`** — Open Firmware's trap table. The kernel has installed none,
+  which is precisely the Phase 2 work; even a legitimate TLB miss here would have no handler.
+- `fprs: 5` confirms the loader's FPU enable (§7a) survives into the kernel. `gl: 2` is worth a
+  second look: the IIi has no GL register, so either QEMU is modelling it regardless or the
+  kernel is running in a global-register set it did not intend, which would neatly explain a
+  corrupt `%g3`.
+
+### One real bug found and fixed along the way
+
+`arch_elf.cpp`'s `R_SPARC_WDISP30` case had **no `break`** and fell through into
+`R_SPARC_HI22`/`LM22`, OR-ing a second unrelated value into the same instruction word. The kernel
+image carries **196 WDISP30 relocations**, so 196 call displacements were being corrupted. Fixed.
+It did not change this particular fault, so it was not the cause here — but it was silently
+corrupting call targets and would have caused something eventually.
+
+### Leads for the fault, not yet followed
+
+Both NetBSD and OpenBSD build their sparc64 kernels with **`-mno-fpu`**
+(`conf/Makefile.sparc64`), and Haiku does not. Haiku does match NetBSD on `-mcmodel=medlow`.
+Whether the kernel should use the FPU at all is worth deciding deliberately rather than by
+default.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
 gate described in the plan's §4.1 and §4.2.
 
-1. **Attach gdb.** Now the single highest-value task. `--gdb` on the harness, then
-   `gdb-multiarch`, `set architecture sparc:v9`, `target remote :1234`, and
-   `add-symbol-file kernel_sparc 0x80000000`. Phase 2 is trap-table and MMU assembly, and this is
-   the only way to see `%tba`, `CANSAVE` and TSB state. Do this before writing any of it.
-2. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
+1. ~~Attach gdb~~ — **done, see §14.** `tools/gdb-kernel.sh` boots the kernel with gdb attached
+   and serial automated. Read §14 before using it: breakpoints do not work, and `-d int,mmu`
+   tracing is the instrument that does.
+2. **Chase the `%g3` corruption in §14.** The faulting address is a valid kernel address shifted
+   left by 32 bits, which is a bug with a specific cause rather than a missing feature. Decide
+   the `gl: 2` question and the `-mno-fpu` question while in there.
+3. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
    TSB allocation, the TLB-miss fast path, demap and invalidate, `early_map` and `create_map`.
    Ships as one unit. Port OpenBSD's `pmap.c` (2-clause BSD) closely rather than inventing.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts

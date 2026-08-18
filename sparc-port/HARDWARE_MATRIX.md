@@ -190,15 +190,25 @@ bindings. Nothing in Phase 2 through Phase 6 is waiting on a document.
 
 **The two remaining gaps are both Phase 7 device work**, and both are ordinary PCI IDE parts:
 
-| Missing | Needed for | Status |
+| Part | Needed for | Status |
 | --- | --- | --- |
-| CMD646 datasheet | Ultra 5/10 IDE | Not found in public archives. CMD Technology was absorbed by Silicon Image. |
-| ALi M1535D+ / M5229 datasheet | Blade 100/150 IDE, USB, audio | Not found. |
+| CMD646 | Ultra 5/10 IDE | ✅ **`Storage/IDE/CMD_PCI0646_PCI-IDE_Spec_Rev1.2.pdf`** — the real chip specification, MAN-000646-000 Rev 1.2, Dec 1995. Pin definitions, base address registers, PCI config, and IDE timing registers. Added 2026-08-18. |
+| ALi M1535D+ / M5229 | Blade 100/150 IDE, USB, audio | ⚠️ **product brief only** — `Chipset/ALi/ALi_M1535D+_ProductBrief.pdf`. Four marketing pages, no register map. |
 
-Neither is likely to block: both are conventional PCI IDE controllers covered by the ATA
-specification, and OpenBSD's `pciide.c` plus Linux's drivers document their quirks in code. If
-either turns out to need real documentation, they are the two items worth hunting on eBay or in
-the vintage-hardware archives.
+The ALi brief is not a datasheet, but it is not worthless either: it confirms the Blade 150's
+peripheral set in the vendor's own words — *"2-channel dedicated UDMA/ATA-100 IDE Master
+controller, 2 USB controllers, SMBus controller, PS/2 Keyboard/Mouse controller, the Super I/O
+(Floppy Disk Controller, 2 serial port/1 parallel port)"*, plus an AC'97 audio controller. That
+upgrades several 📘 entries in §4 to vendor-confirmed, and settles that the M5229 IDE seen by
+OpenBSD is a PCI function of the M1535D+ rather than a separate part.
+
+Also in the library and **not relevant to this port**, filed for completeness only:
+`ALi_M1535_ProductBrief.pdf` (the predecessor southbridge) and the M1644, M1646 and M1651T
+briefs, which are x86 northbridges for Pentium II/III and Athlon with Trident graphics.
+
+**Still wanted:** a real ALi M5229 or M1535D+ *datasheet* with register-level detail. It is a
+Phase 7 item and unlikely to block — the M5229 is a conventional PCI IDE controller, covered by
+the ATA specification, and OpenBSD's `pciide.c` documents its quirks in code.
 
 ---
 
