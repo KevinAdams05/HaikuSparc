@@ -345,51 +345,83 @@ translate_key(char escapeCode)
 }
 
 
+/*!	Reads a single character, or -1 if none is available.
+
+	Asking the firmware for more than one byte at a time is not safe. Open
+	Firmware's "read" returns however many bytes it has, and some
+	implementations reject a multi-byte request outright -- OpenBIOS answers a
+	3-byte read with "pc_serial_read: bad len", printed to the console itself,
+	so a key poll produced a warning that then had to be read back as input.
+	A one-byte request is what every implementation supports.
+*/
+static int
+read_char(bool wait)
+{
+	char character;
+	for (;;) {
+		ssize_t bytesRead = sConsole.ReadAt(NULL, 0, &character, 1);
+		if (bytesRead < 0)
+			return -1;
+		if (bytesRead > 0)
+			return (unsigned char)character;
+		if (!wait)
+			return -1;
+	}
+}
+
+
+/*!	Reads one keypress, decoding the ESC [ X sequences for the cursor keys.
+
+	Returns 0 if \a wait is false and nothing is pending.
+*/
+static int
+read_key(bool wait)
+{
+	int first = read_char(wait);
+	if (first < 0)
+		return 0;
+	if (first != 27)
+		return first;
+
+	// Possibly an escape sequence. The remaining bytes of a real one are
+	// already in flight, so poll briefly rather than blocking -- a bare escape
+	// must not hang the menu.
+	const int kRetries = 1000;
+
+	int second = -1;
+	for (int i = 0; i < kRetries && second < 0; i++)
+		second = read_char(false);
+	if (second < 0)
+		return 27;
+	if (second != '[') {
+		char pending = (char)second;
+		sConsole.PutBackChars(&pending, 1);
+		return 27;
+	}
+
+	int third = -1;
+	for (int i = 0; i < kRetries && third < 0; i++)
+		third = read_char(false);
+	if (third < 0)
+		return 27;
+
+	return translate_key((char)third);
+}
+
+
 int
 console_wait_for_key(void)
 {
-	// wait for a key
-	char buffer[3];
-	ssize_t bytesRead;
-	do {
-		bytesRead = sConsole.ReadAt(NULL, 0, buffer, 3);
-		if (bytesRead < 0)
-			return 0;
-	} while (bytesRead == 0);
-
-	// translate the ESC sequences for cursor keys
-	if (bytesRead == 3 && buffer[0] == 27 && buffer[1] == 91) {
-		int key = translate_key(buffer[2]);
+	for (;;) {
+		int key = read_key(true);
 		if (key != 0)
 			return key;
 	}
-
-	// put back unread chars
-	if (bytesRead > 1)
-		sConsole.PutBackChars(buffer + 1, bytesRead - 1);
-
-	return buffer[0];
 }
 
 
 int
 console_check_for_key(void)
 {
-	char buffer[3];
-	ssize_t bytesRead = sConsole.ReadAt(NULL, 0, buffer, 3);
-	if (bytesRead <= 0)
-		return 0;
-
-	// translate the ESC sequences for cursor keys
-	if (bytesRead == 3 && buffer[0] == 27 && buffer[1] == 91) {
-		int key = translate_key(buffer[2]);
-		if (key != 0)
-			return key;
-	}
-
-	// put back unread chars
-	if (bytesRead > 1)
-		sConsole.PutBackChars(buffer + 1, bytesRead - 1);
-
-	return buffer[0];
+	return read_key(false);
 }

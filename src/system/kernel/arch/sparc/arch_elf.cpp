@@ -183,6 +183,11 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 			case R_SPARC_WDISP30:
 			{
 				write_hi30(P, S + A - P);
+				break;
+					// Without this the case fell through into HI22/LM22 below,
+					// which then OR'd a second, unrelated value into the same
+					// instruction word -- corrupting the call displacement. The
+					// kernel image carries 196 of these relocations.
 			}
 			case R_SPARC_HI22:
 			case R_SPARC_LM22:
