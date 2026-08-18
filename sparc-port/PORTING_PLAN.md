@@ -333,16 +333,33 @@ Each phase below states what it delivers, which files it touches, and a **falsif
 criterion**. A phase is not done because the code is written; it is done because the criterion
 is demonstrated over a serial log.
 
-### Phase 0 — Environment and a reproducible boot
+### Phase 0 — Environment and a building toolchain  **[SUBSTANTIALLY DONE]**
 
-Fork Haiku into the repo. Build the cross toolchain and the loader. Install `qemu-system-sparc`.
-Write the launch-and-capture script. Prove the gdb stub attaches and can break on the loader's
-entry point.
+Fork Haiku. Build the cross toolchain and the loader. Write the launch-and-capture script. Prove
+the gdb stub attaches.
 
-**Files:** none in Haiku — tooling only, under `tools/`.
-**Exit:** the loader prints its banner over serial in QEMU from a single scripted command, and
-gdb can break on `arch_start_kernel`.
-**Risk: low.**
+**Files:** tooling under `sparc-port/tools/`, plus whatever it takes to make the loader compile.
+**Exit:** `haiku_loader.openfirmware` builds clean, and QEMU boots OpenBIOS to the `ok` prompt
+under script control.
+**Risk: low** — and it held.
+
+Done so far: fork with `master`/`sparc/main` split and `rerere`; GCC 13.3.0 cross toolchain for
+`sparc64-unknown-haiku`; `jam` built from buildtools; `qemu-sun4u.sh` verified booting OpenBIOS
+v1.1 as both target CPUs.
+
+> **Correction to this plan's original sequencing.** Phase 0's exit criterion was first written
+> as *"the loader prints its banner over serial."* That was wrong: it depends on Phase 1. Open
+> Firmware will not execute the loader until it is packaged as boot media, because the loader is
+> an Open Firmware *client program* — its `_start` takes the OF entry point as its fifth
+> argument, which only a real `boot` sets up. QEMU's `-kernel` bypasses that and jumps to a bad
+> entry. Building the loader and running it are two different milestones.
+
+**The loader did not build from upstream master.** Four `-Werror` failures had to be fixed
+first — see [UPSTREAM_DELTA.md](UPSTREAM_DELTA.md). Three are architecture-neutral, so the
+Open Firmware loader is bit-rotted for PowerPC too, not merely for us. Worth knowing before
+trusting any other "this part already works" claim about this port.
+
+**Remaining:** prove `gdb-multiarch` attaches to the QEMU stub and breaks somewhere useful.
 
 ### Phase 1 — Bootable media
 
@@ -351,8 +368,22 @@ path. Netboot is worth doing even though it seems like the harder option: it is 
 iteration loop on real hardware, and the OF bootloader already has a `network.cpp`.
 
 **Files:** `build/jam/` image rules, plus a standalone image-assembly tool under `tools/`.
-**Exit:** both `boot disk` and `boot net` reach the loader unattended, in QEMU and on hardware.
+**Exit:** both `boot disk` and `boot net` reach the loader unattended, in QEMU and on hardware —
+and the loader prints its banner, which is the milestone Phase 0 was originally mis-credited with.
 **Risk: medium** — the disklabel geometry and boot-block offsets are fiddly and poorly documented.
+
+**What the first attempts already established.** The build emits an **a.out** image, not ELF
+(magic `0x009c0107`, OMAGIC, `a_entry` 0x00202000) — consistent with `sparcbootblock.h` in the
+tree, and a format OpenBIOS does accept. Two paths were tried and both failed informatively:
+
+- `qemu -kernel` loads it and reports `[sparc64] Kernel already loaded`, then traps at PC 0.
+  Expected: it does not establish the OF client calling convention.
+- `boot net` over QEMU's built-in TFTP reaches `Trying net...` and then
+  `No valid state has been set by load or init-program` — OpenBIOS fetched nothing it would run.
+
+So the open question for this phase is narrow and concrete: what exactly does OpenBoot, and
+OpenBIOS, require of this a.out image and of the media around it. That is a far better starting
+position than "produce bootable media somehow."
 
 ### Phase 2 — MMU and trap table ★ THE GATE
 
