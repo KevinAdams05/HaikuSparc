@@ -177,6 +177,8 @@ Intel NIC document) ✅.
 | Host bridge (sabre) | **`SPARC/UltraSPARC-IIi/manual.pdf`** — sabre is *on-die*, so its host PCI bridge and IOMMU are chapters of the CPU manual, not a separate document. Chapter 10 covers the IOMMU including its own software-managed TSB and TTE format. | ✅ — **an earlier revision of this table wrongly listed this as a gap** |
 | Ultra 5 chassis, connectors, part numbers | `SPARC/Systems/Ultra5_Service_Manual_805-7763-12.pdf` | ✅ added 2026-08-18 |
 | Blade 150 setup, ports, jumpers | `SPARC/Systems/SunBlade150_Getting_Started_816-1161-10.pdf` | ✅ added 2026-08-18 |
+| Ultra 5/10 system architecture | `SPARC/Systems/Sun Ultra 5 and Ultra 10 Workstation Architecture Technical White Paper (May 2001).pdf` | ✅ — architecture-level. Confirms PCI EIDE (up to three internal devices) and built-in PGX24 graphics, but **names no chips**: no sabre, simba, PCIO or CMD646. Our chip identifications remain sourced from OpenBSD's drivers. |
+| **Sourcing and repair reference** | `SPARC/Systems/Sun Field Engineer Handbook Volume 1 (800-4006-19, Sep 2000).pdf` and `Volume 2` | ✅ — per-machine part numbers, CPU module speeds, memory configurations and graphics options. **The most useful of the new additions for buying hardware.** Predates the Blade 150, so covers the Ultra 10 but not the Blade. |
 | Ultra 5/10 south bridge | `SPARC/PCIO-manual-802-7837.pdf` + `PCIO-datasheet-802-7836.pdf` | ✅ |
 | hme ethernet core | `SPARC/FEPS.pdf`, `FEPS_STP2002QFP_datasheet.pdf`, `STP2002QFP-FEPs_UG.pdf` | ✅ excellent |
 | Blade 100/150 south bridge | **nothing** — no ALi M1535D+ or M5229 documentation | ⚠️ **gap** |
