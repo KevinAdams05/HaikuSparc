@@ -278,69 +278,83 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 /*!	Checks that our index arithmetic agrees with the hardware's.
 
 	This is the one property the whole fast path rests on: the miss handler
-	will take a pointer straight out of ASI_DMMU_TSB_8KB_PTR and expect to find
+	takes a pointer straight out of ASI_DMMU_TSB_8KB_PTR and expects to find
 	there whatever software put in. If the two disagree by so much as a bit,
 	every lookup misses, the slow path runs for everything, and the symptom is
 	a mysteriously slow machine rather than an obvious fault.
 
-	Rather than re-derive the formula and compare it with itself, use the
-	firmware's TSB as an oracle. Open Firmware's miss handler uses the same
-	hardware pointer, so its TSB is laid out the way the hardware expects.
-	Index into it with our arithmetic and see whether the tags land where they
-	should.
+	Asking the hardware directly is the only real test. Program the TSB
+	register, set the Tag Access register to a chosen virtual address, and read
+	back the pointer the hardware forms; then compare it with the entry address
+	sparc_tsb_insert() would use for the same address.
+
+	This is safe to do here. Open Firmware keeps both TSB registers at zero --
+	it walks its translation list in software and never uses the hardware TSB
+	mechanism -- so programming them disturbs nothing. Tag Access is rewritten
+	by the hardware on every MMU trap anyway. Both are restored regardless.
 */
 void
 sparc_verify_tsb_indexing()
 {
-	uint64_t rawInstruction;
-	uint64_t rawData;
-	asm("ldxa [%[reg]] 0x50, %[dest]"
-		: [dest] "=r"(rawInstruction) : [reg] "r"(tsb));
-	asm("ldxa [%[reg]] 0x58, %[dest]"
-		: [dest] "=r"(rawData) : [reg] "r"(tsb));
-	dprintf("sparc_mmu: firmware TSB registers: I %#018llx  D %#018llx\n",
-		(unsigned long long)rawInstruction, (unsigned long long)rawData);
+	uint64_t savedTsb;
+	asm volatile("ldxa [%[reg]] 0x58, %[dest]"
+		: [dest] "=r"(savedTsb) : [reg] "r"(tsb));
 
-	TsbEntry* firmwareTsb;
-	size_t size;
-	sparc_get_data_tsb(&firmwareTsb, &size);
+	dprintf("sparc_mmu: firmware TSB registers: D %#018llx%s\n",
+		(unsigned long long)savedTsb,
+		savedTsb == 0 ? " (unused, so free to program)" : "");
 
-	if (rawData == 0 || firmwareTsb == NULL || size == 0) {
-		// Not a failure, and worth knowing: it means the firmware services its
-		// own TLB misses without the hardware TSB mechanism at all, walking
-		// its translation list in software instead. The practical consequence
-		// is good -- the TSB registers are ours to program without disturbing
-		// anything the firmware depends on.
-		dprintf("sparc_mmu: firmware does not use a hardware TSB; the TSB "
-			"registers are free\n");
+	if (sKernelTsb == NULL)
 		return;
+
+	uint64_t tsbRegister = (uint64_t)(addr_t)sKernelTsb | TSB_SPLIT
+		| KERNEL_TSB_SIZE;
+
+	static const addr_t kProbes[] = {
+		0x80000000,		// the kernel image
+		0x81000000,		// where early_map starts handing out addresses
+		0xfd000000,		// the frame buffer
+		0xffd00000,		// Open Firmware's own code
+	};
+
+	uint32 mismatches = 0;
+	for (size_t i = 0; i < sizeof(kProbes) / sizeof(kProbes[0]); i++) {
+		addr_t va = kProbes[i];
+		uint64_t pointer;
+
+		// Kept as one block so nothing can take a TLB miss between setting Tag
+		// Access and reading the pointer back -- the hardware would overwrite
+		// Tag Access on its way into the miss handler.
+		asm volatile(
+			"stxa %[tsbValue], [%[tsbReg]] 0x58\n\t"
+			"membar #Sync\n\t"
+			"stxa %[tagValue], [%[tagReg]] 0x58\n\t"
+			"membar #Sync\n\t"
+			"ldxa [%[zero]] 0x59, %[result]\n\t"
+			"stxa %[savedValue], [%[tsbReg]] 0x58\n\t"
+			"membar #Sync"
+			: [result] "=&r"(pointer)
+			: [tsbValue] "r"(tsbRegister), [tagValue] "r"((uint64_t)va),
+			  [savedValue] "r"(savedTsb), [tsbReg] "r"(tsb),
+			  [tagReg] "r"(tlb_tag_access), [zero] "r"(0UL)
+			: "memory");
+
+		addr_t expected = (addr_t)&sKernelTsb[(va >> 13)
+			& (KERNEL_TSB_ENTRIES - 1)];
+
+		bool ok = (addr_t)pointer == expected;
+		if (!ok)
+			mismatches++;
+
+		dprintf("  va %#12lx -> hardware %#12llx  software %#12lx  %s\n", va,
+			(unsigned long long)pointer, expected, ok ? "match" : "MISMATCH");
 	}
 
-	uint32 entries = size / sizeof(TsbEntry);
-	dprintf("sparc_mmu: firmware data TSB at %p, %" B_PRIu32 " entries\n",
-		firmwareTsb, entries);
-
-	// Walk the firmware's TSB and confirm that every valid entry is stored at
-	// the index our arithmetic computes from the virtual address its own tag
-	// encodes. The tag holds VA<63:22>, so it only pins the address down to a
-	// 4 MB region -- enough to catch a wrong shift or mask, which is what this
-	// is guarding against.
-	uint32 checked = 0;
-	uint32 mismatched = 0;
-	for (uint32 i = 0; i < entries; i++) {
-		if (!firmwareTsb[i].IsValid())
-			continue;
-
-		addr_t va = (firmwareTsb[i].fTag & 0x3ffffffffffULL) << 22;
-		uint32 expected = (va >> 13) & (entries - 1);
-
-		checked++;
-		// Only the bits above 21 survive in the tag, so compare the part of
-		// the index those bits determine.
-		if ((expected & ~0x1ffULL) != (i & ~0x1ffULL))
-			mismatched++;
+	if (mismatches == 0) {
+		dprintf("sparc_mmu: index arithmetic agrees with the hardware\n");
+	} else {
+		panic("sparc_mmu: TSB index arithmetic disagrees with the hardware on "
+			"%" B_PRIu32 " of %" B_PRIuSIZE " probes", mismatches,
+			sizeof(kProbes) / sizeof(kProbes[0]));
 	}
-
-	dprintf("sparc_mmu: index check: %" B_PRIu32 " valid entries, %" B_PRIu32
-		" disagree with our arithmetic\n", checked, mismatched);
 }
