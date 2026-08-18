@@ -30,6 +30,16 @@ FUNCTION(arch_start_kernel):
 	// Current CPU is always 0 on boot
 	mov %g0, %o1
 
+	// Enter the kernel with interrupts disabled, which is what it expects:
+	// smp_trap_non_boot_cpus() asserts !are_interrupts_enabled() before the
+	// kernel has any means of reporting the failure. Open Firmware runs with
+	// them enabled and nothing else clears them on the way in, so the very
+	// first assertion the kernel makes used to fail.
+	// PSTATE.IE is bit 1 (UltraSPARC-IIi User's Manual, TABLE 14-12).
+	rdpr %pstate, %g1
+	andn %g1, 2, %g1
+	wrpr %g1, 0, %pstate
+
 	// Jump into the kernel, store return address in o7
 	jmpl %i1, %o7
 	nop // branch delay slot...
