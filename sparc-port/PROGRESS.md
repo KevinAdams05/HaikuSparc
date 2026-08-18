@@ -814,6 +814,65 @@ teardown to get right, and there are two thousand calls to prove it against.
 
 ---
 
+## 18. `early_map` implemented — and what it proves about Phase 2
+
+### The approach
+
+`arch_vm_translation_map_early_map()` now asks **Open Firmware** to create the mapping, via the
+MMU node's `map` method, exactly as the boot loader does.
+
+The reasoning is about who is servicing TLB misses at that moment. `%tba` is still Open
+Firmware's — the kernel has installed no trap table — so writing a TTE straight into the TLB
+would work only until that entry was evicted, at which point the miss would be handed to a
+firmware handler that had never heard of it. Asking the firmware to make the mapping puts it in
+the tables its own handler consults, so it survives eviction. That is also what makes these
+mappings "early": they belong to the window before the kernel owns the MMU.
+
+### It works, and moves the kernel forward
+
+The fault moved from `MemoryManager::_AllocateArea` to **`vm_page_init`** — further into VM
+initialisation, on memory that is now genuinely mapped.
+
+### But it does not scale, and that is the useful finding
+
+```
+early_tmap calls:        2688
+mappings that succeeded: ~1348
+then: out of malloc memory (10010)!
+      Unable to allocate memory for translations property!   (x1340)
+```
+
+**OpenBIOS rebuilds its `translations` property on every `map` call**, so the cost is quadratic
+in the number of mappings and its heap runs dry after roughly 1300 — about half of what a boot
+needs.
+
+Two obvious workarounds were considered and both are unsafe:
+
+- **Coalescing adjacent pages into one larger call.** `vm_allocate_early()` maps an entire
+  allocation and only then returns the address, so a deferred flush would land *after* the memory
+  had been used. Each allocation starts a fresh virtual run, so the flush could not be triggered
+  by the next call either.
+- **Mapping ahead.** That would create translations for virtual addresses the VM has not handed
+  out, which it would later map elsewhere — a stale-mapping conflict rather than a saving.
+
+Also worth knowing: OF's `map` **returns nothing**, so a firmware that declines a mapping does so
+silently. The failures above are visible only because OpenBIOS prints to the console. Nothing in
+the client interface reports them.
+
+### What this settles about Phase 2
+
+It removes an attractive-looking shortcut. Delegating the MMU to firmware indefinitely is not
+viable — not because of anything SPARC-specific, but because the firmware's bookkeeping is not
+built for thousands of mappings. **The kernel has to own a TSB.**
+
+That reorders the phase slightly and for the better: the TSB comes first, `early_map` becomes a
+few stores into it, and only then does the trap table need to be installed to service misses
+against it. The present implementation stays as a stepping stone — it gets the kernel measurably
+further than the no-op stub did, and real Open Firmware may have headroom OpenBIOS lacks, which
+is worth checking on hardware.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
@@ -828,11 +887,16 @@ gate described in the plan's §4.1 and §4.2.
    the kernel was entered with `PSTATE.IE` still set. Fixed, and the kernel now reaches `vm_init`.
 4. ~~Get kernel debug output onto serial~~ — **done, see §17.** The kernel now narrates its own
    VM initialisation.
-5. **Phase 2, starting with `early_map`** (§17). It is the right first target: it runs before any
-   TSB exists, has no locking or teardown, and the boot generates ~2000 calls to prove it
-   against. Everything after it — the trap table, spill/fill, the TSB and the miss fast path —
-   ships as one unit, ported closely from OpenBSD's `pmap.c` and `locore.s` rather than invented.
-   Keep Open Firmware's mappings alive throughout: they are servicing every trap we currently take.
+5. ~~Phase 2, starting with `early_map`~~ — **implemented via Open Firmware, see §18.** It works
+   and moves the kernel to `vm_page_init`, but OpenBIOS's heap gives out after ~1300 mappings.
+6. **Allocate and populate a kernel-owned TSB.** §18 settles that this must come first rather
+   than after the trap table: `early_map` cannot keep delegating to firmware. Once the TSB
+   exists, `early_map` becomes a few stores into it.
+7. **Then the trap table and the TLB-miss fast path**, to service misses against our own TSB,
+   plus window spill/fill and a real `struct iframe`. Port closely from OpenBSD's `pmap.c` and
+   `locore.s` rather than inventing. Open Firmware's own mappings must survive the cutover:
+   they are servicing every trap the kernel currently takes, so the machine loses its trap
+   handlers the moment `%tba` changes without them being carried across.
 6. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
    dies with `gCallOpenFirmware` corrupt. Shared with PowerPC, so likely upstreamable.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts
