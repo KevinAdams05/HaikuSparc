@@ -359,6 +359,13 @@ def check_file(path, wanted_lines, findings):
         if not code_stripped.strip():
             continue
 
+        # Preprocessor directives are not C expressions and must not be judged
+        # as such: "#include <string.h>" ends in '>', which reads as a trailing
+        # binary operator, and macro bodies routinely break lines wherever they
+        # like.
+        if code_stripped.lstrip().startswith("#"):
+            continue
+
         if CONTROL_RE.search(code_stripped):
             report(index, "control-space")
         if BRACE_SPACE_RE.search(code_stripped):
@@ -402,6 +409,9 @@ SELF_TEST_CASES = [
     ("a.cpp", "a = b *c;\n", "pointer-style"),
     ("a.cpp", "int x = 1; \n", "trailing-space"),
     ("a.cpp", "value = one +\n", "operator-eol"),
+    # A directive is not an expression: this ends in '>', not an operator.
+    ("a.cpp", "#include <string.h>\n", None),
+    ("a.cpp", "#define JOIN(a, b) a##b\n", None),
     ("a.cpp", "value = one\n\t+ two;\n", None),
     ("a.cpp", "   int x;\n", "space-indent"),
     ("a.cpp", "\tint x;\n", None),

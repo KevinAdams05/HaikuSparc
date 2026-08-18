@@ -741,6 +741,79 @@ that is the function specifically meant for fatal situations before the console 
 
 ---
 
+## 17. Kernel debug output works — and Phase 2's job is now fully specified
+
+### The fix
+
+`SparcOpenFirmware::InitSerialDebug()` only fetched Open Firmware's `stdout` when the frame
+buffer was **disabled**:
+
+```c
+if (!kernelArgs->frame_buffer.enabled) {
+	if (of_getprop(gChosen, "stdout", &fOutput, sizeof(int)) == OF_FAILED)
+		return B_ERROR;
+}
+```
+
+The constructor leaves `fOutput` at `-1`, and `SerialDebugPutChar()` returns early on `-1`, so on
+any machine where the loader set a video mode — which is every machine it can — **the kernel
+discarded every byte of its own debug output, silently.** That is why the panic in §16 was
+invisible.
+
+The caution behind the guard was sound, though, and worth keeping: if OF's `stdout` *is* the
+screen, writing through it while Haiku draws to the same frame buffer corrupts the display. So
+`stdout` is now always fetched, and suppressed only when the device actually is one — decided by
+asking it, via `of_instance_to_package()` and its `device_type` property, rather than inferred
+from the frame buffer being present. A machine consoled over serial, which is how this port is
+developed and how a headless Sun is normally run, keeps its output.
+
+### What the kernel now tells us
+
+```
+Welcome to kernel debugger output!
+Haiku revision: , debug level: 2
+vm_translation_map_init: entry
+physical memory ranges:
+         0x0 - 0x20000000
+allocated physical ranges:
+         0x0 -   0xc2e000
+  0x1fe80000 - 0x20000000
+allocated virtual ranges:
+         0x0 -   0xa0c000
+  0xfef80000 - 0xff000000        <- Open Firmware
+  0xffd00000 - 0xfff00000        <- Open Firmware
+  0xfffce000 - 0xfffd2000
+  0x80000000 - 0x80222000        <- the kernel image
+early_tmap: entry pa 0xc2e000 va 0x81000000
+early_tmap: entry pa 0xc30000 va 0x81002000
+... about two thousand more ...
+Unhandled Exception 0x30   PC = 0x80169cdc   (MemoryManager::_AllocateArea)
+```
+
+**2065 lines of kernel narration, and roughly two thousand of them are the same stub.**
+`arch_vm_translation_map_early_map()` prints its arguments and returns `B_OK` without mapping
+anything, so every one of those ~2000 pages is unmapped when the memory manager first writes to
+one. `arch_vm_translation_map_create_map()` likewise returns `B_OK` while leaving `*_map` null.
+
+### This specifies Phase 2 concretely
+
+The kernel is now telling us exactly what it wants, which is a much better starting position than
+the plan's abstract description:
+
+- **~2000 early mappings**, 8 KB apart, physical `0xc2e000`+ to virtual `0x81000000`+ — a
+  straightforward linear run, so `early_map` can be implemented and tested before anything else.
+- **Ranges that must keep working**: Open Firmware's own mappings at `0xfef80000`–`0xff000000`
+  and `0xffd00000`–`0xfff00000` are live and are currently servicing every trap we take. Whatever
+  the TSB ends up holding, those must survive, or the machine loses its trap handlers mid-flight.
+- **The kernel image** occupies `0x80000000`–`0x80222000`, comfortably inside a 4 MB page, which
+  is an argument for mapping it with one large TTE as the plan's §4.3 suggests.
+- Physical memory is a single range, `0x0`–`0x20000000` (512 MB as configured).
+
+`early_map` is the right first target: it runs before any TSB exists, it has no locking or
+teardown to get right, and there are two thousand calls to prove it against.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
@@ -753,15 +826,15 @@ gate described in the plan's §4.1 and §4.2.
    `R_SPARC_RELATIVE` GOT slot on a big-endian target. `gl: 2` was a red herring.
 3. ~~Read the panic message~~ — **done, see §16.** It was `ASSERT(!are_interrupts_enabled())`;
    the kernel was entered with `PSTATE.IE` still set. Fixed, and the kernel now reaches `vm_init`.
-4. **Get kernel debug output onto serial** (§16). It currently goes to the frame buffer console.
-   Implementing `arch_debug_serial_early_boot_message()` — an empty stub, and the function meant
-   for exactly this — is the obvious first move. Do this before writing trap-table assembly:
-   Phase 2 without kernel output would be needlessly blind.
-5. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
+4. ~~Get kernel debug output onto serial~~ — **done, see §17.** The kernel now narrates its own
+   VM initialisation.
+5. **Phase 2, starting with `early_map`** (§17). It is the right first target: it runs before any
+   TSB exists, has no locking or teardown, and the boot generates ~2000 calls to prove it
+   against. Everything after it — the trap table, spill/fill, the TSB and the miss fast path —
+   ships as one unit, ported closely from OpenBSD's `pmap.c` and `locore.s` rather than invented.
+   Keep Open Firmware's mappings alive throughout: they are servicing every trap we currently take.
+6. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
    dies with `gCallOpenFirmware` corrupt. Shared with PowerPC, so likely upstreamable.
-6. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
-   TSB allocation, the TLB-miss fast path, demap and invalidate, `early_map` and `create_map`.
-   Ships as one unit. Port OpenBSD's `pmap.c` (2-clause BSD) closely rather than inventing.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts
    silently and kills the machine with no diagnostic.
 4. **Haiku's `arch_atomic.h` for sparc is empty stubs** — all three memory barriers are `// TODO`.
