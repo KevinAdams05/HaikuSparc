@@ -232,12 +232,82 @@ an 8 KB page and a 64 KB page can land on the same line with identical tags, and
 cannot tell them apart without reading the TTE data — which defeats the point of a fast path.
 *"Therefore, do not use the common TSB mode in an optimized handler."*
 
-**Sizing.** Entries per TSB are `512 × 2^N`, at 16 bytes each (8 tag + 8 data), so `N = 0` is
-8 KB and `N = 7` is 1 MB. A boot needs ~2700 live mappings, so `N = 3` (4096 entries, 64 KB per
-TSB) leaves comfortable headroom for a direct-mapped structure; split means two of those, so
-128 KB total. **The base must be aligned to the size of both TSBs together** — 128 KB in that
-configuration — and note the manual's warning that *"stores to the TSB registers are not checked
-for out-of-range violations"*, so a misaligned base is accepted silently and fails later.
+**Sizing — revised against measurement, see §4.1.** Entries per TSB are `512 × 2^N` at 16 bytes
+each, so `N = 0` is 8 KB and `N = 7` is 1 MB. **The base must be aligned to the size of both TSBs
+together**, and the manual warns that *"stores to the TSB registers are not checked for
+out-of-range violations"* — a misaligned base is accepted silently and fails later.
+
+---
+
+## 4.1 What Open Firmware actually has mapped
+
+`sparc_dump_openfirmware_translations()` reads the firmware's `translations` property from the
+kernel and prints it during `arch_vm_translation_map_init`. This is the real inherited state,
+with physical addresses and modes, which `kernel_args` does not carry:
+
+```
+sparc_mmu: 17 Open Firmware translations to preserve:
+  va                0x0 len     0x2000 -> pa          0x0  vwp-- size 0
+  va             0x2000 len   0x200000 -> pa       0x2000  vwp-- size 0
+  va           0x202000 len    0x52000 -> pa     0x202000  vwp-- size 0   <- boot loader
+  va           0x254000 len   0x5ae000 -> pa     0x254000  vwp--
+  va           0x802000 len     0xa000 -> pa     0x802000  vwp--
+  va           0x80c000 len   0x180000 -> pa     0x80c000  vwp--          <- loader heap
+  va           0x98c000 len    0x80000 -> pa     0x98c000  vwp--
+  va         0x80000000 len   0x222000 -> pa     0xa0c000  vwp--          <- THE KERNEL, unlocked
+  va         0xfd000000 len  0x1000000 -> pa 0x1ff22000000  vwp--         <- 16 MB frame buffer
+  va         0xfef7e000 len     0x2000 -> pa 0x1ff23000000  vwp--
+  va         0xfef80000 len    0x80000 -> pa   0x1fe80000  vwpl-          <- locked
+  va         0xffd00000 len    0x80000 -> pa 0x1fff0000000  v-pl-         <- locked, READ-ONLY
+  va         0xffd80000 len    0x80000 -> pa 0x1fff0080000  v-pl-         <- locked, READ-ONLY
+  va         0xffe00000 len    0x80000 -> pa   0x1ff00000  vwpl-          <- locked
+  va         0xffe80000 len    0x80000 -> pa   0x1ff80000  vwpl-          <- locked
+  va         0xfffce000 len     0x2000 -> pa 0x1fe02002000  vwp--
+  va         0xfffd0000 len     0x2000 -> pa 0x1fe02006000  vwp--
+```
+
+Four things fall out of this, and they change the plan.
+
+**Open Firmware locks its own trap handler, exactly as §2.6 requires.** The two read-only locked
+regions at `0xffd00000` and `0xffd80000` are where OpenBIOS's code lives — every trap PC we have
+seen all session, `0xffd0f1f4`, `0xffd1c184`, `0xffd0a534`, falls inside them. **Locked entries
+survive in the TLB unless explicitly demapped**, so if the cutover does not flush them, the
+firmware's handlers stay reachable. That makes the transition materially less dangerous than
+feared: it can be staged rather than atomic.
+
+**But the kernel's own mapping is not locked.** `va 0x80000000 → pa 0xa0c000` carries the kernel
+image and is evictable. It must be in our TSB before `%tba` is repointed, or the kernel faults on
+its own code with no handler able to help.
+
+**Every entry reports `size 0`, i.e. 8 KB pages** — `len` is the length of the region, not the
+page size. So the firmware describes regions and expanding them into TTEs is our job.
+
+**Expanded, that is a lot of pages:**
+
+| | 8 KB pages |
+| --- | ---: |
+| Total across all 17 regions | 3930 |
+| Locked (already resident, survive the cutover) | 320 |
+| **Unlocked and evictable — must live in our TSB** | **3610** |
+| Plus the kernel's own `early_map` demand | ~2700 |
+| **Worst-case live entries** | **~6310** |
+
+### Revised sizing
+
+| `TSB_Size` | Entries | Per TSB | Split pair | Load factor at 6310 |
+| :---: | ---: | ---: | ---: | ---: |
+| 3 | 4096 | 64 KB | 128 KB | 1.54 — oversubscribed |
+| **4** | **8192** | **128 KB** | **256 KB** | **0.77** |
+| 5 | 16384 | 256 KB | 512 KB | 0.39 |
+
+**`N = 4`**, so a 256 KB split pair aligned to 256 KB. The earlier `N = 3` guess was made before
+the firmware's own mappings were counted and is too small: a direct-mapped structure at a load
+factor above 1 thrashes.
+
+**And use large pages for the big regions.** The 16 MB frame buffer alone is 2048 of those 3610
+pages — over half — and the `0x5ae000` region is another 727. The TTE size field supports 512 KB
+and 4 MB, so mapping those with large TTEs would cut the count by more than half and make `N = 3`
+viable again. Worth doing, but as an optimisation after the fast path works, not before.
 
 **The miss handler can be written with no stack.** MMU globals are guaranteed by hardware and
 faithfully emulated, so the fast path is: read the 8 KB pointer from `ASI_DMMU_TSB_8KB_PTR`, read
