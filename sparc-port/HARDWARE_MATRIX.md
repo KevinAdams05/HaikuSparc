@@ -174,17 +174,31 @@ Intel NIC document) ✅.
 | Architecture: V9 trap model, windows | `SPARC/architecture-v9.pdf`, `UA2005-*-EXT.pdf` | ✅ CANSAVE p.87, spill/fill trap types p.212 |
 | Open Firmware client interface | `SPARC/OpenFirmware/IEEE-1275-1994-*.pdf` + SPARC and PCI bindings | ✅ complete |
 | PCI-PCI bridge (simba) | `SPARC/APB-manual-805-1251.pdf`, `APB-datasheet-805-0088.pdf` | ✅ |
-| Host bridge (sabre) | **no sabre manual** — nearest proxies are `U2P-manual-802-7835.pdf` (psycho) and `PIO_ref_manual.pdf`, which describes its own IOMMU as *"derived from Sabre"* | ⚠️ **gap** |
+| Host bridge (sabre) | **`SPARC/UltraSPARC-IIi/manual.pdf`** — sabre is *on-die*, so its host PCI bridge and IOMMU are chapters of the CPU manual, not a separate document. Chapter 10 covers the IOMMU including its own software-managed TSB and TTE format. | ✅ — **an earlier revision of this table wrongly listed this as a gap** |
+| Ultra 5 chassis, connectors, part numbers | `SPARC/Systems/Ultra5_Service_Manual_805-7763-12.pdf` | ✅ added 2026-08-18 |
+| Blade 150 setup, ports, jumpers | `SPARC/Systems/SunBlade150_Getting_Started_816-1161-10.pdf` | ✅ added 2026-08-18 |
 | Ultra 5/10 south bridge | `SPARC/PCIO-manual-802-7837.pdf` + `PCIO-datasheet-802-7836.pdf` | ✅ |
 | hme ethernet core | `SPARC/FEPS.pdf`, `FEPS_STP2002QFP_datasheet.pdf`, `STP2002QFP-FEPs_UG.pdf` | ✅ excellent |
 | Blade 100/150 south bridge | **nothing** — no ALi M1535D+ or M5229 documentation | ⚠️ **gap** |
 | Ultra 5/10 IDE (CMD646) | **nothing** | ⚠️ **gap** |
 | VIS instructions | `SPARC/VIS-manual-805-1394.pdf` | ✅ (not needed early) |
 
-The three gaps are real but not blocking. `sabre`'s programming model is reachable through the
-psycho documentation plus OpenBSD's driver, which handles both parts in one file. The two IDE
-controllers are ordinary PCI IDE and are covered by the ATA specification and existing
-open-source drivers rather than needing vendor datasheets.
+**Coverage for the kernel work is complete.** Everything the MMU, trap table, register windows,
+context switch and timer need is on disk and searchable: the IIi manual (including its own
+Appendix K errata, 9 entries), the IIe supplement, SPARC V9, UA2005, and the Open Firmware
+bindings. Nothing in Phase 2 through Phase 6 is waiting on a document.
+
+**The two remaining gaps are both Phase 7 device work**, and both are ordinary PCI IDE parts:
+
+| Missing | Needed for | Status |
+| --- | --- | --- |
+| CMD646 datasheet | Ultra 5/10 IDE | Not found in public archives. CMD Technology was absorbed by Silicon Image. |
+| ALi M1535D+ / M5229 datasheet | Blade 100/150 IDE, USB, audio | Not found. |
+
+Neither is likely to block: both are conventional PCI IDE controllers covered by the ATA
+specification, and OpenBSD's `pciide.c` plus Linux's drivers document their quirks in code. If
+either turns out to need real documentation, they are the two items worth hunting on eBay or in
+the vintage-hardware archives.
 
 ---
 

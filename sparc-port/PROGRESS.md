@@ -5,11 +5,12 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phase 0 complete. Phase 1 substantially working.** The Haiku bootloader now boots from
-real Sun-disklabelled media, gets a proper boot path, and runs until it hits a bug *in OpenBIOS*
-rather than in Haiku.
+**State: Phases 0 and 1 complete. The kernel is being entered — we are now at the Phase 2 gate.**
 
-**Nothing is committed past `b9aa013d50`.** Everything below is in the working tree.
+The loader boots from Sun-disklabelled media, mounts a BFS volume, loads `kernel_sparc`, sets a
+video mode, and jumps into the kernel. The kernel then runs as far as `create_debug_alloc_pool`
+and takes a `data_access_exception`, which is precisely what a kernel with no trap table and no
+TLB-miss handling should do. See §13.
 
 ---
 
@@ -417,29 +418,112 @@ Current state: **clean across 15 files.**
 
 ---
 
+## 13. The kernel runs — Phase 1 complete
+
+```
+	Select boot volume/state (Current: Haiku (1024 GiB))
+	load kernel kernel_sparc...
+	video mode: 1024x768x8
+	Unhandled Exception 0x0000000000000030
+	PC = 0x00000000800f36c0
+```
+
+`0x800f36c0` is inside the kernel (`KERNEL_LOAD_BASE_64_BIT` is `0x80000000`), in
+`create_debug_alloc_pool`, on a plain `ld [%g3], %g2`. Trap `0x30` is
+`data_access_exception`. **This is the expected wall**: the kernel has no trap table and no
+TLB-miss handler, so the first access outside Open Firmware's existing translations faults with
+nothing to service it. Phase 2 is exactly the work of fixing this.
+
+### What it took to get here
+
+**The kernel would not compile.** `musl/arch/sparc/atomic_arch.h` did not exist, so anything
+including `atomic.h` failed — `ffs`, `ffsl`, `ffsll`. Added, using SPARC V9's native
+compare-and-swap:
+
+- `cas` / `casx`: `casa [rs1] asi, rs2, rd` compares `rs2` against memory and exchanges `rd` on a
+  match, or loads memory into `rd` on a mismatch — so `rd` always ends up with the previous value,
+  which is exactly musl's `a_cas` contract. Verified against the SPARC V9 Architecture Manual A.9
+  and cross-checked against OpenBSD's `sys/arch/sparc64/include/atomic.h`, which uses the
+  identical constraint form.
+- `a_barrier` uses `membar #StoreLoad` — under TSO that is the only ordering a barrier must add —
+  placed in the delay slot of an always-taken branch to work around **erratum 51**, which the IIi
+  manual's Appendix K explicitly lists as affecting *"US-I, II, and IIi"*: a membar issued late in
+  the delay slot of a mispredicted control transfer can stop instruction issue entirely. Linux
+  carries the same workaround as `membar_safe()`.
+
+**Haiku's loader has no Sun disklabel support.** It only probes Intel partition maps, so a BFS
+partition inside a Sun-labelled disk is invisible to it. Rather than write a partitioning-system
+add-on now, the BFS volume goes on its own disk, which the device scan finds directly. Teaching
+the loader about Sun labels is real future work — it is what an installed single-disk system will
+eventually need.
+
+**BFS endianness is fine, and that is worth knowing.** The host tool runs little-endian and
+writes a little-endian volume; Haiku's BFS defaults to `BFS_LITTLE_ENDIAN_ONLY`, so the
+big-endian SPARC loader byte-swaps on read and mounts it correctly. Every field the loader
+validates was decoded and checked by hand before the first boot attempt. Note
+`BFS_BIG_ENDIAN_ONLY` applies only to the separate `bfs_big` add-on, so loader and kernel agree.
+
+**A bare kernel is enough.** `BootVolume::_SetTo` treats a missing `system/packages` as
+"apparently not packaged" and returns `B_OK`, so `PackageVolumeInfo::SetTo(): failed to open
+packages directory` is benign, not an error to chase.
+
+**The boot menu is interactive and reachable over serial.** Volume selection needs three
+keypresses: `\r` to open "Select boot volume/state", `\r` to take the listed volume, then
+navigate to the boot entry. Cursor keys are `ESC [ A/B/C/D`; the OF console reads three bytes at
+a time. QEMU grumbles `pc_serial_read: bad len ... len 3` continuously once the menu polls for
+keys — noisy but harmless, and `grep -v pc_serial_read` is essential to read the log at all.
+
+### Reproducing it
+
+```sh
+JAM=/home/kevin/Code/Haiku/SPARC/buildtools/jam/bin.linuxx86/jam
+cd generated.sparc && $JAM -q -j24 haiku_loader.openfirmware kernel \
+    '<build>bfs_shell' '<build>fs_shell_command'
+cd ..
+./sparc-port/tools/make-boot-disk.sh --output /tmp/loader.img   # loader on ext2 + Sun label
+./sparc-port/tools/make-bfs-image.sh  --output /tmp/bfs.img     # BFS + system/kernel_sparc
+
+qemu-system-sparc64 -M sun4u -cpu "TI UltraSparc IIi" -m 512 -nographic \
+    -bios /usr/share/qemu/openbios-sparc64 \
+    -drive file=/tmp/loader.img,format=raw,if=ide,index=0,media=disk \
+    -drive file=/tmp/bfs.img,format=raw,if=ide,index=1,media=disk \
+    -drive file=/tmp/any.iso,format=raw,if=ide,index=2,media=cdrom \
+    -fda /tmp/any.fd
+# ok prompt:  boot /pci@1fe,0/pci@1,1/ide@3/ide@0/disk@0:a,\loader.elf
+# then \r, \r, and navigate to boot
+```
+
+The cdrom and floppy media are the empty-drive workarounds from §7a, not optional.
+
+---
+
 ## 12. Next steps
 
-Phase 1 is essentially done: the loader boots from media and reaches its menu. The critical path
-now runs through getting a kernel loaded, which is what makes Phase 2 workable.
+Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
+gate described in the plan's §4.1 and §4.2.
 
-1. **Put a BFS volume with a kernel on the disk.** This is the single highest-value next task —
-   it is what stands between us and the kernel being entered, and Phase 2 (the gate) cannot start
-   until it is. Build `@minimum-raw`, or teach `make-sun-image.py` to place a BFS partition. Note
-   Haiku's own `makebootable` has no SPARC support, so partition a's contents may need arranging
-   by hand.
-2. **Watch for the big-endian BFS problem.** Our reference notes record that big-endian Haiku has
-   **no writable BFS**; reading may be fine but this needs confirming early, since the loader has
-   to read a BFS volume to find the kernel.
-3. **Attach gdb** — `--gdb` on the harness, then `gdb-multiarch`, `set architecture sparc:v9`,
-   `target remote :1234`. The last Phase 0 item, and indispensable for Phase 2.
-4. **Find the Pegasos II big-endian patches** (BFS, ATI, PS/2) — §9.
-5. **Netboot**, as a second path, since it is the fastest iteration loop on real hardware.
+1. **Attach gdb.** Now the single highest-value task. `--gdb` on the harness, then
+   `gdb-multiarch`, `set architecture sparc:v9`, `target remote :1234`, and
+   `add-symbol-file kernel_sparc 0x80000000`. Phase 2 is trap-table and MMU assembly, and this is
+   the only way to see `%tba`, `CANSAVE` and TSB state. Do this before writing any of it.
+2. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
+   TSB allocation, the TLB-miss fast path, demap and invalidate, `early_map` and `create_map`.
+   Ships as one unit. Port OpenBSD's `pmap.c` (2-clause BSD) closely rather than inventing.
+3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts
+   silently and kills the machine with no diagnostic.
+4. **Haiku's `arch_atomic.h` for sparc is empty stubs** — all three memory barriers are `// TODO`.
+   The musl header added in §13 now has correct implementations to copy from, including the
+   erratum 51 workaround.
+5. **Find the Pegasos II big-endian patches** (BFS, ATI, PS/2) — §9.
+6. **Later, not now:** a Sun disklabel partitioning add-on for the loader, so a single disk can
+   hold both the loader and the system; and netboot, the fastest loop on real hardware.
 
 ### Open questions
 
+- Does the kernel need its own FPU enable? The loader sets PSTATE.PEF and FPRS.FEF, but the trap
+  table resets PSTATE on entry, so the kernel probably has to do it again.
 - Does OpenBIOS sparc64 implement TFTP at all, or only the RARP half?
 - Is the a.out wrapper meant to be written to a disklabel boot block — is `sparcbootblock.h` the
   intended first stage? Nothing in the tree exercises it.
-- What reads the `-r 0` requirement — OpenBIOS's grubfs feature support, or something narrower?
-- Does the kernel need its own FPU enable, or does it inherit PSTATE from the loader? The trap
-  table will reset PSTATE on entry, so this probably needs doing again in the kernel.
+- What exactly does the `mkfs.ext2 -r 0` requirement come from — a grubfs feature check, or
+  something narrower?
