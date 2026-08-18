@@ -40,6 +40,51 @@ QEMU's `-nographic` serial output misbehaves when stdout is a pipe that closes e
 into `head` produces *no output at all* rather than a truncated log. Use `--log FILE`, or
 redirect to a file, and grep afterwards.
 
+## `make-boot-disk.sh`
+
+Builds a bootable Sun-disklabelled disk image containing the loader, and prints the `boot`
+command for it. This is the **working** boot path — see PROGRESS.md §4.
+
+```sh
+./make-boot-disk.sh --output haiku-sparc.img
+./qemu-sun4u.sh --disk haiku-sparc.img --timeout 0
+# at the ok prompt:
+#   boot /pci@1fe,0/pci@1,1/ide@3/ide@0/disk@0:a,\loader.elf
+```
+
+It exists because the recipe has three requirements that are invisible until they bite:
+
+1. The payload must be the **ELF** (`boot_loader_openfirmware`), not the a.out wrapper.
+2. The ext2 filesystem must be **revision 0** — `mkfs.ext2 -r 0`. Anything newer has features
+   OpenBIOS's grubfs cannot read, and the boot fails with a bare `File not found`.
+3. Partition a must **not start at cylinder 0**, or the payload overwrites the disk label.
+
+## `make-sun-image.py`
+
+Builds and inspects Sun disk labels; `make-boot-disk.sh` uses it. The label is a fixed 512-byte
+big-endian VTOC with magic `0xDABE` at offset 508 and a checksum chosen so the XOR of all 256
+16-bit words is zero.
+
+```sh
+python3 make-sun-image.py --payload fs.ext2 --output disk.img --start-cylinder 1
+python3 make-sun-image.py --inspect disk.img
+```
+
+## `style-check.py`
+
+Haiku coding-style checker scoped to this fork's own code — full files for what we wrote, only
+changed lines for upstream files we edit, and cosmetic rules for our own code alone. Rules come
+from Haiku's own `src/tools/checkstyle/checkstyle.py`, including its real 100-column limit.
+
+```sh
+python3 style-check.py               # our delta vs master
+python3 style-check.py --list-rules
+python3 style-check.py --self-test   # 25 cases against the checker itself
+```
+
+Exit status is 0 when clean, so it can gate a build or a push. See PROGRESS.md §11 for why it is
+scoped this way.
+
 ## Host requirements
 
 Already present on the build host and verified working:
