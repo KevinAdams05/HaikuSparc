@@ -33,6 +33,7 @@ kernel="$objects/haiku/sparc/release/system/kernel/kernel_sparc"
 output=bfs.img
 size_mb=48
 label=Haiku
+serial_debug=0
 
 usage() {
 	cat <<EOF
@@ -42,6 +43,15 @@ Usage: make-bfs-image.sh [options]
   --output FILE   BFS image to write, default $output
   --size-mb N     image size, default $size_mb
   --label NAME    volume name, default $label
+  --serial-debug  write a kernel settings file enabling serial_debug_output, so
+                  the kernel's early output goes to serial rather than the
+                  framebuffer blue screen where nothing can read it.
+                  CURRENTLY BROKEN, and off by default: merely having the file
+                  present makes the loader die before the kernel, with a
+                  mem_address_not_aligned trap on a "call %g1" in
+                  of_finddevice, meaning gCallOpenFirmware itself has been
+                  corrupted. Reading driver settings damages loader state
+                  somehow -- see PROGRESS.md section 15.
   -h, --help
 EOF
 }
@@ -52,6 +62,7 @@ while [[ $# -gt 0 ]]; do
 		--output)  output="$2"; shift 2 ;;
 		--size-mb) size_mb="$2"; shift 2 ;;
 		--label)   label="$2"; shift 2 ;;
+		--serial-debug) serial_debug=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -66,6 +77,8 @@ for tool in "$bfs_shell" "$fs_shell_command"; do
 	fi
 done
 [[ -r "$kernel" ]] || { echo "kernel not found: $kernel" >&2; exit 1; }
+
+work=$(mktemp -d)
 
 rm -f "$output"
 dd if=/dev/zero of="$output" bs=1M count="$size_mb" status=none
@@ -97,12 +110,32 @@ cleanup() {
 	shell_command quit >/dev/null 2>&1 || true
 	exec 5>&- 6>&- 3<&- 4>&- 2>/dev/null || true
 	wait "$bfs_pid" 2>/dev/null || true
+	rm -rf "$work"
 }
 trap cleanup EXIT
 
 # ":" prefixes a host path; unprefixed paths are inside the volume.
 shell_command mkdir /myfs/system
 shell_command cp -f ":$kernel" /myfs/system/kernel_sparc
+
+if [[ "$serial_debug" == "1" ]]; then
+	# The loader reads driver settings from this exact path
+	# (src/system/boot/loader/load_driver_settings.cpp). Without
+	# serial_debug_output the kernel's early output -- including any panic --
+	# goes to the framebuffer blue screen instead of the serial console.
+	settings="$work/kernel-settings"
+	cat > "$settings" <<-'SETTINGS'
+	serial_debug_output true
+	debug_screen true
+	SETTINGS
+	for directory in home home/config home/config/settings \
+			home/config/settings/kernel home/config/settings/kernel/drivers; do
+		shell_command mkdir "/myfs/$directory" || true
+	done
+	shell_command cp -f ":$settings" \
+		/myfs/home/config/settings/kernel/drivers/kernel
+fi
+
 echo "--- volume contents ---"
 shell_command ls /myfs/system
 

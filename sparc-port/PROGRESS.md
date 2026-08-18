@@ -589,6 +589,91 @@ default.
 
 ---
 
+## 15. The `%g3` corruption: root-caused and fixed
+
+### It was a relocation bug, and `gl: 2` was a red herring
+
+**`gl: 2` is inert on this CPU and means nothing here.** UltraSPARC-IIi has no GL register — GL
+arrives with UA2005 and the T-series. On the IIi the active global register set is selected by
+**PSTATE.AG (bit 0), MG (bit 10) and IG (bit 11)** (UltraSPARC-IIi User's Manual, TABLE 14-12,
+printed p.201, and the selection encoding in TABLE 14-13). Our trace shows `pstate: 00000014`,
+which is PRIV (bit 2) and PEF (bit 4) only, so **AG, MG and IG are all clear and the normal
+global set is active** — exactly right.
+
+QEMU prints a `gl` field unconditionally because it models it for hyperprivileged CPUs. The
+decisive argument that it is not banking anything: OpenBIOS runs correctly from power-on to the
+boot menu with `gl: 2` displayed the whole time. If GL were switching register sets, the firmware
+would break first.
+
+### What it actually was
+
+`%g3` came from `ldx [%g2], %g3` where `%g2 = %l7 + offset`, and `%l7` is the **GOT base** — the
+kernel is built `-fPIE`. So the corrupt value was a **GOT entry**, not a corrupt register.
+
+The GOT is populated by `R_SPARC_RELATIVE` relocations, and `arch_elf.cpp` had:
+
+```c
+case R_SPARC_RELATIVE:
+	write_word32(P, B + A);   // Elf64_Word is uint32
+```
+
+`R_SPARC_RELATIVE` on ELF64 is a **64-bit** field. Writing 32 bits of it left the other half
+untouched, and **because SPARC is big-endian the value landed in the high half** — so a slot that
+should have held `0x80217fc8` held `0x80217fc800000000`, which is precisely the observed `%g3`.
+The kernel carries **1153** of these relocations, so most of the GOT was wrong. Fixed to
+`write_word64`.
+
+The arithmetic matching exactly is what makes this conclusive rather than plausible: writing
+`0x80217fc8` as 32 bits at a big-endian 64-bit slot gives bytes `80 21 7f c8 00 00 00 00`, which
+reads back as `0x80217fc800000000`.
+
+### What the fix bought
+
+The kernel now runs a great deal of real code. From the trap trace:
+
+| Trap | Count |
+| --- | --- |
+| Clean Windows | 51,938 |
+| Window Spill | 9,959 |
+| Window Fill | 9,956 |
+| Data Access MMU Miss | 693 |
+| Instruction Access MMU Miss | 24 |
+| Instruction Access Error | 1 (fatal) |
+
+Ten thousand spill and ten thousand fill traps, all serviced — by **Open Firmware's** trap table,
+since `tbr` is still `0xffd00000`. That is a useful thing to know: OF's handlers are carrying the
+kernel until we install our own, which is why the kernel gets this far with none of Phase 2 done.
+
+Resolving the instruction-miss addresses gives the execution path:
+
+```
+_start → __sparc_get_pc_thunk.l7 → smp_set_num_cpus → cpu_preboot_init_percpu
+       → arch_cpu_preboot_init_percpu → thread_preboot_init_percpu
+       → panic → blue_screen_enter → kprintf → sort_debugger_commands → [wild jump]
+```
+
+**The kernel reaches early init and then panics**, and the panic path itself dies on a wild jump.
+Two separate problems now, which is progress: something panics, and the debugger path cannot
+report it. The latter is unsurprising — `arch_debug.cpp` is entirely stubs.
+
+### Reading the panic message is blocked by a third bug
+
+The panic text goes to `blue_screen_enter`, i.e. the framebuffer, where nothing can read it.
+Serial output is selectable with `serial_debug_output` in
+`home/config/settings/kernel/drivers/kernel`, which `make-bfs-image.sh --serial-debug` will write.
+
+**That currently makes things worse, so it is off by default.** With the settings file present the
+loader dies *before* the kernel, taking `mem_address_not_aligned` at `0x204870` — a `call %g1` in
+`of_finddevice`, where `%g1` was loaded from a global. In other words **`gCallOpenFirmware` itself
+is corrupt**, so merely reading driver settings damages loader state. Worth chasing: it is a
+memory-corruption bug in code shared with PowerPC.
+
+The alternative route to the panic message is the boot menu's *Debug Options → Enable serial debug
+output*, which passes the flag through `kernel_args` and never touches the settings file. That
+needs a few more keystrokes in `serial-driver.py` and avoids this bug entirely.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
@@ -597,10 +682,15 @@ gate described in the plan's §4.1 and §4.2.
 1. ~~Attach gdb~~ — **done, see §14.** `tools/gdb-kernel.sh` boots the kernel with gdb attached
    and serial automated. Read §14 before using it: breakpoints do not work, and `-d int,mmu`
    tracing is the instrument that does.
-2. **Chase the `%g3` corruption in §14.** The faulting address is a valid kernel address shifted
-   left by 32 bits, which is a bug with a specific cause rather than a missing feature. Decide
-   the `gl: 2` question and the `-mno-fpu` question while in there.
-3. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
+2. ~~Chase the `%g3` corruption~~ — **root-caused and fixed, see §15.** A 32-bit write to a 64-bit
+   `R_SPARC_RELATIVE` GOT slot on a big-endian target. `gl: 2` was a red herring.
+3. **Read the panic message.** The kernel now reaches early init and panics; the text is going to
+   the framebuffer. Add the *Debug Options → Enable serial debug output* keystrokes to
+   `serial-driver.py`, which routes it through `kernel_args` and sidesteps the settings-file bug
+   in §15.
+4. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
+   dies with `gCallOpenFirmware` corrupt. Shared with PowerPC, so likely upstreamable.
+5. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
    TSB allocation, the TLB-miss fast path, demap and invalidate, `early_map` and `create_map`.
    Ships as one unit. Port OpenBSD's `pmap.c` (2-clause BSD) closely rather than inventing.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts
