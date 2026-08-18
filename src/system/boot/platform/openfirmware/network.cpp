@@ -124,8 +124,8 @@ OFEthernetInterface::FindMACAddress()
 	size_t size;
 	void* ptr;
 	if (of_interpret("mac-address", 0, 2, &size, &ptr) != OF_FAILED) {
-		if (size == sizeof(fMACAddress)) {
-			memcpy(&fMACAddress, ptr, size);
+		if (size == sizeof(fMACAddress.address)) {
+			memcpy(fMACAddress.address, ptr, size);
 			return B_OK;
 		}
 	}

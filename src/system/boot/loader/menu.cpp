@@ -1210,6 +1210,10 @@ add_boot_volume_item(Menu* menu, Directory* volume, const char* name)
 	}
 
 	// Display the size of this boot partition, if we can.
+	// newName is function-scoped rather than alloca'd so that the compiler can
+	// bound this function's stack usage: the Open Firmware loader is built with
+	// -Wstack-usage and runs on the firmware's small stack.
+	char newName[128];
 	Partition* partition;
 	if (gRoot->GetPartitionFor(volume, &partition) == B_OK) {
 		float size = partition->Size() / (1024.0 * 1024.0);
@@ -1219,8 +1223,7 @@ add_boot_volume_item(Menu* menu, Directory* volume, const char* name)
 			unit = "GiB";
 		}
 
-		char* newName = (char*)alloca(128);
-		snprintf(newName, 128, "%s (%f %s)", name, size, unit);
+		snprintf(newName, sizeof(newName), "%s (%f %s)", name, size, unit);
 		name = newName;
 	}
 

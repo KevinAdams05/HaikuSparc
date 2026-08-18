@@ -19,9 +19,26 @@ commits.
 | Files | Commit | Why | Upstreamable? |
 | --- | --- | --- | --- |
 | `README.md` | `91c5724` | Repo landing page. A new path — Haiku's own file is `ReadMe.md` — so it can never conflict. | No, and never needs to. |
+| `src/system/boot/platform/openfirmware/devices.cpp` | *(loader build fix)* | `printf("%ld", status)` where `status_t` is `int`. Harmless on the 32-bit PowerPC OF port; a hard `-Werror=format=` failure on 64-bit SPARC. | **Yes** — plain 64-bit portability bug. |
+| `src/system/boot/platform/openfirmware/network.cpp` | *(loader build fix)* | `memcpy` into a `mac_addr_t`, which has a user-defined copy constructor and so is not trivially copyable — `-Werror=class-memaccess`. Now copies into the `address` array member. | **Yes** — and it is the Sun-specific `mac-address` path, so it matters to us directly. |
+| `src/system/boot/platform/openfirmware/video.cpp` | *(loader build fix)* | `platform_init_video()` held an `edid1_info` on the stack *and* memcpy'd it to a `kernel_args` allocation, costing 1840 bytes against a 1023-byte budget. Now decodes straight into the allocation, dropping both the stack use and a redundant copy. | **Yes** — smaller and simpler on every platform. |
+| `src/system/boot/loader/menu.cpp` | *(loader build fix)* | `alloca(128)` inside a conditional made the function's stack usage unbounded to the compiler. Replaced with a function-scoped 128-byte array. | **Yes** — but note this file is shared by *every* architecture, making it the highest-risk row here. |
 
-Nothing else. As of the initial commit, `git diff --name-only master...sparc/main` returns only
-`README.md` and `sparc-port/`; not one Haiku file is modified.
+### Why these four exist
+
+The Open Firmware bootloader **does not build from upstream master** — not for SPARC, and by
+inspection not for PowerPC either. Haiku's own guide says the loader works, which was evidently
+true at some earlier point. Three of the four failures are architecture-neutral and would fail
+any modern-GCC build of this loader; only the `%ld` one is genuinely 64-bit-specific.
+
+`-Wstack-usage=1023` is applied to the `openfirmware` boot target and no other
+(`build/jam/ArchitectureRules:554`). That is deliberate — the loader runs on the firmware's own
+small stack — so the right response was to fix the stack consumers rather than to raise the
+limit for SPARC, even though SPARC's mandatory 176-byte register-window save area does make
+every frame inherently larger.
+
+**Follow-up:** `menu.cpp` is cross-architecture and has not yet been compile-tested on x86_64.
+Do that before the first upstream submission.
 
 ## Decisions that keep this list short
 

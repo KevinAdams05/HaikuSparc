@@ -125,14 +125,18 @@ platform_init_video(void)
 		return B_NO_INIT;
 	edid1_raw edidRaw;
 	if (of_getprop(screen, "EDID", &edidRaw, sizeof(edidRaw)) != OF_FAILED) {
-		edid1_info info;
-		edid_decode(&info, &edidRaw);
+		// Decode directly into the kernel_args allocation. Keeping an edid1_info
+		// on the stack as well pushed this function past the -Wstack-usage limit
+		// the Open Firmware loader is built with, and the copy it needed was
+		// redundant anyway.
+		edid1_info* info = (edid1_info*)kernel_args_malloc(sizeof(edid1_info));
+		if (info != NULL) {
+			edid_decode(info, &edidRaw);
 #ifdef TRACE_VIDEO
-		edid_dump(&info);
+			edid_dump(info);
 #endif
-		gKernelArgs.edid_info = kernel_args_malloc(sizeof(edid1_info));
-		if (gKernelArgs.edid_info != NULL)
-			memcpy(gKernelArgs.edid_info, &info, sizeof(edid1_info));
+			gKernelArgs.edid_info = info;
+		}
 	}
 
 	return B_OK;
