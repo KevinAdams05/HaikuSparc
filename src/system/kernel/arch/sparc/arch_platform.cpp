@@ -7,6 +7,7 @@
 #include <arch_platform.h>
 
 #include <new>
+#include <string.h>
 
 #include <KernelExport.h>
 
@@ -122,10 +123,37 @@ SparcOpenFirmware::InitSerialDebug(struct kernel_args *kernelArgs)
 {
 	if (of_getprop(gChosen, "stdin", &fInput, sizeof(int)) == OF_FAILED)
 		return B_ERROR;
-	if (!kernelArgs->frame_buffer.enabled) {
-		if (of_getprop(gChosen, "stdout", &fOutput, sizeof(int)) == OF_FAILED)
-			return B_ERROR;
+
+	int output;
+	if (of_getprop(gChosen, "stdout", &output, sizeof(int)) == OF_FAILED)
+		return B_ERROR;
+
+	// Previously stdout was only fetched when there was no frame buffer, which
+	// left fOutput at -1 and silently discarded every byte of kernel debug
+	// output on any machine that had one -- including every machine the loader
+	// sets a video mode on.
+	//
+	// The caution behind that was reasonable, though: if Open Firmware's stdout
+	// is the screen, writing through it while Haiku is drawing to the same
+	// frame buffer corrupts the display. So suppress it only in that case, and
+	// decide by asking the device what it is rather than by inferring it. A
+	// machine consoled over serial -- which is how this port is developed, and
+	// how a headless Sun is usually run -- keeps its debug output.
+	bool outputIsDisplay = false;
+	if (kernelArgs->frame_buffer.enabled) {
+		intptr_t package = of_instance_to_package(output);
+		if (package != OF_FAILED) {
+			char type[16];
+			if (of_getprop(package, "device_type", type, sizeof(type))
+					!= OF_FAILED) {
+				type[sizeof(type) - 1] = '\0';
+				outputIsDisplay = strcmp(type, "display") == 0;
+			}
+		}
 	}
+
+	if (!outputIsDisplay)
+		fOutput = output;
 
 	return B_OK;
 }
