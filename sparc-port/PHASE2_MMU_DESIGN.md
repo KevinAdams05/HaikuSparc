@@ -325,6 +325,47 @@ being reachable the instant we take over.
 
 ---
 
+## 4.2 The TSB is allocated and warmed
+
+Implemented in `sparc_mmu_init_tsb()`, called from `arch_vm_translation_map_init()`. Nothing
+points the hardware at it yet — the structure is built so it can be inspected before anything
+depends on it.
+
+```
+sparc_mmu: TSB at 0x80240000, 8192 entries per half, 256 KB total
+sparc_mmu: warmed with 3963 firmware pages, 306 collisions (3657 distinct entries live)
+sparc_mmu: firmware TSB registers: I 0x0000000000000000  D 0x0000000000000000
+sparc_mmu: firmware does not use a hardware TSB; the TSB registers are free
+```
+
+`0x80240000` is 256 KB aligned, as `FIGURE 15-9` requires. The 3963 pages are the 3930 predicted
+in §4.1 plus the TSB's own 32 pages, which the firmware maps while allocating it.
+
+**Collisions are 306 of 3963, under 8%**, and 3657 distinct entries occupy a 8192-entry half — a
+load factor of 0.45. That validates the `N = 4` choice from §4.1 empirically rather than by
+estimate. It also means **306 of the firmware's pages are not represented in the TSB**; after the
+cutover those will fault unless they are locked in the TLB or the slow path can find them.
+
+### Open Firmware does not use a hardware TSB at all
+
+Both TSB registers read zero. OpenBIOS services its own TLB misses by walking its translation
+list in software, never using the hardware TSB mechanism. Three consequences:
+
+- **The TSB registers are ours to program**, and doing so cannot disturb anything the firmware
+  depends on. That removes a hazard the cutover would otherwise have had.
+- **There is no oracle to validate our index arithmetic against.** The plan had been to index
+  into the firmware's TSB with our own formula and check the tags landed correctly; that is not
+  available. The arithmetic will have to be validated another way — the most direct being to
+  program the TSB register, set the Tag Access register to a known virtual address, read back
+  `ASI_DMMU_TSB_8KB_PTR`, and compare it with the entry address our code computes. That is a
+  small, self-contained experiment and worth doing before the trap table is written, because it
+  tests the one property the whole fast path rests on.
+- **After the cutover the firmware's handlers stop helping us**, since ours will consult a TSB
+  and theirs does not. Their *locked TLB entries* survive, which keeps the firmware's own code
+  mapped, but everything else must come from our TSB.
+
+---
+
 ## 5. The one caveat about developing against QEMU
 
 Every mechanism above is emulated faithfully, so the *logic* can be developed and debugged in

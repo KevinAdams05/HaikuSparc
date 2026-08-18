@@ -83,6 +83,20 @@ extern void sparc_get_instruction_tsb(TsbEntry **_pageTable, size_t *_size);
 extern void sparc_get_data_tsb(TsbEntry **_pageTable, size_t *_size);
 
 extern void sparc_dump_openfirmware_translations();
+extern void sparc_verify_tsb_indexing();
+
+// TSB_Size for the kernel's own TSB. 8192 entries of 16 bytes is 128 KB per
+// TSB, and the split pair is 256 KB aligned to 256 KB. Sized from the measured
+// working set -- see sparc-port/PHASE2_MMU_DESIGN.md section 4.1.
+#define KERNEL_TSB_SIZE				4
+#define KERNEL_TSB_ENTRIES			TSB_ENTRIES(KERNEL_TSB_SIZE)
+#define KERNEL_TSB_BYTES			(KERNEL_TSB_ENTRIES * sizeof(TsbEntry))
+
+struct kernel_args;
+
+extern status_t sparc_mmu_init_tsb(struct kernel_args *args);
+extern void sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
+	uint64 flags);
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

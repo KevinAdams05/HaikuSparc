@@ -74,6 +74,12 @@ arch_vm_translation_map_init(kernel_args *args,
 	// before %tba is repointed -- see sparc-port/PHASE2_MMU_DESIGN.md.
 	sparc_dump_openfirmware_translations();
 
+	// Build the kernel's TSB and warm it with those translations. Nothing
+	// points at it yet: the hardware still uses the firmware's TSB and the
+	// firmware's trap handlers. This only gets the structure in place so it
+	// can be inspected before the cutover depends on it.
+	sparc_mmu_init_tsb(args);
+
 	return B_OK;
 }
 
@@ -139,6 +145,12 @@ arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
 			return B_ERROR;
 		}
 	}
+
+	// Record it in the kernel's TSB as well, so that structure tracks reality
+	// and is ready when the kernel takes the MMU over. Harmless until then --
+	// nothing reads it yet.
+	sparc_tsb_insert(va, pa, TTE_WRITABLE | TTE_PRIVILEGED
+		| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL);
 
 	// "map" takes ( mode size virt phys.hi phys.lo -- ) and returns nothing, so
 	// the value here reports only whether the client-interface call itself got
