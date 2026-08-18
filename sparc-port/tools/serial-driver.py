@@ -39,6 +39,19 @@ KEY_UP = "\x1b[A"
 KEY_DOWN = "\x1b[B"
 ENTER = "\r"
 
+# The menu also accepts vi keys (text_menu.cpp), which are single bytes and so
+# far more robust over a serial line than three-byte escape sequences.
+UP = "k"
+DOWN = "j"
+
+# Navigation clamps at both ends rather than wrapping -- select_next_valid_item
+# falls back to last_selectable_item -- so a burst of one key reliably parks the
+# selection on the first or last entry regardless of how many items a menu has.
+# That matters because the Debug Options menu's length varies with build
+# options.
+TO_TOP = UP * 12
+TO_BOTTOM = DOWN * 12
+
 BOOT_DEVICE = "/pci@1fe,0/pci@1,1/ide@3/ide@0/disk@0"
 BOOT_COMMAND = "boot %s:a,\\loader.elf" % BOOT_DEVICE
 
@@ -72,6 +85,24 @@ SCRIPTS = {
         # booting" entry, itself already highlighted. So three Enters in total.
         (r"Select Boot Volume/State", ENTER),
         (r"Continue booting", ENTER),
+        (r"load kernel", None),
+    ],
+    # Same, but turns on serial_debug_output first, so the kernel's early
+    # output -- including any panic -- comes to the serial console instead of
+    # the framebuffer blue screen where nothing can read it. Going through the
+    # menu passes the flag in kernel_args and avoids the driver settings file,
+    # which currently corrupts the loader (see PROGRESS.md section 15).
+    "boot-kernel-debug": [
+        (r"0 >", BOOT_COMMAND + "\n"),
+        (r"Select boot volume/state", ENTER),
+        (r"Select Boot Volume/State", ENTER),
+        # Main menu: park at the top, then down twice to "Select debug options".
+        (r"Continue booting", TO_TOP + DOWN + DOWN + ENTER),
+        # "Enable serial debug output" is the first entry and is markable, so
+        # Enter toggles it and stays put. Then park at the bottom, which is
+        # "Return to main menu".
+        (r"Debug Options", ENTER + TO_BOTTOM + ENTER),
+        (r"Continue booting", TO_BOTTOM + ENTER),
         (r"load kernel", None),
     ],
 }

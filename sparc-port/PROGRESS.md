@@ -674,6 +674,73 @@ needs a few more keystrokes in `serial-driver.py` and avoids this bug entirely.
 
 ---
 
+## 16. The panic, found and fixed — and the Phase 2 gate reached
+
+### The panic was an assertion about interrupts
+
+Reading it needed the spin-loop technique from §14, because breakpoints do not work here: `panic()`
+was temporarily patched to spin, and gdb attached afterwards to read the call frame.
+
+```
+pc  = panic + 44                      (the spin)
+i7  = 0x800afbc8                      (the caller)
+o7  = panic + 16
+```
+
+Disassembling the call site gave the argument registers, and `%o2 = 0x4f7 = 1271` is a **line
+number** — so this was an `ASSERT`, not a hand-written panic:
+
+```c
+smp.cpp:1271:   ASSERT(!are_interrupts_enabled());
+```
+
+**The kernel was being entered with interrupts still enabled.** Open Firmware runs with
+`PSTATE.IE` set, `arch_start_kernel` did not clear it, and the kernel has no other opportunity to
+before that assertion — which fires before it has any means of reporting the failure. Fixed by
+clearing `PSTATE.IE` (bit 1, TABLE 14-12) in `arch_start_kernel.S` immediately before the jump.
+
+Worth noting how indirect this was: the trap trace showed `pstate: 00000014` at the *fault*, with
+IE clear, because by then `panic()` had already called `disable_interrupts()`. The offending
+state was gone by the time anything reported it.
+
+### Attaching gdb early corrupts the boot
+
+A harness bug found on the way, now worked around with `--filler-iso` / `--filler-floppy`: if gdb
+connects while Open Firmware is reading the kernel off disk, the read fails and the loader dies at
+`0xffd1c184`. Attaching *after* the kernel is running is reliable. For the spin-loop technique
+this costs nothing, since the machine waits forever.
+
+### How far the kernel gets now
+
+```
+_start → smp_set_num_cpus → cpu_preboot_init_percpu → arch_cpu_preboot_init_percpu
+       → thread_preboot_init_percpu → arch_platform_init → debug_init
+       → debug_paranoia_init → frame_buffer_console_init → mutex_init
+       → debug_output → interrupts_init
+       → vm_init → vm_page_init_num_pages → slab_init → MemoryManager::Init
+       → rw_lock_init → vm_allocate_early → [fault]
+```
+
+It initialises the platform, the debug output layer, the frame buffer console, locking, and the
+interrupt layer, and then enters **`vm_init`**. It dies in `MemoryManager::_AllocateArea` on
+`stx %g1, [%i5 + 0x20]` — a write to memory that `vm_allocate_early` has just handed back.
+
+**That is the Phase 2 gate, and this is the expected failure.**
+`arch_vm_translation_map.cpp`'s `early_map()` is a no-op and `create_map()` yields a null map, so
+the address was allocated but never mapped. Trap totals for the run: 51,771 clean-window, 9,926
+spill, 9,924 fill, 700 data-MMU-miss, 38 instruction-MMU-miss — all still serviced by Open
+Firmware, `tbr` unchanged.
+
+### Kernel debug output still is not on serial
+
+`debug_output` and `vsnprintf` are in the trace, so the kernel *is* producing messages — they go
+to `frame_buffer_console`, not the serial port, so we still cannot read them. Enabling
+"serial debug output" through the boot menu (`--script boot-kernel-debug`) did not change this.
+Worth resolving early in Phase 2: `arch_debug_serial_early_boot_message()` is an empty stub, and
+that is the function specifically meant for fatal situations before the console is up.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
@@ -684,13 +751,15 @@ gate described in the plan's §4.1 and §4.2.
    tracing is the instrument that does.
 2. ~~Chase the `%g3` corruption~~ — **root-caused and fixed, see §15.** A 32-bit write to a 64-bit
    `R_SPARC_RELATIVE` GOT slot on a big-endian target. `gl: 2` was a red herring.
-3. **Read the panic message.** The kernel now reaches early init and panics; the text is going to
-   the framebuffer. Add the *Debug Options → Enable serial debug output* keystrokes to
-   `serial-driver.py`, which routes it through `kernel_args` and sidesteps the settings-file bug
-   in §15.
-4. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
+3. ~~Read the panic message~~ — **done, see §16.** It was `ASSERT(!are_interrupts_enabled())`;
+   the kernel was entered with `PSTATE.IE` still set. Fixed, and the kernel now reaches `vm_init`.
+4. **Get kernel debug output onto serial** (§16). It currently goes to the frame buffer console.
+   Implementing `arch_debug_serial_early_boot_message()` — an empty stub, and the function meant
+   for exactly this — is the obvious first move. Do this before writing trap-table assembly:
+   Phase 2 without kernel output would be needlessly blind.
+5. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
    dies with `gCallOpenFirmware` corrupt. Shared with PowerPC, so likely upstreamable.
-5. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
+6. **Phase 2 proper**: trap table at `%tba`, window spill/fill handlers, a real `struct iframe`,
    TSB allocation, the TLB-miss fast path, demap and invalidate, `early_map` and `create_map`.
    Ships as one unit. Port OpenBSD's `pmap.c` (2-clause BSD) closely rather than inventing.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts

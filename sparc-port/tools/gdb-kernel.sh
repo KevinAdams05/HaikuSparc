@@ -37,6 +37,8 @@ script=boot-kernel
 batch=
 interrupt_on=
 interrupt_delay=3
+filler_iso_arg=
+filler_fd_arg=
 
 usage() {
 	cat <<EOF
@@ -82,6 +84,8 @@ while [[ $# -gt 0 ]]; do
 		--batch)  batch="$2"; shift 2 ;;
 		--interrupt-on)    interrupt_on="$2"; shift 2 ;;
 		--interrupt-delay) interrupt_delay="$2"; shift 2 ;;
+		--filler-iso)      filler_iso_arg="$2"; shift 2 ;;
+		--filler-floppy)   filler_fd_arg="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		--) shift; break ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -107,14 +111,20 @@ fi
 
 # Empty removable drives make OpenBIOS misbehave: opening an empty CD-ROM traps
 # inside the firmware, and scanning an empty floppy hangs. Give both media.
-filler_iso="$work/filler.iso"
-filler_fd="$work/filler.fd"
-if [[ ! -f "$filler_iso" ]]; then
-	mkdir -p "$work/isoroot" && : > "$work/isoroot/placeholder"
+filler_iso="${filler_iso_arg:-$work/filler.iso}"
+filler_fd="${filler_fd_arg:-$work/filler.fd}"
+if [[ -z "$filler_iso_arg" ]]; then
+	# The placeholder needs actual content: an ISO built from an empty file
+	# still trips the firmware's empty-media bug, which presents as a trap at
+	# 0xffd1c184 during the loader's device scan.
+	mkdir -p "$work/isoroot"
+	head -c 65536 /dev/urandom > "$work/isoroot/placeholder"
 	xorriso -as mkisofs -quiet -o "$filler_iso" "$work/isoroot" 2>/dev/null \
-		|| dd if=/dev/zero of="$filler_iso" bs=1M count=1 status=none
+		|| dd if=/dev/zero of="$filler_iso" bs=1M count=4 status=none
 fi
-dd if=/dev/zero of="$filler_fd" bs=1024 count=1440 status=none
+if [[ -z "$filler_fd_arg" ]]; then
+	dd if=/dev/zero of="$filler_fd" bs=1024 count=1440 status=none
+fi
 
 cleanup() {
 	[[ -n "${qemu_pid:-}" ]] && kill "$qemu_pid" 2>/dev/null || true
