@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="780" viewBox="0 0 1020 780" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6472"/>
+    </marker>
+  </defs>
+
+  <rect width="1020" height="780" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1019" height="779" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Register windows: the reason SPARC context switching is not mechanical</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">Live thread state lives inside the CPU, not on the stack. Until spill and fill handlers are correct, no nontrivial C code is safe to run.</text>
+
+  <!-- window overlap -->
+  <text x="56" y="106" font-size="14.5" font-weight="600" fill="#1a1d24">Adjacent windows physically share registers</text>
+
+  <!-- Window N -->
+  <rect x="80" y="124" width="130" height="42" rx="4" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="145" y="150" font-size="12.5" fill="#1a1d24" text-anchor="middle">%i0–%i7</text>
+  <rect x="210" y="124" width="130" height="42" rx="4" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="275" y="150" font-size="12.5" fill="#1a1d24" text-anchor="middle">%l0–%l7</text>
+  <rect x="340" y="124" width="130" height="42" rx="4" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="405" y="150" font-size="12.5" fill="#1a1d24" text-anchor="middle">%o0–%o7</text>
+  <text x="490" y="150" font-size="12.5" font-weight="600" fill="#2563a8">caller (CWP = N)</text>
+
+  <!-- Window N-1 -->
+  <rect x="340" y="180" width="130" height="42" rx="4" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="405" y="206" font-size="12.5" fill="#1a1d24" text-anchor="middle">%i0–%i7</text>
+  <rect x="470" y="180" width="130" height="42" rx="4" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="535" y="206" font-size="12.5" fill="#1a1d24" text-anchor="middle">%l0–%l7</text>
+  <rect x="600" y="180" width="130" height="42" rx="4" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="665" y="206" font-size="12.5" fill="#1a1d24" text-anchor="middle">%o0–%o7</text>
+  <text x="750" y="206" font-size="12.5" font-weight="600" fill="#2563a8">callee, after save</text>
+
+  <!-- Window N-2 -->
+  <rect x="600" y="236" width="130" height="42" rx="4" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="665" y="262" font-size="12.5" fill="#1a1d24" text-anchor="middle">%i0–%i7</text>
+  <rect x="730" y="236" width="130" height="42" rx="4" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="795" y="262" font-size="12.5" fill="#1a1d24" text-anchor="middle">%l0–%l7</text>
+  <rect x="860" y="236" width="130" height="42" rx="4" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="925" y="262" font-size="12.5" fill="#1a1d24" text-anchor="middle">%o0–%o7</text>
+
+  <text x="56" y="300" font-size="12.5" fill="#404752">Purple blocks are shared silicon: a <tspan font-weight="600">save</tspan> makes the caller's <tspan font-family="monospace">%o</tspan> registers become the callee's <tspan font-family="monospace">%i</tspan> registers, so argument</text>
+  <text x="56" y="320" font-size="12.5" fill="#404752">passing is free and <tspan font-family="monospace">%o7</tspan> becomes <tspan font-family="monospace">%i7</tspan>. But the file holds only <tspan font-weight="600">8 windows</tspan> — the ring wraps, and that is where trouble starts.</text>
+
+  <!-- spill/fill panel -->
+  <rect x="56" y="344" width="440" height="222" rx="7" fill="#fceae8" stroke="#c0392b"/>
+  <text x="76" y="370" font-size="14.5" font-weight="600" fill="#96271b">Running out of windows is a trap</text>
+  <text x="76" y="394" font-size="12.5" fill="#404752">Call deeper than the ring allows and the CPU raises a</text>
+  <text x="76" y="412" font-size="12.5" fill="#404752"><tspan font-weight="600">spill</tspan> trap: our handler must write the oldest window out</text>
+  <text x="76" y="430" font-size="12.5" fill="#404752">to that thread's stack to free a slot.</text>
+  <text x="76" y="456" font-size="12.5" fill="#404752">Return past what is resident and it raises a <tspan font-weight="600">fill</tspan> trap:</text>
+  <text x="76" y="474" font-size="12.5" fill="#404752">our handler must read the window back off the stack.</text>
+  <text x="76" y="502" font-size="12.5" fill="#404752">The bookkeeping lives in <tspan font-family="monospace">CANSAVE</tspan>, <tspan font-family="monospace">CANRESTORE</tspan>,</text>
+  <text x="76" y="520" font-size="12.5" fill="#404752"><tspan font-family="monospace">CLEANWIN</tspan>, <tspan font-family="monospace">OTHERWIN</tspan> and <tspan font-family="monospace">WSTATE</tspan>. Getting any of them</text>
+  <text x="76" y="538" font-size="12.5" fill="#404752">wrong corrupts state silently, then crashes somewhere</text>
+  <text x="76" y="556" font-size="12.5" fill="#404752">unrelated. This is where SPARC ports usually stall.</text>
+
+  <!-- context switch panel -->
+  <rect x="536" y="344" width="428" height="222" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="556" y="370" font-size="14.5" font-weight="600" fill="#146638">Which makes a context switch short, but late</text>
+  <text x="556" y="394" font-size="12.5" fill="#404752">Once spill and fill are right, switching threads is barely</text>
+  <text x="556" y="412" font-size="12.5" fill="#404752">any code at all:</text>
+  <rect x="556" y="426" width="388" height="86" rx="5" fill="#ffffff" stroke="#bcd9c8"/>
+  <text x="572" y="448" font-size="12.5" font-family="monospace" fill="#146638">flushw</text>
+  <text x="640" y="448" font-size="11.5" fill="#5b6472">! push every live window to the stack</text>
+  <text x="572" y="470" font-size="12.5" font-family="monospace" fill="#146638">save %sp of "from", load %sp of "to"</text>
+  <text x="572" y="492" font-size="12.5" font-family="monospace" fill="#146638">swap %o7 / globals / PSTATE, then ret</text>
+  <text x="556" y="534" font-size="12.5" fill="#404752">The register file empties itself into the outgoing thread's</text>
+  <text x="556" y="552" font-size="12.5" fill="#404752">stack, so only the stack pointer really has to change.</text>
+
+  <!-- bottom band -->
+  <rect x="56" y="588" width="908" height="118" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="614" font-size="14" font-weight="600" fill="#1a1d24">Consequences that shape the schedule</text>
+  <text x="76" y="640" font-size="12.5" fill="#404752">· <tspan font-weight="600">struct arch_thread</tspan> holds only <tspan font-family="monospace">sp</tspan> and an interrupt stack today. It needs real saved state, and <tspan font-weight="600">struct iframe</tspan> is referenced but never defined.</text>
+  <text x="76" y="662" font-size="12.5" fill="#404752">· Kernel stacks must be sized and aligned for spilled windows, with the SPARC V9 <tspan font-weight="600">2047-byte stack bias</tspan> applied consistently.</text>
+  <text x="76" y="684" font-size="12.5" fill="#404752">· KDL backtraces require unwinding spilled windows, so <tspan font-family="monospace">arch_debug.cpp</tspan> is not optional polish — it is the debugger for everything after it.</text>
+
+  <text x="40" y="742" font-size="12" fill="#5b6472">Window state registers and the spill_n_* / fill_n_* trap types: UltraSPARC Architecture 2005 spec pp.73, 87, 151, 212; SPARC V9 Architecture Manual.</text>
+  <text x="40" y="764" font-size="12" fill="#5b6472">Working reference implementation: OpenBSD sys/arch/sparc64/sparc64/locore.s (6,504 lines) — see the licensing note in the plan before drawing from it.</text>
+</svg>

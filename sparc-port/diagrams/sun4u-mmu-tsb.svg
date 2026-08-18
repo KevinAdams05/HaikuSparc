@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="790" viewBox="0 0 1020 790" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6472"/>
+    </marker>
+  </defs>
+
+  <rect width="1020" height="790" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1019" height="789" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Why sun4u needs a trap table before it can have an MMU</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">UltraSPARC has no hardware page-table walker. Every TLB miss is a software trap — so the MMU and the trap table are one problem, not two.</text>
+
+  <!-- VA -->
+  <rect x="56" y="92" width="908" height="50" rx="7" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="76" y="122" font-size="14" fill="#1a1d24">Load, store, or instruction fetch issues a <tspan font-weight="600">virtual address + context id</tspan></text>
+
+  <line x1="510" y1="142" x2="510" y2="170" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)"/>
+
+  <!-- TLB -->
+  <rect x="56" y="176" width="908" height="56" rx="7" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="76" y="200" font-size="14" font-weight="600" fill="#1a1d24">I-TLB / D-TLB lookup — 64 fully-associative entries each, 8 KB base page size</text>
+  <text x="76" y="221" font-size="12.5" fill="#404752">Hardware only. This is the entire extent of the hardware's involvement in translation.</text>
+
+  <path d="M 270 232 L 270 262" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)" fill="none"/>
+  <path d="M 754 232 L 754 262" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)" fill="none"/>
+
+  <!-- HIT -->
+  <rect x="56" y="268" width="428" height="60" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="76" y="292" font-size="14" font-weight="600" fill="#146638">HIT — the common case</text>
+  <text x="76" y="313" font-size="12.5" fill="#404752">Physical address produced, execution continues. No software involved.</text>
+
+  <!-- MISS -->
+  <rect x="536" y="268" width="428" height="60" rx="7" fill="#fceae8" stroke="#c0392b"/>
+  <text x="556" y="292" font-size="14" font-weight="600" fill="#96271b">MISS — a trap, every single time</text>
+  <text x="556" y="313" font-size="12.5" fill="#404752">There is no walker. Software must resolve this or the CPU stops.</text>
+
+  <line x1="754" y1="328" x2="754" y2="356" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)"/>
+
+  <!-- hardware assist -->
+  <rect x="536" y="362" width="428" height="96" rx="7" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="556" y="386" font-size="13.5" font-weight="600" fill="#4a2b70">Hardware does exactly three favours, then gets out of the way</text>
+  <text x="556" y="407" font-size="12.5" fill="#404752">1 · latches faulting VA + context into TLB Tag Access</text>
+  <text x="556" y="426" font-size="12.5" fill="#404752">2 · precomputes a TSB pointer from TSB Base and the hashed VA</text>
+  <text x="556" y="445" font-size="12.5" fill="#404752">3 · vectors to a fixed offset in the trap table at %tba</text>
+
+  <line x1="754" y1="458" x2="754" y2="486" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)"/>
+
+  <!-- fast path -->
+  <rect x="536" y="492" width="428" height="94" rx="7" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="556" y="516" font-size="13.5" font-weight="600" fill="#8a6508">Our asm fast path — a handful of instructions, no stack, no C</text>
+  <text x="556" y="537" font-size="12.5" fill="#404752">Load the candidate TTE from the TSB, compare its tag against the</text>
+  <text x="556" y="556" font-size="12.5" fill="#404752">faulting VA. It runs on every miss, so its cost is the port's</text>
+  <text x="556" y="575" font-size="12.5" fill="#404752">steady-state memory performance.</text>
+
+  <path d="M 640 586 L 640 616" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)" fill="none"/>
+  <path d="M 868 586 L 868 616" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a2)" fill="none"/>
+
+  <rect x="536" y="622" width="204" height="86" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="551" y="644" font-size="12.5" font-weight="600" fill="#146638">Tag matches</text>
+  <text x="551" y="664" font-size="11.5" fill="#404752">stxa the TTE straight</text>
+  <text x="551" y="681" font-size="11.5" fill="#404752">into the TLB, then</text>
+  <text x="551" y="698" font-size="11.5" fill="#404752">retry the instruction.</text>
+
+  <rect x="760" y="622" width="204" height="86" rx="7" fill="#fceae8" stroke="#c0392b"/>
+  <text x="775" y="644" font-size="12.5" font-weight="600" fill="#96271b">Tag misses</text>
+  <text x="775" y="664" font-size="11.5" fill="#404752">Fall out to C: walk the</text>
+  <text x="775" y="681" font-size="11.5" fill="#404752">Haiku translation map,</text>
+  <text x="775" y="698" font-size="11.5" fill="#404752">refill TSB, or fault.</text>
+
+  <!-- left info panel -->
+  <rect x="56" y="362" width="428" height="346" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="390" font-size="14.5" font-weight="600" fill="#1a1d24">What this means for the work plan</text>
+
+  <line x1="76" y1="402" x2="464" y2="402" stroke="#e3e6ec"/>
+
+  <text x="76" y="426" font-size="12.5" font-weight="600" fill="#2563a8">The TSB is ours to own</text>
+  <text x="76" y="446" font-size="12.5" fill="#404752">A direct-mapped, software-managed cache of TTEs</text>
+  <text x="76" y="464" font-size="12.5" fill="#404752">in ordinary physical memory. Haiku must allocate</text>
+  <text x="76" y="482" font-size="12.5" fill="#404752">it, point the TSB register at it, and keep it</text>
+  <text x="76" y="500" font-size="12.5" fill="#404752">coherent with VMTranslationMap on every unmap.</text>
+
+  <text x="76" y="530" font-size="12.5" font-weight="600" fill="#2563a8">The handler lives in the trap table</text>
+  <text x="76" y="550" font-size="12.5" fill="#404752">It cannot be a normal function — it runs with no</text>
+  <text x="76" y="568" font-size="12.5" fill="#404752">usable stack. So Phase "MMU" and Phase "traps"</text>
+  <text x="76" y="586" font-size="12.5" fill="#404752">cannot be sequenced; they ship together.</text>
+
+  <text x="76" y="616" font-size="12.5" font-weight="600" fill="#2563a8">Two TLBs, two contexts, two demap paths</text>
+  <text x="76" y="636" font-size="12.5" fill="#404752">I and D MMUs are separate, each with its own ASI</text>
+  <text x="76" y="654" font-size="12.5" fill="#404752">block. Primary vs. secondary context is the</text>
+  <text x="76" y="672" font-size="12.5" fill="#404752">mechanism that lets a kernel in its own address</text>
+  <text x="76" y="690" font-size="12.5" fill="#404752">space still reach user memory — see ticket #19597.</text>
+
+  <text x="40" y="748" font-size="12" fill="#5b6472">Register and ASI layout: UltraSPARC-IIi User's Manual — MMU overview p.23, demap operations pp.85–86, TLB/TSB register block Table 6-10.</text>
+  <text x="40" y="770" font-size="12" fill="#5b6472">Those constants are already transcribed in Haiku's src/system/kernel/arch/sparc/arch_mmu.cpp — the reading side exists; the managing side does not.</text>
+</svg>

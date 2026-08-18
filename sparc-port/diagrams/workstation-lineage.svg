@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="830" viewBox="0 0 1020 830" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1020" height="830" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1019" height="829" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Four generations of 64-bit Sun workstation — and why only one of them is worth sourcing</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">All are sun4u, so all are in scope for a sparc64 Haiku. What separates them is whether Haiku already has drivers for the peripherals.</text>
+
+  <!-- column headers -->
+  <text x="76" y="102" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">GENERATION &amp; MACHINES</text>
+  <text x="356" y="102" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">HOST BRIDGE / IO</text>
+  <text x="512" y="102" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">STORAGE</text>
+  <text x="658" y="102" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">NETWORK</text>
+  <text x="804" y="102" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">ONBOARD VIDEO</text>
+
+  <!-- BAND 1: SBus -->
+  <rect x="56" y="112" width="908" height="146" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="136" font-size="14.5" font-weight="600" fill="#1a1d24">SBus era · 1995–1997</text>
+  <text x="76" y="157" font-size="12.5" fill="#404752">Ultra 1, Ultra 1E, Ultra 2</text>
+  <text x="76" y="176" font-size="12.5" fill="#5b6472">UltraSPARC I / II</text>
+  <rect x="76" y="190" width="176" height="22" rx="11" fill="#fceae8" stroke="#c0392b"/>
+  <text x="164" y="205" font-size="11" font-weight="600" fill="#96271b" text-anchor="middle">HAIKU COVERAGE: NONE</text>
+  <text x="76" y="232" font-size="11.5" fill="#8a93a3">No PCI at all — every driver</text>
+  <text x="76" y="248" font-size="11.5" fill="#8a93a3">would be written from zero.</text>
+
+  <text x="356" y="136" font-size="12.5" fill="#1a1d24">SYSIO</text>
+  <text x="356" y="155" font-size="12" fill="#5b6472">SBus, no PCI</text>
+  <text x="512" y="136" font-size="12.5" fill="#1a1d24">esp / fas SCSI</text>
+  <text x="512" y="155" font-size="12" fill="#5b6472">SBus attached</text>
+  <text x="658" y="136" font-size="12.5" fill="#1a1d24">hme (SBus)</text>
+  <text x="804" y="136" font-size="12.5" fill="#1a1d24">cgsix, FFB</text>
+
+  <!-- BAND 2: psycho -->
+  <rect x="56" y="270" width="908" height="146" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="294" font-size="14.5" font-weight="600" fill="#1a1d24">psycho era · 1997–1999</text>
+  <text x="76" y="315" font-size="12.5" fill="#404752">Ultra 30, Ultra 60, Ultra 80</text>
+  <text x="76" y="334" font-size="12.5" fill="#5b6472">UltraSPARC II, up to 4 sockets</text>
+  <rect x="76" y="348" width="176" height="22" rx="11" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="164" y="363" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">COVERAGE: PARTIAL</text>
+  <text x="76" y="390" font-size="11.5" fill="#8a93a3">Haiku's 53c8xx may cover the</text>
+  <text x="76" y="406" font-size="11.5" fill="#8a93a3">Symbios SCSI. Video would not.</text>
+
+  <text x="356" y="294" font-size="12.5" fill="#1a1d24">psycho / psycho+</text>
+  <text x="356" y="313" font-size="12" fill="#5b6472">UPA to dual PCI</text>
+  <text x="356" y="332" font-size="12" fill="#5b6472">ebus for legacy IO</text>
+  <text x="512" y="294" font-size="12.5" fill="#1a1d24">Symbios 53C875</text>
+  <text x="512" y="313" font-size="12" fill="#5b6472">SCSI only, no IDE</text>
+  <text x="658" y="294" font-size="12.5" fill="#1a1d24">hme</text>
+  <text x="658" y="313" font-size="12" fill="#5b6472">Happy Meal 10/100</text>
+  <text x="804" y="294" font-size="12.5" fill="#1a1d24">Creator3D / FFB</text>
+  <text x="804" y="313" font-size="12" fill="#5b6472">UPA framebuffer</text>
+
+  <!-- BAND 3: sabre - TARGET -->
+  <rect x="56" y="428" width="908" height="164" rx="7" fill="#e6f4ec" stroke="#1f8b4d" stroke-width="2"/>
+  <rect x="56" y="428" width="908" height="26" rx="7" fill="#1f8b4d"/>
+  <rect x="56" y="446" width="908" height="8" fill="#1f8b4d"/>
+  <text x="76" y="446" font-size="12" font-weight="600" fill="#ffffff" letter-spacing="0.6">TARGET GENERATION — THE ONLY IDE-BASED SUN WORKSTATIONS</text>
+  <text x="76" y="480" font-size="14.5" font-weight="600" fill="#1a1d24">sabre era · 1998–2003</text>
+  <text x="76" y="501" font-size="12.5" fill="#404752">Ultra 5, Ultra 10, Blade 100, Blade 150</text>
+  <text x="76" y="520" font-size="12.5" fill="#5b6472">UltraSPARC IIi and IIe</text>
+  <rect x="76" y="534" width="176" height="22" rx="11" fill="#d9f0e3" stroke="#1f8b4d"/>
+  <text x="164" y="549" font-size="11" font-weight="600" fill="#146638" text-anchor="middle">COVERAGE: BEST AVAILABLE</text>
+  <text x="76" y="576" font-size="11.5" fill="#5b6472">Also the generation QEMU emulates.</text>
+
+  <text x="356" y="480" font-size="12.5" font-weight="600" fill="#1a1d24">sabre + simba (APB)</text>
+  <text x="356" y="499" font-size="12" fill="#5b6472">One bridge for both</text>
+  <text x="356" y="518" font-size="12" fill="#5b6472">IIi and IIe CPUs</text>
+  <text x="356" y="543" font-size="12" fill="#5b6472">Ultra: PCIO + ebus</text>
+  <text x="356" y="562" font-size="12" fill="#5b6472">Blade: ALi M1535D+</text>
+
+  <text x="512" y="480" font-size="12.5" font-weight="600" fill="#146638">IDE / ATA</text>
+  <text x="512" y="499" font-size="12" fill="#5b6472">Ultra 5/10: CMD646</text>
+  <text x="512" y="518" font-size="12" fill="#5b6472">Blade: ALi M5229</text>
+  <text x="512" y="543" font-size="12" fill="#5b6472">Haiku's stack is</text>
+  <text x="512" y="562" font-size="12" fill="#5b6472">ATA-native</text>
+
+  <text x="658" y="480" font-size="12.5" fill="#1a1d24">Ultra 5/10: hme</text>
+  <text x="658" y="499" font-size="12" fill="#5b6472">no Haiku driver yet</text>
+  <text x="658" y="524" font-size="12.5" font-weight="600" fill="#146638">Blade: DM9102</text>
+  <text x="658" y="543" font-size="12" fill="#5b6472">already supported by</text>
+  <text x="658" y="562" font-size="12" fill="#5b6472">Haiku's dec21xxx</text>
+
+  <text x="804" y="480" font-size="12.5" font-weight="600" fill="#146638">ATI Mach64</text>
+  <text x="804" y="499" font-size="12" fill="#5b6472">PGX24 / PGX64</text>
+  <text x="804" y="518" font-size="12" fill="#5b6472">Rage Pro / Rage XL</text>
+  <text x="804" y="543" font-size="12" fill="#5b6472">Haiku's ati driver</text>
+  <text x="804" y="562" font-size="12" fill="#5b6472">already lists 0x4752</text>
+
+  <!-- BAND 4: schizo/tomatillo -->
+  <rect x="56" y="604" width="908" height="146" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="628" font-size="14.5" font-weight="600" fill="#1a1d24">schizo / tomatillo era · 2001–2008</text>
+  <text x="76" y="649" font-size="12.5" fill="#404752">Blade 1000, 2000, 1500, 2500, Ultra 25, Ultra 45</text>
+  <text x="76" y="668" font-size="12.5" fill="#5b6472">UltraSPARC III, III Cu, IIIi</text>
+  <rect x="76" y="682" width="176" height="22" rx="11" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="164" y="697" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">COVERAGE: PARTIAL</text>
+  <text x="76" y="724" font-size="11.5" fill="#8a93a3">Different CPU generation — new</text>
+  <text x="76" y="740" font-size="11.5" fill="#8a93a3">errata, and QEMU does not model it.</text>
+
+  <text x="356" y="628" font-size="12.5" fill="#1a1d24">schizo, tomatillo</text>
+  <text x="356" y="647" font-size="12" fill="#5b6472">JBus on the IIIi parts</text>
+  <text x="512" y="628" font-size="12.5" fill="#1a1d24">QLogic isp SCSI</text>
+  <text x="512" y="647" font-size="12" fill="#5b6472">no Haiku driver</text>
+  <text x="512" y="666" font-size="12" fill="#5b6472">later models add SATA</text>
+  <text x="658" y="628" font-size="12.5" fill="#1a1d24">gem, then bge</text>
+  <text x="658" y="647" font-size="12" fill="#5b6472">Haiku has broadcom570x</text>
+  <text x="804" y="628" font-size="12.5" fill="#1a1d24">XVR-100 / XVR-500</text>
+  <text x="804" y="647" font-size="12" fill="#5b6472">XVR-100 is an RV100 —</text>
+  <text x="804" y="666" font-size="12" fill="#5b6472">Haiku's radeon lists it</text>
+
+  <text x="40" y="782" font-size="12" fill="#5b6472">Bridge ID from OpenBSD dev/psycho.c: "sabre is the UltraSPARC IIi and IIe onboard UPA to PCI bridge" — one bridge driver covers all four target machines.</text>
+  <text x="40" y="804" font-size="12" fill="#5b6472">Haiku driver claims verified in-tree: ati/driver.cpp 0x4752, dec21xxx if_dcreg.h DC_TYPE_DM9102, radeon detect.c DEVICE_ID_RADEON_QY.</text>
+</svg>

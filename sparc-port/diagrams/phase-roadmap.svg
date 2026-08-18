@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="930" viewBox="0 0 1020 930" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1020" height="930" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1019" height="929" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Phase plan — strictly ordered, with one gate that dominates the schedule</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">Every phase has a falsifiable exit criterion. Phase 2 is where SPARC ports usually die — and it must ship as a single piece.</text>
+
+  <text x="124" y="98" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">PHASE &amp; WHAT IT DELIVERS</text>
+  <text x="560" y="98" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">EXIT CRITERION — HOW WE KNOW IT IS DONE</text>
+  <text x="880" y="98" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">RISK</text>
+
+  <!-- connecting rail -->
+  <line x1="90" y1="112" x2="90" y2="838" stroke="#d6d9e0" stroke-width="2"/>
+
+  <!-- P0 -->
+  <rect x="56" y="110" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="144" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="149" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">0</text>
+  <text x="124" y="138" font-size="14" font-weight="600" fill="#1a1d24">Environment and a reproducible boot</text>
+  <text x="124" y="160" font-size="12" fill="#5b6472">Cross toolchain, QEMU sun4u harness, serial capture, fork in place</text>
+  <text x="560" y="138" font-size="12" fill="#404752">Loader prints its banner over serial in QEMU, from a</text>
+  <text x="560" y="156" font-size="12" fill="#404752">scripted one-command run.</text>
+  <rect x="880" y="134" width="64" height="20" rx="10" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="912" y="148" font-size="11" font-weight="600" fill="#146638" text-anchor="middle">LOW</text>
+
+  <!-- P1 -->
+  <rect x="56" y="186" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="220" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="225" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">1</text>
+  <text x="124" y="214" font-size="14" font-weight="600" fill="#1a1d24">Bootable media</text>
+  <text x="124" y="236" font-size="12" fill="#5b6472">Sun-disklabelled image and a netboot path; closes a documented gap</text>
+  <text x="560" y="214" font-size="12" fill="#404752">Both `boot disk` and `boot net` reach the loader</text>
+  <text x="560" y="232" font-size="12" fill="#404752">unattended, in QEMU and on real hardware.</text>
+  <rect x="880" y="210" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="224" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P2 GATE -->
+  <rect x="56" y="262" width="908" height="80" rx="7" fill="#fceae8" stroke="#c0392b" stroke-width="2"/>
+  <circle cx="90" cy="302" r="17" fill="#f8d5d1" stroke="#c0392b" stroke-width="2"/>
+  <text x="90" y="307" font-size="14" font-weight="600" fill="#96271b" text-anchor="middle">2</text>
+  <text x="124" y="288" font-size="14" font-weight="600" fill="#1a1d24">MMU and trap table — ships as one piece</text>
+  <text x="124" y="310" font-size="12" fill="#404752">Table at %tba, spill/fill handlers, a real struct iframe, TSB allocation,</text>
+  <text x="124" y="328" font-size="12" fill="#404752">TLB-miss fast path, demap and invalidate, early_map and create_map</text>
+  <text x="560" y="288" font-size="12" fill="#404752">The kernel maps a page it allocated itself, then</text>
+  <text x="560" y="306" font-size="12" fill="#404752">survives a deliberately provoked TLB miss and a</text>
+  <text x="560" y="324" font-size="12" fill="#404752">forced window overflow.</text>
+  <rect x="880" y="292" width="64" height="20" rx="10" fill="#f8d5d1" stroke="#c0392b"/>
+  <text x="912" y="306" font-size="11" font-weight="600" fill="#96271b" text-anchor="middle">HIGH</text>
+  <rect x="812" y="266" width="46" height="18" rx="9" fill="#c0392b"/>
+  <text x="835" y="279" font-size="10.5" font-weight="600" fill="#ffffff" text-anchor="middle">GATE</text>
+
+  <!-- P3 -->
+  <rect x="56" y="350" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="384" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="389" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">3</text>
+  <text x="124" y="378" font-size="14" font-weight="600" fill="#1a1d24">Context switch</text>
+  <text x="124" y="400" font-size="12" fill="#5b6472">Kernel thread stack setup, _sparc_context_switch, real arch_thread state</text>
+  <text x="560" y="378" font-size="12" fill="#404752">Two kernel threads hand control back and forth</text>
+  <text x="560" y="396" font-size="12" fill="#404752">cooperatively, visible over serial.</text>
+  <rect x="880" y="374" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="388" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P4 -->
+  <rect x="56" y="426" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="460" r="17" fill="#e6f4ec" stroke="#1f8b4d" stroke-width="2"/>
+  <text x="90" y="465" font-size="14" font-weight="600" fill="#146638" text-anchor="middle">4</text>
+  <text x="124" y="454" font-size="14" font-weight="600" fill="#1a1d24">Timer and interrupts — the scheduler milestone</text>
+  <text x="124" y="476" font-size="12" fill="#5b6472">%TICK_CMPR, a real system_time(), SOFTINT and PIL-based dispatch</text>
+  <text x="560" y="454" font-size="12" fill="#404752">A periodic tick preempts a busy loop. The kernel is</text>
+  <text x="560" y="472" font-size="12" fill="#404752">now demonstrably alive.</text>
+  <rect x="880" y="450" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="464" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P5 -->
+  <rect x="56" y="502" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="536" r="17" fill="#f0e9f8" stroke="#6b3fa0" stroke-width="2"/>
+  <text x="90" y="541" font-size="14" font-weight="600" fill="#4a2b70" text-anchor="middle">5</text>
+  <text x="124" y="530" font-size="14" font-weight="600" fill="#1a1d24">KDL and backtraces <tspan font-size="11.5" font-weight="400" fill="#6b3fa0">— start during Phase 2, not after</tspan></text>
+  <text x="124" y="552" font-size="12" fill="#5b6472">Window-aware stack unwinder, debug variable support</text>
+  <text x="560" y="530" font-size="12" fill="#404752">KDL prints a correct backtrace across a spilled</text>
+  <text x="560" y="548" font-size="12" fill="#404752">window boundary.</text>
+  <rect x="880" y="526" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="540" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P6 -->
+  <rect x="56" y="578" width="908" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="616" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="621" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">6</text>
+  <text x="124" y="604" font-size="14" font-weight="600" fill="#1a1d24">Userspace</text>
+  <text x="124" y="626" font-size="12" fill="#5b6472">Syscall entry, the #19597 address-space split and user_memcpy, signal</text>
+  <text x="124" y="644" font-size="12" fill="#5b6472">frames, TLS, fork frames, runtime_loader</text>
+  <text x="560" y="604" font-size="12" fill="#404752">A statically linked hello-world runs to completion</text>
+  <text x="560" y="622" font-size="12" fill="#404752">and exits cleanly, then a dynamically linked one.</text>
+  <rect x="880" y="602" width="64" height="20" rx="10" fill="#f8d5d1" stroke="#c0392b"/>
+  <text x="912" y="616" font-size="11" font-weight="600" fill="#96271b" text-anchor="middle">HIGH</text>
+
+  <!-- P7 -->
+  <rect x="56" y="662" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="696" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="701" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">7</text>
+  <text x="124" y="690" font-size="14" font-weight="600" fill="#1a1d24">Device stack</text>
+  <text x="124" y="712" font-size="12" fill="#5b6472">PCI on sabre and simba plus the IOMMU, ATA on CMD646 and M5229, then hme</text>
+  <text x="560" y="690" font-size="12" fill="#404752">Mount BFS from a real disk; answer a ping.</text>
+  <rect x="880" y="686" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="700" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P8 -->
+  <rect x="56" y="738" width="908" height="68" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <circle cx="90" cy="772" r="17" fill="#e8f0fa" stroke="#2563a8" stroke-width="2"/>
+  <text x="90" y="777" font-size="14" font-weight="600" fill="#2563a8" text-anchor="middle">8</text>
+  <text x="124" y="766" font-size="14" font-weight="600" fill="#1a1d24">Desktop</text>
+  <text x="124" y="788" font-size="12" fill="#5b6472">Open Firmware framebuffer into app_server, later the Mach64 accelerant</text>
+  <text x="560" y="766" font-size="12" fill="#404752">Deskbar renders on a physical monitor.</text>
+  <rect x="880" y="762" width="64" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="912" y="776" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">MED</text>
+
+  <!-- P9 parallel track -->
+  <rect x="56" y="822" width="908" height="62" rx="7" fill="#f0e9f8" stroke="#6b3fa0" stroke-dasharray="6 4"/>
+  <circle cx="90" cy="853" r="17" fill="#ffffff" stroke="#6b3fa0" stroke-width="2"/>
+  <text x="90" y="858" font-size="14" font-weight="600" fill="#4a2b70" text-anchor="middle">9</text>
+  <text x="124" y="846" font-size="14" font-weight="600" fill="#1a1d24">Hardware validation — a continuous track, not a final phase</text>
+  <text x="124" y="868" font-size="12" fill="#5b6472">Every phase from 1 onward is re-run on the Ultra 10 and Blade 150 over serial. QEMU agreement is evidence, never proof.</text>
+
+  <text x="40" y="912" font-size="12" fill="#5b6472">Phases 2 and 6 carry nearly all the risk. Phases 3, 4 and 7 are comparatively mechanical once the gate is passed.</text>
+</svg>

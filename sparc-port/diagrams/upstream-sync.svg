@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="700" viewBox="0 0 1020 700" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6472"/>
+    </marker>
+    <marker id="a4g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f8b4d"/>
+    </marker>
+  </defs>
+
+  <rect width="1020" height="700" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1019" height="699" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Staying close to upstream without merge access</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">Not needed on day one or day one hundred — but the discipline that makes it possible is free if adopted from the first commit.</text>
+
+  <!-- upstream -->
+  <rect x="56" y="98" width="228" height="128" rx="7" fill="#eceef2" stroke="#8a93a3"/>
+  <text x="76" y="124" font-size="14" font-weight="600" fill="#1a1d24">haiku-os/haiku</text>
+  <text x="76" y="146" font-size="12" fill="#404752">Moves fast, mostly in areas</text>
+  <text x="76" y="164" font-size="12" fill="#404752">we never touch. Reaches our</text>
+  <text x="76" y="182" font-size="12" fill="#404752">tree only through periodic</text>
+  <text x="76" y="200" font-size="12" fill="#404752">merges of a pinned commit.</text>
+  <rect x="76" y="208" width="130" height="0" fill="none"/>
+
+  <line x1="284" y1="162" x2="322" y2="162" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a4)"/>
+
+  <!-- analyser -->
+  <rect x="328" y="98" width="250" height="128" rx="7" fill="#e8f0fa" stroke="#2563a8"/>
+  <text x="348" y="124" font-size="14" font-weight="600" fill="#1a1d24">Overlap analyser</text>
+  <text x="348" y="146" font-size="12" fill="#404752">Intersect the files upstream</text>
+  <text x="348" y="164" font-size="12" fill="#404752">changed with the files we have</text>
+  <text x="348" y="182" font-size="12" fill="#404752">changed. That intersection is</text>
+  <text x="348" y="200" font-size="12" fill="#404752">the entire risk surface.</text>
+
+  <path d="M 578 140 L 616 122" stroke="#1f8b4d" stroke-width="1.8" marker-end="url(#a4g)" fill="none"/>
+  <path d="M 578 186 L 616 206" stroke="#5b6472" stroke-width="1.6" marker-end="url(#a4)" fill="none"/>
+
+  <!-- disjoint -->
+  <rect x="622" y="90" width="342" height="66" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="642" y="114" font-size="13.5" font-weight="600" fill="#146638">Disjoint — merge on green CI</text>
+  <text x="642" y="136" font-size="12" fill="#404752">The overwhelming majority. Build both sparc and x86_64,</text>
+  <text x="642" y="150" font-size="12" fill="#404752">merge unattended, no human in the loop.</text>
+
+  <!-- overlap -->
+  <rect x="622" y="172" width="342" height="66" rx="7" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="642" y="196" font-size="13.5" font-weight="600" fill="#8a6508">Overlapping — stop and open an issue</text>
+  <text x="642" y="218" font-size="12" fill="#404752">A human reads it. git rerere replays resolutions we have</text>
+  <text x="642" y="232" font-size="12" fill="#404752">already made, so the same conflict is only paid for once.</text>
+
+  <!-- our repo band -->
+  <rect x="56" y="268" width="908" height="196" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="296" font-size="15" font-weight="600" fill="#1a1d24">KevinAdams05/HaikuSparc — the shape of our diff decides how painful all of the above is</text>
+
+  <rect x="76" y="312" width="416" height="134" rx="6" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="96" y="336" font-size="13.5" font-weight="600" fill="#146638">Class A — inside */arch/sparc/*</text>
+  <text x="96" y="358" font-size="12" fill="#404752">The trap table, the TSB, context switch, the timer.</text>
+  <text x="96" y="376" font-size="12" fill="#404752">Upstream touches these paths only during tree-wide</text>
+  <text x="96" y="394" font-size="12" fill="#404752">sweeps, so conflicts are rare and shallow.</text>
+  <text x="96" y="420" font-size="12" font-weight="600" fill="#146638">Target: 95% of our commits land here.</text>
+  <text x="96" y="438" font-size="12" fill="#5b6472">These are also the commits worth sending to Gerrit.</text>
+
+  <rect x="528" y="312" width="416" height="134" rx="6" fill="#fceae8" stroke="#c0392b"/>
+  <text x="548" y="336" font-size="13.5" font-weight="600" fill="#96271b">Class B — shared, cross-architecture files</text>
+  <text x="548" y="358" font-size="12" fill="#404752">The #19597 address-space split is the big one: it</text>
+  <text x="548" y="376" font-size="12" fill="#404752">changes IS_USER_ADDRESS and user_memcpy for everyone.</text>
+  <text x="548" y="394" font-size="12" fill="#404752">Every such change goes in its own labelled commit and</text>
+  <text x="548" y="412" font-size="12" fill="#404752">into a ledger explaining why it exists.</text>
+  <text x="548" y="438" font-size="12" font-weight="600" fill="#96271b">Keep this list short enough to read in one sitting.</text>
+
+  <!-- upstreaming -->
+  <rect x="56" y="490" width="908" height="112" rx="7" fill="#f0e9f8" stroke="#6b3fa0"/>
+  <text x="76" y="518" font-size="15" font-weight="600" fill="#4a2b70">The real answer to drift is to shrink the diff, not to merge it faster</text>
+  <text x="76" y="544" font-size="12.5" fill="#404752">SPARC is an official Tier-2 Haiku target with no active maintainer. Arch-specific work is exactly what upstream would accept through</text>
+  <text x="76" y="564" font-size="12.5" fill="#404752">review.haiku-os.org — and anything accepted upstream is a patch we no longer carry, no longer merge, and no longer have to defend.</text>
+  <text x="76" y="588" font-size="12.5" fill="#404752">The fork then holds only what is genuinely experimental, which is the state in which a long-lived fork stays cheap.</text>
+
+  <path d="M 500 490 L 500 470 L 170 470 L 170 232" stroke="#6b3fa0" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#a4)" fill="none"/>
+  <text x="186" y="256" font-size="11.5" font-weight="600" fill="#4a2b70">submit Class A upstream</text>
+
+  <text x="40" y="646" font-size="12" fill="#5b6472">Sequencing: fork hygiene and rerere from commit one · pinned-upstream bumps monthly while the kernel is unstable · automate the merge only once</text>
+  <text x="40" y="668" font-size="12" fill="#5b6472">the tree builds reliably, since a merge robot with no CI to gate it is just a faster way to break the build.</text>
+</svg>

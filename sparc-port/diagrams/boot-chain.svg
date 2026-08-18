@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="880" viewBox="0 0 1000 880" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6472"/>
+    </marker>
+  </defs>
+
+  <rect width="1000" height="880" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="999" height="879" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">The SPARC boot chain, and where Haiku stops</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">sun4u / UltraSPARC-IIi + IIe · verified against the Haiku tree at commit 366aed0f87 (August 2026)</text>
+
+  <!-- legend -->
+  <rect x="40" y="84" width="14" height="14" rx="3" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="60" y="96" font-size="12.5" fill="#1a1d24">works today</text>
+  <rect x="160" y="84" width="14" height="14" rx="3" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="180" y="96" font-size="12.5" fill="#1a1d24">partial / gap</text>
+  <rect x="286" y="84" width="14" height="14" rx="3" fill="#fceae8" stroke="#c0392b"/>
+  <text x="306" y="96" font-size="12.5" fill="#1a1d24">stub or absent</text>
+  <rect x="424" y="84" width="14" height="14" rx="3" fill="#eceef2" stroke="#8a93a3"/>
+  <text x="444" y="96" font-size="12.5" fill="#1a1d24">not ours (firmware)</text>
+
+  <!-- S1 firmware -->
+  <rect x="40" y="122" width="560" height="76" rx="7" fill="#eceef2" stroke="#8a93a3"/>
+  <text x="60" y="147" font-size="15" font-weight="600" fill="#1a1d24">1 · Firmware — OpenBoot PROM 3.x / OpenBIOS</text>
+  <text x="60" y="168" font-size="12.5" fill="#404752">IEEE 1275 Open Firmware. Owns the MMU, builds the device tree,</text>
+  <text x="60" y="186" font-size="12.5" fill="#404752">exposes the client interface the loader calls through.</text>
+  <text x="636" y="146" font-size="12" font-weight="600" fill="#5b6472">REAL HW</text>
+  <text x="636" y="164" font-size="12" fill="#404752">OBP in flash, `boot` command</text>
+  <text x="636" y="188" font-size="12" font-weight="600" fill="#5b6472">QEMU</text>
+  <text x="636" y="206" font-size="12" fill="#404752">/usr/share/qemu/openbios-sparc64</text>
+
+  <line x1="320" y1="198" x2="320" y2="230" stroke="#5b6472" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- S2 boot media -->
+  <rect x="40" y="236" width="560" height="84" rx="7" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="60" y="261" font-size="15" font-weight="600" fill="#1a1d24">2 · Boot media — how OF finds the loader</text>
+  <text x="60" y="282" font-size="12.5" fill="#404752">Sun disklabel + boot block on disk, a Sun-labelled hybrid ISO, or</text>
+  <text x="60" y="300" font-size="12.5" fill="#404752">RARP/DHCP + TFTP netboot. Haiku's image build emits none of these.</text>
+  <rect x="500" y="248" width="86" height="20" rx="10" fill="#fdf3dd" stroke="#b8860b"/>
+  <text x="543" y="262" font-size="11" font-weight="600" fill="#8a6508" text-anchor="middle">OPEN GAP</text>
+  <text x="636" y="266" font-size="12" fill="#404752">"The generated filesystem image</text>
+  <text x="636" y="284" font-size="12" fill="#404752">is not sufficient for booting a</text>
+  <text x="636" y="302" font-size="12" fill="#404752">SPARC machine." — Haiku docs</text>
+
+  <line x1="320" y1="320" x2="320" y2="352" stroke="#5b6472" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- S3 loader -->
+  <rect x="40" y="358" width="560" height="104" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="60" y="383" font-size="15" font-weight="600" fill="#1a1d24">3 · haiku_loader.openfirmware</text>
+  <text x="60" y="404" font-size="12.5" fill="#404752">Big-endian sparc64 ELF. Claims memory and maps ranges through the OF</text>
+  <text x="60" y="422" font-size="12.5" fill="#404752">MMU node, installs OF callbacks, reads the kernel ELF off BFS, fills</text>
+  <text x="60" y="440" font-size="12.5" fill="#404752">kernel_args (memory ranges + frame_buffer), keeps OF resident.</text>
+  <rect x="497" y="370" width="89" height="20" rx="10" fill="#d9f0e3" stroke="#1f8b4d"/>
+  <text x="541" y="384" font-size="11" font-weight="600" fill="#146638" text-anchor="middle">COMPLETE</text>
+  <text x="636" y="388" font-size="12" fill="#404752">852 lines of sparc code,</text>
+  <text x="636" y="406" font-size="12" fill="#404752">635 of them mmu.cpp</text>
+  <text x="636" y="430" font-size="12" fill="#404752">OF serial console works —</text>
+  <text x="636" y="448" font-size="12" fill="#404752">this is the only proven path</text>
+
+  <line x1="320" y1="462" x2="320" y2="494" stroke="#5b6472" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- S4 handoff -->
+  <rect x="40" y="500" width="560" height="76" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="60" y="525" font-size="15" font-weight="600" fill="#1a1d24">4 · arch_start_kernel — the handoff</text>
+  <text x="60" y="546" font-size="12.5" fill="#404752">Applies the SPARC V9 stack bias (%sp = top − 2047), passes kernel_args</text>
+  <text x="60" y="564" font-size="12.5" fill="#404752">in %o0 and cpu 0 in %o1, then jmpl into the kernel entry point.</text>
+  <rect x="497" y="512" width="89" height="20" rx="10" fill="#d9f0e3" stroke="#1f8b4d"/>
+  <text x="541" y="526" font-size="11" font-weight="600" fill="#146638" text-anchor="middle">COMPLETE</text>
+  <text x="636" y="530" font-size="12" fill="#404752">47 lines of asm. The kernel</text>
+  <text x="636" y="548" font-size="12" fill="#404752">inherits OF's MMU state and</text>
+  <text x="636" y="566" font-size="12" fill="#404752">OF's trap table — it owns neither.</text>
+
+  <line x1="320" y1="576" x2="320" y2="608" stroke="#5b6472" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- S5 kernel -->
+  <rect x="40" y="614" width="560" height="150" rx="7" fill="#fceae8" stroke="#c0392b"/>
+  <text x="60" y="639" font-size="15" font-weight="600" fill="#1a1d24">5 · Haiku kernel — 1,707 lines, load-bearing parts empty</text>
+  <rect x="497" y="626" width="89" height="20" rx="10" fill="#f8d5d1" stroke="#c0392b"/>
+  <text x="541" y="640" font-size="11" font-weight="600" fill="#96271b" text-anchor="middle">STUBS</text>
+  <text x="60" y="664" font-size="12.5" fill="#404752">arch_int.cpp — every init returns B_OK. No trap table, no dispatch.</text>
+  <text x="60" y="684" font-size="12.5" fill="#404752">arch_vm_translation_map.cpp — prints ranges, hands back a null map.</text>
+  <text x="60" y="704" font-size="12.5" fill="#404752">arch_thread.cpp — context switch is an empty body; kthread stack panics.</text>
+  <text x="60" y="724" font-size="12.5" fill="#404752">arch_timer.cpp — no tick programmed; system_time() returns 0.</text>
+  <text x="60" y="744" font-size="12.5" fill="#404752">arch_vm_translation_map.h / arch_vm_types.h — zero-byte files.</text>
+  <text x="636" y="668" font-size="12" fill="#404752">arch_mmu.cpp is the exception:</text>
+  <text x="636" y="686" font-size="12" fill="#404752">real ASI constants and TSB</text>
+  <text x="636" y="704" font-size="12" fill="#404752">readers already exist — it can</text>
+  <text x="636" y="722" font-size="12" fill="#404752">read OF's TSB, but not manage</text>
+  <text x="636" y="740" font-size="12" fill="#404752">one of its own.</text>
+
+  <line x1="320" y1="764" x2="320" y2="796" stroke="#5b6472" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- S6 userspace -->
+  <rect x="40" y="802" width="560" height="52" rx="7" fill="#fceae8" stroke="#c0392b"/>
+  <text x="60" y="826" font-size="15" font-weight="600" fill="#1a1d24">6 · Userspace — runtime_loader, servers, app_server</text>
+  <text x="60" y="845" font-size="12.5" fill="#404752">No syscall entry, no signal frames, no TLS. Nothing has ever run here.</text>
+  <rect x="497" y="812" width="89" height="20" rx="10" fill="#f8d5d1" stroke="#c0392b"/>
+  <text x="541" y="826" font-size="11" font-weight="600" fill="#96271b" text-anchor="middle">NO WORK</text>
+  <text x="636" y="822" font-size="12" fill="#404752">Blocked behind #19597: SPARC</text>
+  <text x="636" y="840" font-size="12" fill="#404752">wants separate kernel/user</text>
+  <text x="636" y="858" font-size="12" fill="#404752">address spaces.</text>
+</svg>
