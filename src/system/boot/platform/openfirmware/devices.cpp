@@ -119,7 +119,13 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 			file[0] = '\0';
 	}
 
-	int handle = of_open(devicePath);
+	// An Open Firmware handle is intptr_t, not int. Truncating it to 32 bits
+	// happened to be harmless on 32-bit PowerPC, but on sparc64 the high bits
+	// are lost and the value then sign-extends back into something that is not
+	// a valid instance handle. The firmware dereferences it and takes a data
+	// access exception inside itself, which looks for all the world like a
+	// broken seek or read.
+	intptr_t handle = of_open(devicePath);
 	if (handle == OF_FAILED) {
 		puts("\t\t(open failed)");
 		return B_ERROR;

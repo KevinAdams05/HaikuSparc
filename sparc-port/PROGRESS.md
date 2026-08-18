@@ -194,7 +194,81 @@ class of misbehaviour.
 
 ---
 
-## 7. Current blocker: `seek` is broken in OpenBIOS
+## 7a. RESOLVED — it was never a firmware `seek` bug
+
+**§7 below is retained as a record of a wrong diagnosis, because the way it was wrong is
+instructive.** The conclusion "OpenBIOS's `seek` is broken" was well-evidenced and still wrong.
+
+Two further bugs were found, both ours:
+
+**The handle was being truncated.** `platform_add_boot_device()` had
+`int handle = of_open(devicePath)`. `of_open` returns `intptr_t`; on sparc64 storing it in an
+`int` drops the high half, and the value then sign-extends back into something that is not a
+valid instance handle. The firmware dereferenced it and took a data access exception *inside
+itself* — which is exactly why the trap PC was in OpenBIOS and why it looked like a firmware
+bug. On 32-bit PowerPC `int` and `intptr_t` coincide, so this was invisible there.
+
+*What broke the false diagnosis:* skipping `seek` entirely still crashed at the **same PC**. An
+operation-specific bug cannot survive removing the operation. Once both `seek` and `read` failed
+identically, the only shared input left was the handle.
+
+*What made the false diagnosis so convincing:* the debug `printf` after `of_seek` never appeared,
+so the trap looked like it happened inside `of_seek`. Console output can be lost when the machine
+traps immediately afterwards — **never infer where a fault happened from the last line printed.**
+
+**The FPU was never enabled.** With the handle fixed, the trap moved out of OpenBIOS and into our
+own code at a `ld [%g1], %f0` — trap `0x20`, `fp_disabled`. SPARC V9 gates floating point behind
+**PSTATE.PEF (bit 4)** and **FPRS.FEF (bit 2)**, and an FP instruction with either clear traps
+(UltraSPARC-IIi User's Manual §A.4). Open Firmware does not set them for a client program.
+
+The loader genuinely needs FP: the menu formats partition sizes with `%f`, and GCC also emits FP
+register loads to move small structures — which is what actually faulted first. `_start` now
+enables both bits before the constructors run. Note the VIS graphics instructions share the FP
+register file and the same two enables.
+
+### Where that leaves us: the boot menu renders
+
+```
+	no boot path found, scan for all partitions...
+	/pci@1fe,0/pci@1,1/ebus@1/fdthree@0        (could open device, handle = 0xfef86860)
+	/pci@1fe,0/pci@1,1/ide@3/ide@0/disk@0      (could open device, handle = 0xfef86c10)
+	/pci@1fe,0/pci@1,1/ide@3/ide@1/cdrom@0     (could open device, handle = 0xfef86fc0)
+	check for partitioning_system: Intel Partition Map
+	check for partitioning_system: Intel Extended Partition
+	check for file_system: BFS Filesystem / FAT32 Filesystem / TAR Filesystem
+	Could not locate any supported boot devices!
+
+	Welcome to the Haiku Boot Loader
+	Copyright 2004-2026 Haiku, Inc.
+	  Select boot volume/state (Current: None)
+	  Select safe mode options
+	  Select debug options
+	  Exit to OpenFirmware
+```
+
+Full device enumeration, partition scanning on every device, filesystem probes, and an
+interactive menu. Handles now print as plausible values (`0xfef86860`) instead of a truncated
+negative. "Could not locate any supported boot devices" is **correct**: the test disk carries
+ext2, which Haiku's loader does not read. It needs a BFS volume with a kernel — that is the next
+step, not a bug.
+
+### Two emulator quirks that are genuinely OpenBIOS's fault
+
+Both are about *empty* removable drives, and both are worked around by attaching media:
+
+- **Opening an empty CD-ROM traps** `0x34` (`mem_address_not_aligned`) at PC `0xffd1c184` — the
+  same PC as the earlier `dir` crash. Attach any ISO and it opens fine. QEMU's sun4u always
+  instantiates a CD-ROM on the secondary IDE channel, so pass
+  `-drive file=<any>.iso,format=raw,if=ide,index=2,media=cdrom`.
+- **Scanning an empty floppy hangs** the partition scan indefinitely. Pass `-fda <any image>`.
+
+With both attached, the loader runs to the menu. Also note the console emits a continuous stream
+of `pc_serial_read: bad len, addr … len 3` once the menu starts polling for keys — harmless
+QEMU noise, but it buries the log, so filter it with `grep -v pc_serial_read`.
+
+---
+
+## 7. Superseded: the "OpenBIOS seek is broken" diagnosis
 
 Instrumenting `Handle::ReadAt` was decisive:
 
@@ -224,19 +298,13 @@ The earlier floppy-probe crash was at `0xffd0f25c`, 0x68 bytes away — the same
 This is consistent with the known QEMU bug *"OpenBIOS seek fails on NetBSD CD image"*
 (launchpad #1169856).
 
-**This is a firmware bug, not a Haiku bug.** Options, roughly in order of appeal:
+**This was recorded as a firmware bug. It was not** — see §7a. Every bullet above is sound
+evidence and the conclusion drawn from it was still wrong, which is the point of keeping this
+section. The planned next step at the time was "build a newer OpenBIOS and see if it fixes seek";
+that would have consumed an afternoon and fixed nothing.
 
-1. Avoid `seek` — use the `read-blocks` method via `call-method`, or OF's `load`. Haiku would
-   need an Open Firmware block backend that does not rely on seek/read pairs.
-2. Build a current OpenBIOS from source; v1.1 as shipped with QEMU 8.2.2 may already be fixed
-   upstream.
-3. Netboot, avoiding block devices entirely — but the TFTP path does not work yet either.
-4. Test on real OpenBoot as soon as hardware arrives. Real OBP very likely implements `seek`
-   correctly, in which case this blocker is emulator-only — which would be worth knowing before
-   spending effort on it.
-
-Option 4 is the cheapest and most informative, which is a genuine argument for sourcing the
-Blade 150 sooner rather than later.
+The lesson worth carrying: *"the fault PC is in their code"* localises the **dereference**, not
+the **cause**. A caller can hand a callee a bad pointer, and then the callee is where it dies.
 
 ---
 
@@ -351,21 +419,27 @@ Current state: **clean across 15 files.**
 
 ## 12. Next steps
 
-1. **Work around or eliminate the OpenBIOS `seek` bug** (§7). Cheapest first move is to check
-   whether a current OpenBIOS build fixes it, before writing a `read-blocks` backend.
-2. **Attach gdb** — `--gdb` on the harness, then `gdb-multiarch`, `set architecture sparc:v9`,
-   `target remote :1234`. Not yet done; it is the last Phase 0 item and will be indispensable
-   for Phase 2.
-3. **Find the Pegasos II big-endian patches** (BFS, ATI, PS/2) — §9.
-4. **Make netboot work** as a second path, since it is the fastest iteration loop on real
-   hardware.
-5. **Teach the image tool to place a BFS filesystem**, so the loader can find a kernel, not just
-   itself.
+Phase 1 is essentially done: the loader boots from media and reaches its menu. The critical path
+now runs through getting a kernel loaded, which is what makes Phase 2 workable.
+
+1. **Put a BFS volume with a kernel on the disk.** This is the single highest-value next task —
+   it is what stands between us and the kernel being entered, and Phase 2 (the gate) cannot start
+   until it is. Build `@minimum-raw`, or teach `make-sun-image.py` to place a BFS partition. Note
+   Haiku's own `makebootable` has no SPARC support, so partition a's contents may need arranging
+   by hand.
+2. **Watch for the big-endian BFS problem.** Our reference notes record that big-endian Haiku has
+   **no writable BFS**; reading may be fine but this needs confirming early, since the loader has
+   to read a BFS volume to find the kernel.
+3. **Attach gdb** — `--gdb` on the harness, then `gdb-multiarch`, `set architecture sparc:v9`,
+   `target remote :1234`. The last Phase 0 item, and indispensable for Phase 2.
+4. **Find the Pegasos II big-endian patches** (BFS, ATI, PS/2) — §9.
+5. **Netboot**, as a second path, since it is the fastest iteration loop on real hardware.
 
 ### Open questions
 
 - Does OpenBIOS sparc64 implement TFTP at all, or only the RARP half?
 - Is the a.out wrapper meant to be written to a disklabel boot block — is `sparcbootblock.h` the
   intended first stage? Nothing in the tree exercises it.
-- Does real OpenBoot implement `seek` correctly? If so §7 is emulator-only.
 - What reads the `-r 0` requirement — OpenBIOS's grubfs feature support, or something narrower?
+- Does the kernel need its own FPU enable, or does it inherit PSTATE from the loader? The trap
+  table will reset PSTATE on entry, so this probably needs doing again in the kernel.
