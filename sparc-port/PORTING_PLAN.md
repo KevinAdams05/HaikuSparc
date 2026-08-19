@@ -434,7 +434,7 @@ So the open question for this phase is narrow and concrete: what exactly does Op
 OpenBIOS, require of this a.out image and of the media around it. That is a far better starting
 position than "produce bootable media somehow."
 
-### Phase 2 — MMU and trap table ★ THE GATE  **[IN PROGRESS]**
+### Phase 2 — MMU and trap table ★ THE GATE  **[DONE]**
 
 The one phase that ships as a single unit. Install a `%tba`-aligned trap table. Write window
 spill and fill handlers and set the window state registers. Define a real `struct iframe`.

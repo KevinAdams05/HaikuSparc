@@ -5,27 +5,42 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0 and 1 complete. Phase 2 in progress — every piece written, none installed yet.**
+**State: Phases 0, 1 and 2 complete. The kernel services its own TLB misses and window traps.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume, loads `kernel_sparc`, and
-jumps in. The kernel initialises the platform, debug output, locking and interrupts, reaches
-`vm_init`, and dies in `vm_page_init` accessing `0x82000000` — an address `early_map` handed out
-and OpenBIOS silently declined to map. **Our TSB already holds that entry**, so the cutover is
-the fix for the fault in front of us (§18, §19).
+jumps in. The kernel initialises the platform, debug output, locking and interrupts, takes the
+MMU and the trap table over from Open Firmware, then runs through `vm_page_init`, brings up the
+slab allocator, reserves the boot loader ranges and reaches
+`vm_translation_map_init_post_area` — where it stops on an ordinary Haiku porting bug rather
+than a trap (§21).
 
-Phase 2 so far:
+**Phase 2's three exit criteria are met, each by a deliberate test rather than by inference:**
 
 | | |
 | --- | --- |
-| TSB allocated and warmed | 256 KB split pair, 3657 live entries, load factor 0.45 (§19) |
+| Maps a page it allocated itself | after the cutover `early_map` writes only the TSB; the firmware is not called (§21) |
+| Survives a provoked TLB miss | page written, translation demapped, read back correctly — no route but the fast path (§21) |
+| Survives a forced window overflow | 24 frames against 8 windows, sum exact, so the stack bias is right too (§21) |
+
+Phase 2 as built:
+
+| | |
+| --- | --- |
+| TSB | 256 KB split pair, 3657 live entries, load factor 0.45 (§19) |
 | Index arithmetic | **verified against the hardware**, four probes (§19) |
 | TTE construction and TLB load | **verified** — a page mapped, written, read back (§19) |
-| Lookup algorithm | **verified** in C against known translations (§19) |
-| TLB miss fast path | written, 10 instructions, assembles correctly |
-| Window spill / fill / clean | written, all fit the 128-byte slots |
-| Unhandled-trap handler | written, fault-proof by construction ([design §4.3](PHASE2_MMU_DESIGN.md)) |
-| **The trap table itself** | **not built** |
-| **The cutover** | **not done** — `%tba` and the TSB registers untouched |
+| Tag target | **verified against the hardware** — both contexts zero, four probes match (§21) |
+| TLB miss fast path | 10 instructions, servicing every miss since the cutover |
+| Window spill / fill / clean | in the 128-byte slots, servicing every spill since the cutover |
+| Trap table | 32 KB, geometry asserted by `.org` at build time and re-checked every boot (§20) |
+| Trap data block | reachable from any handler through `%g7` in both alternate banks (§20) |
+| Locking | 10 TLB entries: 4 for the TSB as 64 KB pages, 6 for the trap path (§21) |
+| **The cutover** | **done** — TSB registers then `%tba`, interrupts off (§21) |
+
+**Next: a real `VMTranslationMap` for SPARC.** `arch_vm_translation_map_create_map()` returns
+`B_OK` without ever setting `*_map`, so the kernel address space has no translation map at all
+and `B_ALREADY_WIRED`'s `map->Query()` cannot work. The authoritative page table that needs is
+the same structure the TSB slow path must resolve from, so the two land together.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1025,3 +1040,116 @@ gate described in the plan's §4.1 and §4.2.
   intended first stage? Nothing in the tree exercises it.
 - What exactly does the `mkfs.ext2 -r 0` requirement come from — a grubfs feature check, or
   something narrower?
+
+
+## 21. The cutover — the kernel takes the MMU
+
+The gate. From the store to `%tba` onwards every trap the machine takes goes to our handlers,
+including the window spills and fills that ordinary C code generates by the thousand. It is not a
+step that can be taken halfway.
+
+### What had to be true first
+
+**What the firmware locked, and what it did not.** `sparc_dump_tlb()` reads both TLBs through the
+Tag Read and Data Access ASIs. Open Firmware locked only its own mappings — five D-entries and
+two I-entries, its OBP, PCI/EBus and code regions, all 512 KB pages. Every kernel page was an
+ordinary replaceable 8 KB entry, the trap table's included. And the D-TLB was already **full**:
+64 valid, 0 free.
+
+**Why the TSB had to be locked, and could not be locked cheaply.** The miss handler reads the TSB
+with an atomic quad load, and TABLE 13-32 lists this CPU's atomic quad load ASIs in full: 0x24 and
+0x2c, both virtual. The physical variants arrived with UltraSPARC III. Giving up atomicity instead
+was not an option — a separate tag and data load can pick up a stale pairing, the one race the
+quad load exists to close — so the read is virtual, can miss, and the TSB must be locked. Locking
+256 KB as 8 KB pages would have taken 32 of the 64 D-TLB entries; it is locked as four 64 KB pages
+instead. Full reasoning in [design note §4.4](PHASE2_MMU_DESIGN.md).
+
+That needed physical memory both 64 KB aligned and contiguous, which `vm_allocate_early()` cannot
+supply: it takes physical pages one at a time and its alignment argument constrains only the
+virtual base. So the TSB takes its virtual range from that function with a `physicalSize` of zero,
+which maps nothing, and `sparc_allocate_aligned_physical()` gathers the physical side — drawing
+pages until one lands on the alignment, then **checking** each next page really is the last plus
+one rather than assuming the early allocator stays contiguous. The locked entries are then the
+TSB's only mapping, so the `memset` that zeroes it is the first write through them, done
+deliberately while the firmware can still report a fault.
+
+**Ten entries locked in total:** four for the TSB, four for the trap table, one for the handlers,
+one for the trap data block. Handlers and table go in the I-TLB because a fetch that missed there
+would need the very code that could not be fetched.
+
+**That the tag comparison would match.** `sparc_tsb_insert()` stores `VA<63:22>` and nothing else,
+because the hardware's tag target is `(context << 48) | VA<63:22>` and the context is zero
+throughout the kernel. The fast path's single xor depends entirely on that. If it were wrong,
+every access would miss and the slow path would stop the machine on the first one with nothing
+said. Rather than read the context registers and reason about them,
+`sparc_verify_tag_target()` writes an address into Tag Access and reads back the tag target the
+hardware forms from it — the exact value a handler is handed. Both contexts read zero; all four
+probes match.
+
+### The cutover itself
+
+TSB registers first, then `%tba`, interrupts off across both. The order is the whole of it: a trap
+taken after `%tba` was set but before the TSB base was programmed would send the fast path to read
+a TSB at address zero, find whatever was there, treat it as a translation, and load it into the
+TLB. The reverse costs nothing, since nothing reads those registers until a handler does.
+
+```
+sparc_mmu: contexts: primary 0, secondary 0
+sparc_mmu: tag target 0x80000000 -> hardware 0x000000000200, stored 0x000000000200 -- match
+sparc_mmu: installing TSB register 0x0000000080241004 and %tba 0x801b8000
+sparc_mmu: the kernel now services its own traps
+```
+
+That last line is itself the first evidence: it reached the console through C code, which means
+window spills and fills, all handled by us.
+
+### Then the firmware came out of the mapping path
+
+With the kernel owning the MMU, `early_map` no longer needs to tell the firmware anything. That
+turned out to be the next thing to break rather than a tidiness point: every `map` call extends the
+firmware's `translations` property, and OpenBIOS's heap does not survive the thousands of pages
+`vm_page_init()` maps. The first post-cutover boot died with **`out of malloc memory (10010)!`** —
+an OpenBIOS message, not Haiku's — partway through that loop. Mappings made *before* the cutover
+still go to the firmware, because until then the firmware is what services a miss.
+
+### How far it gets now
+
+Past `vm_page_init`, into `kernel malloc: using slab_heap`, through
+`reserve_boot_loader_ranges()`, and into `vm_translation_map_init_post_area` — where it stops on
+`ASSERT FAILED (vm.cpp:1929): wiring != B_ALREADY_WIRED`. That is not a trap and not an MMU
+problem: `arch_vm_translation_map_create_map()` returns `B_OK` without ever setting `*_map`, so
+the kernel address space has no translation map and the `B_ALREADY_WIRED` path's `map->Query()`
+cannot work.
+
+Worth noting from the same output: *"Current thread pointer is 0x000000008022e8d8, which is an
+address we can't read from."* That value is the normal-bank `%g7` seen during the trap-globals
+check, which confirms `%g7` is the thread pointer on this ABI — and that setting it in the MMU and
+alternate banks left the normal one alone, as the check reported.
+
+### The two deliberate tests
+
+Getting this far only shows that most handler paths worked most of the time. A handler that is one
+register short or one displacement off corrupts something far away, long after the evidence is
+gone. So both criteria are provoked on purpose, where the answer is known in advance:
+
+```
+sparc_mmu: provoked TLB miss at 0x80280000: read 0xfeedfacecafebeef -- refilled
+sparc_mmu: forced window overflow 24 deep: got 0x66408c6fe4, expected 0x66408c6fe4 -- spilled and filled
+```
+
+The miss test allocates a page, writes a pattern, demaps the translation but leaves it in the TSB,
+and reads back — there is no route to a correct answer except the fast path. The window test
+recurses 24 frames against 8 windows with a marker live across each recursive call, so it must
+occupy a register the window owns and must therefore be spilled and filled; an exact sum also
+confirms the stack bias.
+
+### Still owed
+
+- **A resolving slow path.** `sparc_tsb_miss_trap` records the miss into the trap data block and
+  stops. It cannot resolve anything until there is an authoritative page table to resolve from,
+  and collisions in a direct-mapped TSB mean this *will* be reached eventually — 288 were counted
+  warming it from the firmware's translations alone.
+- **A legible failure when it is reached.** The record is complete, but the machine stops with no
+  output; reading it means attaching gdb and looking at the trap data block, whose address is
+  printed at boot. A trampoline that returns to TL=0 and panics with the recorded address would be
+  better, and the address for it can live in the still-unused MMU-global `%g3`.
