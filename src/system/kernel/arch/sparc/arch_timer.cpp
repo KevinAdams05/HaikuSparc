@@ -179,15 +179,47 @@ sparc_verify_system_time()
 }
 
 
+/*!	Arms the %TICK comparator.
+
+	TICK_CMPR is bit 63 INT_DIS and bits 62:0 a compare value, and the hardware
+	posts TICK_INT when %TICK's counter *equals* it (manual TABLE 14-11, printed
+	p.199). Equality, not "greater than", which is the whole hazard here: a
+	comparator set to a value the counter has already passed does not fire late,
+	it fires in about three thousand years.
+
+	So the timeout has a floor, and after arming, the comparator is checked
+	against the counter once more. If the counter got there first the interrupt
+	is posted by hand, which is exactly what the hardware would have done.
+*/
 void
 arch_timer_set_hardware_timer(bigtime_t timeout)
 {
+	const uint64 kMinimumTicks = 1000;
+
+	uint64 ticks = (uint64)timeout * (sClockFrequency / 1000000);
+	if (ticks < kMinimumTicks)
+		ticks = kMinimumTicks;
+
+	uint64 target = (sparc_read_tick() + ticks) & TICK_COUNTER_MASK;
+
+	// INT_DIS clear, so the comparison is live.
+	asm volatile("wr %0, 0, %%asr23" : : "r"(target));
+
+	// Both values are well inside the counter's range, so the difference is a
+	// small signed number and the comparison needs no wraparound reasoning.
+	if ((int64)(target - sparc_read_tick()) <= 0) {
+		// SET_SOFTINT ORs into SOFTINT, and bit 0 is TICK_INT.
+		asm volatile("wr %0, 0, %%asr20" : : "r"(1ULL));
+	}
 }
 
 
 void
 arch_timer_clear_hardware_timer()
 {
+	// Bit 63 is INT_DIS. Setting it stops the comparison without having to
+	// choose a compare value that will never be reached.
+	asm volatile("wr %0, 0, %%asr23" : : "r"(1ULL << 63));
 }
 
 

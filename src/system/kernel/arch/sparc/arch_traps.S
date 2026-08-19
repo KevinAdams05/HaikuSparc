@@ -77,6 +77,29 @@
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
 
+/*	struct iframe, from arch_int.h. sparc_verify_iframe_layout() compares these
+ *	against the structure they describe.
+ */
+#define IFRAME_TSTATE			0x00
+#define IFRAME_TPC			0x08
+#define IFRAME_TNPC			0x10
+#define IFRAME_TT			0x18
+#define IFRAME_Y			0x20
+#define IFRAME_G1			0x28
+#define IFRAME_G2			0x30
+#define IFRAME_G3			0x38
+#define IFRAME_G4			0x40
+#define IFRAME_G5			0x48
+#define IFRAME_G6			0x50
+#define IFRAME_G7			0x58
+#define IFRAME_PIL			0x60
+#define IFRAME_SIZEOF			0x70
+
+/*	The minimum SPARC V9 stack frame, from arch_thread_types.h: 128 bytes of
+ *	register save area and 48 more for outgoing arguments.
+ */
+#define SPARC_MINIMUM_FRAME_SIZE	176
+
 #define SPARC_GLOBALS_MMU		0
 
 /*	Page table geometry, from arch_vm_translation_map.h. Three levels of 1024
@@ -575,6 +598,164 @@ sparc_unhandled_trap_stop:
 	 nop
 
 
+/*	Interrupt entry.
+ *
+ *	Entered at trap level 1 with the alternate globals selected and PSTATE.IE
+ *	already cleared by the hardware, so nothing can interrupt this until it
+ *	returns. The interrupted window is untouched -- a trap does not rotate CWP --
+ *	which is what makes the shape below work: `save` here takes a window of our
+ *	own and makes the interrupted one the previous window, so `restore` on the
+ *	way out brings it back, filled from the stack if a spill got there first.
+ *
+ *	The order is forced by two facts. The trap registers only exist at trap
+ *	level 1, so they have to be read before dropping to zero; and C has to run at
+ *	trap level zero, because a window spill or a TLB miss inside it must be
+ *	handled by the ordinary table rather than nesting towards MAXTL.
+ *
+ *	Everything between the two `wrpr %tl` writes therefore lives in this window's
+ *	locals, which survive both because they are window registers.
+ *
+ *	Deliberately a local symbol, for the same reason the miss slow paths are: the
+ *	table branches here with `ba,a`, and a branch to a .global symbol goes through
+ *	a load-time relocation that leaves a displacement of zero -- a branch to
+ *	itself, silently.
+ */
+sparc_interrupt_entry:
+	save	%sp, -(SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
+
+	/* The trap registers first, while they still exist. */
+	rdpr	%tstate, %l0
+	rdpr	%tpc, %l1
+	rdpr	%tnpc, %l2
+	rdpr	%tt, %l3
+	rd	%y, %l4
+
+	/* Back to the normal global bank. Two reasons: the interrupted code's
+	 * globals are in it and have to be saved, and C expects the thread pointer
+	 * in %g7, which is the normal bank's.
+	 *
+	 * All three selector bits, not just AG. UltraSPARC-IIi adds interrupt and
+	 * MMU global sets to SPARC V9's two, selected by PSTATE.IG at bit 11 and
+	 * PSTATE.MG at bit 10 alongside AG at bit 0 (TABLE 14-12, printed p.201).
+	 * Clearing only AG would leave a different bank selected than intended,
+	 * which is worse than not switching at all: the handler would save one
+	 * bank's globals and restore them into another.
+	 */
+	rdpr	%pstate, %l5
+	andn	%l5, PSTATE_AG | PSTATE_MG | PSTATE_IG, %l6
+	wrpr	%l6, 0, %pstate
+
+	/* The frame sits above this window's own save area. */
+	add	%sp, SPARC_MINIMUM_FRAME_SIZE + BIAS, %l7
+
+	stx	%g1, [%l7 + IFRAME_G1]
+	stx	%g2, [%l7 + IFRAME_G2]
+	stx	%g3, [%l7 + IFRAME_G3]
+	stx	%g4, [%l7 + IFRAME_G4]
+	stx	%g5, [%l7 + IFRAME_G5]
+	stx	%g6, [%l7 + IFRAME_G6]
+	stx	%g7, [%l7 + IFRAME_G7]
+
+	/* Raise the interrupt level so nothing can nest, and remember what it was.
+	 *
+	 * PSTATE.IE is already clear, so this looks redundant -- and it is not.
+	 * Rescheduling from this handler switches to another thread and comes back,
+	 * and the interrupt-enable bit is not something a switch can be relied upon
+	 * to leave alone. An interrupt taken while this handler still owes a trap
+	 * return writes its own trap level over ours, and the two returns then drive
+	 * the trap level below zero. Blocking at the level rather than at the enable
+	 * bit does not depend on anyone else's discipline.
+	 *
+	 * 15 rather than 14: PIL blocks interrupts at or below its own level, and
+	 * the tick arrives at 14.
+	 */
+	rdpr	%pil, %l5
+	stx	%l5, [%l7 + IFRAME_PIL]
+	wrpr	%g0, 15, %pil
+
+	stx	%l0, [%l7 + IFRAME_TSTATE]
+	stx	%l1, [%l7 + IFRAME_TPC]
+	stx	%l2, [%l7 + IFRAME_TNPC]
+	stx	%l3, [%l7 + IFRAME_TT]
+	stx	%l4, [%l7 + IFRAME_Y]
+
+	/* Down to trap level zero, so the handler runs like ordinary kernel code.
+	 * Interrupts stay disabled -- PSTATE.IE is still clear -- so nothing nests.
+	 */
+	wrpr	%g0, 0, %tl
+
+	call	sparc_interrupt
+	 mov	%l7, %o0
+
+	/* Back up to trap level 1: `retry` is meaningless below it, and %tpc and
+	 * friends do not exist to be written.
+	 */
+	wrpr	%g0, 1, %tl
+
+	/* Everything restored from this window's locals and the frame, because
+	 * `restore` below takes both away.
+	 */
+	ldx	[%l7 + IFRAME_G1], %g1
+	ldx	[%l7 + IFRAME_G2], %g2
+	ldx	[%l7 + IFRAME_G3], %g3
+	ldx	[%l7 + IFRAME_G4], %g4
+	ldx	[%l7 + IFRAME_G5], %g5
+	ldx	[%l7 + IFRAME_G6], %g6
+	ldx	[%l7 + IFRAME_G7], %g7
+
+	ldx	[%l7 + IFRAME_PIL], %l6
+	wrpr	%l6, 0, %pil
+
+	wr	%l4, 0, %y
+	wrpr	%l0, 0, %tstate
+	wrpr	%l1, 0, %tpc
+	wrpr	%l2, 0, %tnpc
+
+	/* `restore` may fill from the stack, which traps to level 2 and comes back;
+	 * `retry` then re-executes the instruction the interrupt landed on, with
+	 * PSTATE -- including IE -- restored from %tstate.
+	 */
+	restore
+	retry
+
+
+/*	Report this file's idea of the interrupt frame layout, for C++ to check.
+ *
+ *	void sparc_iframe_offsets(uint64 *out);   // fourteen entries
+ */
+FUNCTION(sparc_iframe_offsets):
+	mov	IFRAME_TSTATE, %o1
+	stx	%o1, [%o0 + (0 * 8)]
+	mov	IFRAME_TPC, %o1
+	stx	%o1, [%o0 + (1 * 8)]
+	mov	IFRAME_TNPC, %o1
+	stx	%o1, [%o0 + (2 * 8)]
+	mov	IFRAME_TT, %o1
+	stx	%o1, [%o0 + (3 * 8)]
+	mov	IFRAME_Y, %o1
+	stx	%o1, [%o0 + (4 * 8)]
+	mov	IFRAME_G1, %o1
+	stx	%o1, [%o0 + (5 * 8)]
+	mov	IFRAME_G2, %o1
+	stx	%o1, [%o0 + (6 * 8)]
+	mov	IFRAME_G3, %o1
+	stx	%o1, [%o0 + (7 * 8)]
+	mov	IFRAME_G4, %o1
+	stx	%o1, [%o0 + (8 * 8)]
+	mov	IFRAME_G5, %o1
+	stx	%o1, [%o0 + (9 * 8)]
+	mov	IFRAME_G6, %o1
+	stx	%o1, [%o0 + (10 * 8)]
+	mov	IFRAME_G7, %o1
+	stx	%o1, [%o0 + (11 * 8)]
+	mov	IFRAME_PIL, %o1
+	stx	%o1, [%o0 + (12 * 8)]
+	mov	IFRAME_SIZEOF, %o1
+	stx	%o1, [%o0 + (13 * 8)]
+	retl
+	 nop
+
+
 FUNCTION(sparc_trap_handlers_end):
 
 
@@ -823,10 +1004,23 @@ FUNCTION(sparc_read_trap_page_table):
 	/* 0x024-0x027: clean_window. The most frequent trap of all. */
 	TRAP_GROUP_CLEAN
 
-	/* 0x028-0x063: interrupt levels, and the traps for watchdog, alignment
-	 * and the rest.
+	/* 0x028-0x04d: interrupt levels 1 to 13, plus watchdog, alignment and the
+	 * rest. None handled yet.
 	 */
-	.rept 0x03c
+	.rept 0x026
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x04e: interrupt_level_14, which is where the %TICK comparison lands --
+	 * one entry, not four, because the interrupt levels are consecutive rather
+	 * than spaced apart the way the busier traps are.
+	 */
+8:	ba,a	sparc_interrupt_entry
+	 nop
+	.org 8b + 32
+
+	/* 0x04f-0x063: interrupt level 15 and the rest. */
+	.rept 0x015
 	TRAP_UNHANDLED
 	.endr
 
