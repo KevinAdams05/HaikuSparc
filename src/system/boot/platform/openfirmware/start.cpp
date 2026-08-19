@@ -12,6 +12,7 @@
 
 #include <OS.h>
 
+#include <boot/addr_range.h>
 #include <boot/platform.h>
 #include <boot/stage2.h>
 #include <boot/heap.h>
@@ -68,6 +69,31 @@ platform_start_kernel(void)
 
 	printf("kernel entry at %p\n", (void*)kernelEntry);
 	printf("kernel stack top: %p\n", (void*)stackTop);
+
+	// The kernel's early allocators require these arrays to be in ascending
+	// order and do not check. allocate_early_virtual() looks for a gap between
+	// range[i-1] and range[i], and vm_allocate_early_physical_page() checks that
+	// the next page does not run into range[i+1]; neither means anything on an
+	// unsorted array.
+	//
+	// insert_address_range() does not sort. It merges ranges that touch or
+	// overlap, but appends a range that touches nothing wherever there is room,
+	// so the order is whatever order things were allocated in. Every other
+	// platform sorts here -- bios_ia32, all the EFI architectures, riscv and the
+	// m68k ones -- and this one was the exception.
+	//
+	// Left unsorted the failure is quiet and destructive. Open Firmware's own
+	// regions are recorded first and sit at the top of the address space, so the
+	// kernel image's range ends up last; allocate_early_virtual() then takes its
+	// "gap after the last range" path and hands out addresses straight through
+	// whatever the loader allocated above the kernel. The symptom appears much
+	// later, as a failed address range reservation.
+	sort_address_ranges(gKernelArgs.physical_memory_range,
+		gKernelArgs.num_physical_memory_ranges);
+	sort_address_ranges(gKernelArgs.physical_allocated_range,
+		gKernelArgs.num_physical_allocated_ranges);
+	sort_address_ranges(gKernelArgs.virtual_allocated_range,
+		gKernelArgs.num_virtual_allocated_ranges);
 
 	/* TODO: ?
 	mmu_init_for_kernel();

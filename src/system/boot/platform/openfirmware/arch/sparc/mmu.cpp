@@ -384,13 +384,34 @@ arch_mmu_allocate(void *_virtualAddress, size_t size, uint8 _protection,
 	int64 protection = PAGE_DEFAULT_MODE;
 	(void)_protection;
 
-	// If no address is given, use the KERNEL_BASE as base address, since
-	// that avoids trouble in the kernel, when we decide to keep the region.
+	// An allocation with no address requested still has to land somewhere the
+	// kernel can use, because some of these regions are kept: the blocks behind
+	// kernel_args_malloc() are handed to the kernel in kernel_args_range, and
+	// the kernel makes an area for each one. An address outside the kernel
+	// address space fails IS_KERNEL_ADDRESS, so create_area() rejects it with
+	// B_BAD_VALUE and the range stays unmanaged -- which is what happened while
+	// this defaulted to the loader's own low identity-mapped memory.
+	//
+	// Not KERNEL_BASE itself, which is where the kernel image goes: the heap is
+	// allocated before the kernel is loaded, so starting the search there would
+	// hand the heap the kernel's load address. The kernel asks for it with
+	// exactAddress false, so it would be placed somewhere else silently instead
+	// of failing.
+	//
+	// Eight megabytes up, and the size of that offset matters more than it looks.
+	// The kernel's TSB is direct-mapped on VA<25:13>, so addresses 64 MB apart
+	// index to the same TSB line. Putting these allocations a round 256 MB above
+	// the kernel image made them alias it perfectly -- every kernel page evicted
+	// by a loader page as the TSB was warmed. Staying inside the same 64 MB
+	// window as the kernel image means the two occupy different lines instead,
+	// and everything the kernel maps early stays within one window.
+	//
+	// If a kernel image ever grows past eight megabytes it collides with this
+	// instead, and gets relocated rather than refused. That would be visible in
+	// the load address, not silent.
 	void *virtualAddress = _virtualAddress;
-#if 0
 	if (!virtualAddress)
-		virtualAddress = (void*)KERNEL_BASE;
-#endif
+		virtualAddress = (void*)(KERNEL_BASE + 0x00800000);
 
 	// find free address large enough to hold "size"
 	virtualAddress = find_free_virtual_range(virtualAddress, size);
