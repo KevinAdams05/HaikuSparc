@@ -412,11 +412,67 @@ then the whole thing again for `TL > 0`, at `+0x4000`.
 While the port is kernel-only the `_normal` and `_other` variants can share a handler; they
 separate when userspace arrives and a spill has to know whether it is writing a user stack.
 
-**The open question is what "unhandled" should do.** Zero-filling is the easy answer and the wrong
-one: zero is an illegal instruction, so an unhandled trap would take another trap, and four
-levels of that is a watchdog reset with nothing said. It wants a handler that records the trap
-type somewhere the debugger can find it and then halts — which is the same problem as the TSB
-slow path, since neither can call anything or use a stack.
+### What "unhandled" does
+
+The constraint is that this handler **cannot fault**. It runs at whatever trap level the machine
+reached, possibly inside another handler, with no guarantee that any particular stack is mapped —
+and a fault here nests one level deeper. Four levels in, the CPU takes a watchdog reset and says
+nothing at all.
+
+Zero-filling the unused entries is the easy answer and is a trap in itself: zero is an illegal
+instruction, so an unhandled trap would immediately take another, which is the watchdog reset
+again with the original cause discarded.
+
+OpenBSD is not a model here either. Its `slowtrap` builds a stack frame and calls C, which needs
+a guaranteed-mapped kernel stack, a trapframe layout and a C entry point — none of which exist
+yet. Its handler for architecturally undefined traps executes `sir`, a software-initiated reset,
+which destroys precisely the state worth reading.
+
+**So the handler touches no memory at all.** The one storage that cannot fault is the private
+global register bank the hardware supplies on the way in — MMU globals for the MMU traps, the
+alternate set otherwise. `rdpr` cannot fault either. So it reads the trap state into registers
+and stops:
+
+```
+sparc_unhandled_trap:
+	rdpr	%tt, %g1        ! trap type
+	rdpr	%tpc, %g2       ! trapped pc
+	rdpr	%tnpc, %g3
+	rdpr	%tstate, %g4
+	rdpr	%tl, %g5        ! trap level
+sparc_unhandled_trap_stop:
+	ba,a	sparc_unhandled_trap_stop
+```
+
+`%g6` and `%g7` are left alone: they are reserved for system software, and a handler that stops
+the machine should disturb no more than it must.
+
+Three ways to read the result, in order of convenience: QEMU's `-d int` trace prints the whole
+register file at every trap, so the values are in the log with nothing attached; gdb can break in,
+and because the spin is at a named symbol `$pc` identifies the handler immediately; and on
+hardware with neither, the machine stops rather than resetting, which at least distinguishes a
+trap from a hang.
+
+Writing the same information to memory would let a *later* boot recover it, which the registers
+cannot. That needs a page locked in the TLB to be fault-proof, so it waits until the table is
+installed and the locking from §2.6 is in place.
+
+### Enforcing the geometry
+
+Each entry must be exactly 32 bytes; a handler that overruns misaligns everything after it, and
+every later trap then vectors into the middle of some other handler. The check is `.org`:
+
+```
+	.org sparc_trap_table + (next_trap_type * 32)
+```
+
+which pads the gap and, because `.org` refuses to move backwards, fails the build if a handler
+ran past the space its trap type owns.
+
+The obvious alternative — bracket an entry with labels and `.if` their difference is not 32 —
+**does not work**, and was tried. gas evaluates `.if` during its first pass, before a forward
+label is known, so it fails on a correct entry. The entry it rejected measured exactly 32 bytes
+when the same difference was assigned to a symbol instead.
 
 ---
 
