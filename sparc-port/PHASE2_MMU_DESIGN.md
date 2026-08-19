@@ -572,6 +572,37 @@ Whether QEMU honours 4 MB TTEs is not in doubt — the firmware's own locked ent
 pages, so more than one size is in use and working — but it is worth confirming for 4 MB
 specifically once the region exists.
 
+## 4.5 What was built, against what was designed
+
+Recorded here so a reader of this note is not left guessing whether it was followed. The running
+account, with output, is [PROGRESS.md §20 and §21](PROGRESS.md).
+
+Built as designed: the split TSB, the ten-instruction fast path, the four-entries-per-group table
+layout, the inline spill and fill handlers, and the fault-proof unhandled handler.
+
+Three things the design did not anticipate, each settled by evidence rather than by preference:
+
+**The geometry assertion had to be `.org`, not `.if`.** §4.3 proposed `.if` size checks. gas cannot
+do label arithmetic in `.if` — it evaluates the condition before addresses are assigned, and
+rejected a table that was correct. Two forms were tried. `.org` both pads a group and fails the
+build if a handler overran it, because it refuses to move backwards.
+
+**Locking is not optional and could not be cheap.** §2.6 listed what must be locked. What it did
+not know was that Open Firmware locks none of the kernel's pages and leaves the D-TLB full, nor
+that this CPU has no physical-address atomic quad load — so the TSB must be virtually mapped and
+therefore locked, as four 64 KB pages rather than thirty-two 8 KB ones. That is §4.4, which was
+written after the TLB dump and the manual settled it.
+
+**The trap code did not need copying into a 4 MB region.** §4.4 works through such an arrangement,
+and it remains the right answer if the locked-entry count ever matters. It was not needed: only the
+TSB requires large pages, and the TSB is the one thing whose physical address this code chooses.
+The trap code stays where the linker put it with its pages locked individually, which avoids
+copying position-dependent code and avoids relocating the kernel.
+
+One thing the design assumed and this note should say plainly: the fast path compares tags on the
+strength of the kernel running in context zero, which `sparc_verify_tag_target()` now checks
+against the hardware on every boot rather than taking on trust.
+
 ## 5. The one caveat about developing against QEMU
 
 Every mechanism above is emulated faithfully, so the *logic* can be developed and debugged in
@@ -593,7 +624,10 @@ found in the documentation rather than on hardware.
   (printed p.205), §15.3 TSB organisation and pointer formation (pp.207–210), §15.3.1 hardware
   support and the refill sequence (p.209), §15.3.2 alternate globals (p.211), §15.4 MMU traps
   (p.211), §15.9.6 `FIGURE 15-9` I-/D-TSB register format (printed p.227), §14.1.3 trap levels
-  and MAXTL (p.224), Appendix K errata.
+  and MAXTL (p.224), Appendix K errata. For the locking work: `TABLE 13-32` atomic quad load
+  opcodes (printed p.178), §15.9.9 with `FIGURE 15-12`/`15-13` Data In and Data Access register
+  formats and §15.9.10 with `FIGURE 15-15` demap format (printed pp.229–231), and `FIGURE 15-14`
+  TLB Tag Read format (printed p.230).
 - **UltraSPARC Architecture 2005**, `SPARC/UA2005-HP-EXT.pdf` — `FIGURE 12-4` trap table layout,
   window state registers and the `spill_n_*` / `fill_n_*` trap types (pp.73, 87, 151, 212).
 - **QEMU** `target/sparc/{int64_helper.c,win_helper.c,ldst_helper.c}` at master, read directly
