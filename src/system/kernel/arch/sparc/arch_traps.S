@@ -271,3 +271,109 @@ FUNCTION(sparc_fill_kernel):
 
 FUNCTION(sparc_clean_window):
 	CLEAN_KERNEL_WINDOW
+
+
+/*	Everything the kernel does not handle yet.
+ *
+ *	The hard constraint is that this cannot fault. It runs at whatever trap
+ *	level the machine reached, possibly inside another handler, with no
+ *	guarantee that any particular stack is mapped -- and a fault here nests one
+ *	level deeper. Four levels in, the CPU takes a watchdog reset and says
+ *	nothing at all, which is the single worst outcome available.
+ *
+ *	So it touches no memory. The trap state is read with rdpr, which cannot
+ *	fault, into the private global bank the hardware supplies on the way in --
+ *	MMU globals for the MMU traps, the alternate set otherwise, but either way
+ *	registers that belong to the handler and to nothing else. Then it stops.
+ *
+ *	Zero-filling unused table entries would have been the easy alternative and
+ *	is a trap: zero is an illegal instruction, so an unhandled trap would take
+ *	another trap immediately, and that is the watchdog reset again with the
+ *	original cause thrown away.
+ *
+ *	Reading the result, in order of convenience:
+ *
+ *	  - QEMU's -d int trace prints the whole register file at every trap, so
+ *	    the values are in the log without attaching anything.
+ *	  - gdb: break in, and the registers below say what happened. The spin is
+ *	    at a named symbol, so $pc identifies this handler immediately.
+ *	  - On hardware with neither, the machine stops rather than resetting,
+ *	    which at least distinguishes a trap from a hang.
+ *
+ *	Recording to memory as well would let a later boot recover this, but it
+ *	needs a page locked in the TLB to be fault-proof, and that has to wait
+ *	until the table is installed and the locking is in place.
+ *
+ *	    %g1  trap type          (%tt)
+ *	    %g2  trapped pc         (%tpc)
+ *	    %g3  trapped next pc    (%tnpc)
+ *	    %g4  trap state         (%tstate)
+ *	    %g5  trap level         (%tl)
+ *
+ *	%g6 and %g7 are left alone: they are reserved for system software, and a
+ *	handler that stops the machine has no business disturbing more than it
+ *	must.
+ */
+sparc_unhandled_trap:
+	rdpr	%tt, %g1
+	rdpr	%tpc, %g2
+	rdpr	%tnpc, %g3
+	rdpr	%tstate, %g4
+	rdpr	%tl, %g5
+sparc_unhandled_trap_stop:
+	ba,a	sparc_unhandled_trap_stop
+	 nop
+
+
+/*	One trap table entry, for a trap with no handler.
+ *
+ *	Exactly eight instructions, because an ordinary entry is 32 bytes. The
+ *	branch annuls its delay slot, so only the first instruction ever runs and
+ *	the rest is padding that keeps the table's geometry exact.
+ *
+ *	The target is a local symbol on purpose. A branch to a global one goes
+ *	through a relocation that the shared-object link defers to load time,
+ *	leaving a displacement of zero -- a branch to itself. That failure is
+ *	silent, and it has already happened once in this file.
+ */
+.macro TRAP_UNHANDLED
+	ba,a	sparc_unhandled_trap
+	 nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+.endm
+
+
+/*	Eight entries' worth, for filling runs of unused trap types. */
+.macro TRAP_UNHANDLED_8
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+.endm
+
+
+/*	Table geometry is enforced with .org, not with an assembler .if.
+ *
+ *	The obvious check -- bracket an entry with two labels and .if their
+ *	difference is not 32 -- does not work: gas evaluates .if during its first
+ *	pass, before a forward label is known, so it fails on a correct entry. That
+ *	was tried, and it failed on an entry measured at exactly 32 bytes.
+ *
+ *	When the table is built, each handler is followed by
+ *
+ *	    .org sparc_trap_table + (next_trap_type * 32)
+ *
+ *	which pads the gap and, because .org refuses to move backwards, fails the
+ *	build outright if a handler ran past the space its trap type owns. That is
+ *	the assertion worth having: overflowing an entry misaligns everything after
+ *	it, so every later trap would vector into the middle of some other handler.
+ */
