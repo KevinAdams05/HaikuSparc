@@ -465,7 +465,7 @@ saved state.
 **Exit:** two kernel threads hand control back and forth cooperatively, visible over serial.
 **Risk: medium** — small once Phase 2 is right, and near-impossible before.
 
-### Phase 4 — Timer and interrupts (the scheduler milestone)  **[IN PROGRESS]**
+### Phase 4 — Timer and interrupts (the scheduler milestone)  **[DONE]**
 
 Program `%TICK_CMPR` for a periodic tick. Implement `system_time()` from `%TICK` divided by the
 `clock-frequency` property read from Open Firmware. Route interrupts through PIL-based dispatch
@@ -477,10 +477,8 @@ stubbed deliberately.
 **Exit:** a periodic tick preempts a busy loop. **The kernel is now demonstrably alive.**
 **Risk: medium.**
 
-**Status:** the clock and the interrupt are done and tested — `system_time()` from `%TICK`, the
-level-14 entry path, `%TICK_CMPR` arming — so Haiku's timers and timeouts work. Preemption is not:
-rescheduling from inside the handler corrupts the register window it returns through. See
-[PROGRESS §24](PROGRESS.md).
+**Status: done.** `system_time()` from `%TICK`, the level-14 entry path, `%TICK_CMPR` arming, and
+preemption — a spinner that never yields is taken off the CPU. See [PROGRESS §24](PROGRESS.md).
 
 ### Phase 5 — KDL and backtraces (starts during Phase 2, not after)
 

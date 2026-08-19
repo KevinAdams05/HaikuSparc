@@ -15,9 +15,9 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel runs its own MMU, page table and VM, schedules threads, keeps time, and reaches the
-disk device manager.** Phases 0–3 are complete, including Phase 2 — the MMU and trap table, the
-gate this port has always turned on — and Phase 4 is half done.
+**The kernel runs its own MMU, page table and VM, schedules and preempts threads, keeps time, and
+reaches the disk device manager.** Phases 0–4 are complete, including Phase 2 — the MMU and trap
+table, the gate this port has always turned on.
 
 On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
 enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
@@ -37,14 +37,16 @@ and the total comes out exact. The context switch is twelve instructions, becaus
 callee-saved registers *are* the window registers — `flushw` spills them to the outgoing thread's
 own stack, and the fill after `restore` pulls them from the incoming one.
 
-Phase 4 is partly done. `system_time()` runs off `%TICK`, and the kernel takes the level-14 timer
-interrupt and returns from it, so Haiku's timers and timeouts work. Preemption does not yet:
-rescheduling from inside the handler corrupts the register window it returns through, and that is
-the next thing to fix.
+Phase 4 is done too: `system_time()` runs off `%TICK`, the kernel takes the level-14 timer
+interrupt, and a thread that never yields gets taken off the CPU anyway — `spinner reached 402130
+after 8720 us without either thread yielding`.
 
 Along the way the firmware's own clock turned out to be the unreliable one — OpenBIOS's
 `milliseconds` runs about eleven times fast under QEMU, which took timestamping the serial output
 on the host to establish.
+
+Next is Phase 5, window-aware backtraces, which the plan said to start during Phase 2 and which is
+now four phases overdue.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

@@ -5,15 +5,15 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0–3 complete. Phase 4 is half done: the clock and the timer interrupt work,
-preemption does not.**
+**State: Phases 0–4 complete. The kernel keeps time, takes interrupts, and preempts.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The
 kernel takes the MMU and trap table over from Open Firmware, builds its own three-level page
 table, runs the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler,
-switches between kernel threads, **keeps time from %TICK and takes the timer interrupt**, and gets
-as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no
-disk drivers yet.
+switches between kernel threads, keeps time from `%TICK`, takes the level-14 timer interrupt, and
+**preempts a thread that never yields**. It gets as far as
+`KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk drivers
+yet.
 
 Exit criteria met, each by a deliberate test rather than by inference:
 
@@ -22,9 +22,9 @@ Exit criteria met, each by a deliberate test rather than by inference:
 | 2 | Maps a page it allocated itself | after the cutover `early_map` writes only the page table and TSB (§21) |
 | 2 | Survives a provoked TLB miss | translation demapped, read back correctly — no route but the fast path (§21) |
 | 2 | Survives a forced window overflow | 24 frames against 8 windows, sum exact (§21) |
-| 3 | Two threads hand control back and forth | `counter 128 of 128 after 122 yields` (§23) |
-| 4 | `system_time()` is right | monotonic, and agreeing with the raw %TICK delta (§24) |
-| 4 | **A tick preempts a busy loop** | **not met** — see §24 |
+| 3 | Two threads hand control back and forth | `counter 128 of 128 after 124 yields` (§23) |
+| 4 | `system_time()` is right | monotonic, and agreeing with the raw `%TICK` delta (§24) |
+| 4 | A tick preempts a busy loop | `spinner reached 402130 after 8720 us without either thread yielding` (§24) |
 
 What exists:
 
@@ -37,16 +37,15 @@ What exists:
 | Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 | Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
-| Clock | `system_time()` from %TICK and the firmware's clock-frequency (§24) |
-| Timer interrupt | entry path, C handler, `%TICK_CMPR` arming (§24) |
+| Clock | `system_time()` from `%TICK` and the firmware's clock-frequency (§24) |
+| Timer interrupt | entry path, C handler, `%TICK_CMPR` arming, preemption (§24) |
 
-**Next: finish Phase 4.** Preemption is the one thing missing, and §24 says exactly what is known
-about why.
+**Next: Phase 5, KDL and backtraces** — which the plan said to start during Phase 2 and which is
+now four phases overdue. Everything since has been diagnosed with one frame of context rather than
+a stack walk.
 
-**Open, and not on that path:** `wait_for_thread()` trips `could acquire exit_sem for thread 5`
-(§23); the boot ends at `did not find any boot partitions!`, which is the absence of disk drivers;
-and window-aware backtraces (Phase 5) are still not written, which the plan warned against
-deferring.
+**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), and the boot ends
+at `did not find any boot partitions!`, which is the absence of disk drivers rather than a defect.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1440,19 +1439,49 @@ the scheduler lock with interrupts off, and a thread scheduled for the first tim
 exactly that state — `common_thread_entry()` does the matching `release_spinlock()` and
 `enable_interrupts()` itself. Starting one with interrupts on trips Haiku's own check immediately.
 
-### What is not done: preemption
+### Preemption, and the one instruction that was wrong
 
-Rescheduling from the interrupt means switching stacks with a trap frame still on this one. With it
-enabled, the kernel faults inside ordinary code — `BOpenHashTable::Insert` in the runs seen — with
-`%i7` still pointing into this handler's caller, which means **the register window it is running in
-is not the one it thinks**. The entry and exit paths are right for a handler that returns to what it
-interrupted, and are not yet right for one that returns somewhere else entirely.
+Rescheduling from the handler means switching stacks with a trap frame still on this one, and with
+it first enabled the kernel faulted inside ordinary code — `BOpenHashTable::Insert` in the runs
+seen — with `%i7` still pointing into this handler's caller.
 
-Without it the timer still runs: `system_time()` advances, `timer_interrupt()` fires, and Haiku's
-timers and timeouts work. What does not happen is a thread being taken off the CPU against its
-will, so scheduling stays cooperative.
+Read literally, that symptom is the answer: **code running in a register window that is not the one
+it thinks**.
 
-The next step is a QEMU `-d int` trace of the failure, which was attempted and abandoned only
-because tracing slows the machine enough that the boot does not reach the failure inside a
-reasonable timeout. Narrowing the window first — forcing a reschedule from the very first tick,
-rather than waiting for the scheduler to want one — would make that trace short enough to read.
+`retry` restores CWP from TSTATE, and TSTATE holds the *numeric* window index from the moment of
+the trap. That identifies the right window only as long as nothing renumbers the register file in
+between — and rescheduling does exactly that. The context switch flushes every window, the thread
+runs somewhere else, and when it comes back its frames have been filled into whichever windows were
+free. The handler is then at a different CWP than it started at, and restoring the recorded one
+lands on a window holding somebody else's registers.
+
+So the exit path patches TSTATE's CWP field to the window `restore` is about to land on, computed
+before the restore because afterwards those locals are gone:
+
+```
+	rdpr	%cwp, %l6
+	sub	%l6, 1, %l6
+	and	%l6, 7, %l6
+	andn	%l0, 0x1f, %l0
+	or	%l0, %l6, %l0
+```
+
+Five instructions, and a no-op whenever no switch happened — which is exactly why everything worked
+until preemption was turned on, and why the failure was intermittent rather than immediate.
+
+### Proving it
+
+Phase 3's test is not evidence here. Alternating two threads with `thread_yield()` shows switching
+works but says nothing about preemption, because both threads *ask* to be switched away.
+
+So: a spinner loops without ever reaching the scheduler, while the testing thread busy-waits for it
+without yielding either. If nothing can take the CPU from a running thread, whichever started first
+keeps it and the counter stays at zero.
+
+```
+sparc_thread: two threads alternated, counter 128 of 128 after 124 yields -- switched cleanly
+sparc_int: spinner reached 402130 after 8720 us without either thread yielding -- preempted
+```
+
+Three consecutive boots, spinner counts within 2% of each other. The deadline uses `system_time()`,
+so a failure of either half of this phase surfaces in the same place.
