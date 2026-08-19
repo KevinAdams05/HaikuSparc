@@ -488,6 +488,13 @@ Fixing it early pays for itself immediately.
 **Exit:** KDL prints a correct backtrace across a spilled window boundary.
 **Risk: medium.**
 
+**This advice was not taken, and the cost is now measurable.** Phases 2 and 3 were done without
+backtraces. What replaced them was a trap handler that returns to TL=0 and reports the trapped
+window's `%o7` and `%i7`, which turned out to identify a call site well enough to find every bug
+that came up — see [PROGRESS §22 and §23](PROGRESS.md). That is one frame, not a backtrace, and
+several of those bugs took a bracket-and-bisect hunt that a real stack walk would have shortened.
+The recommendation stands for anyone reading this before starting: do it earlier than we did.
+
 ### Phase 6 — Userspace
 
 Syscall entry and return. `arch_thread_enter_userspace`. Signal frames. TLS. Fork frames. The
