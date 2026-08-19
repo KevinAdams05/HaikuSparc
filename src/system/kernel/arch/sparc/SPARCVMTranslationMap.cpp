@@ -16,6 +16,18 @@
 #include <vm/VMArea.h>
 #include <vm/VMCache.h>
 
+#include <arch/vm.h>
+#include <boot/elf.h>
+
+#include <stddef.h>
+
+
+// PAGE_SHIFT and B_PAGE_SIZE describe the same number and the kernel uses them
+// interchangeably -- vm_page.cpp shifts a page number by one, this file
+// multiplies by the other. They disagreed on sparc for as long as the port has
+// existed, and nothing said so; see the note in arch_vm.h for what that cost.
+static_assert((1UL << PAGE_SHIFT) == B_PAGE_SIZE,
+	"PAGE_SHIFT and B_PAGE_SIZE disagree");
 
 //#define TRACE_SPARC_VM_TRANSLATION_MAP
 #ifdef TRACE_SPARC_VM_TRANSLATION_MAP
