@@ -175,6 +175,25 @@ static TsbEntry* sKernelTsb;
 static phys_addr_t sKernelTsbPhysical;
 static bool sMmuInstalled;
 
+// Ranges whose TLB entries are locked and whose mappings never change: the trap
+// handlers, the trap table, the trap data block and the TSB.
+//
+// They have to be remembered, because "locked" does not mean what it sounds
+// like. The Lock bit exempts an entry from the *replacement* algorithm; it does
+// nothing about an explicit demap, which removes whatever matches the address.
+// So an ordinary VM operation on a kernel address -- and the trap table lives
+// inside the kernel image, so protecting or remapping kernel text covers it --
+// silently unlocks the machine's ability to service a TLB miss, and the next
+// instruction fetch of the miss handler misses, nests, and ends in a watchdog
+// reset at MAXTL.
+struct locked_range {
+	addr_t	base;
+	size_t	size;
+};
+
+static locked_range sLockedRanges[8];
+static uint32 sLockedRangeCount;
+
 // Defined further down, next to the TLB-reading code they are built on, but
 // needed by the TSB allocation above them.
 static status_t sparc_allocate_aligned_physical(kernel_args *args, size_t size,
@@ -182,6 +201,7 @@ static status_t sparc_allocate_aligned_physical(kernel_args *args, size_t size,
 static int sparc_tlb_lock_range(addr_t virtualAddress,
 	phys_addr_t physicalAddress, size_t size, uint64 pageSize,
 	bool instruction, uint64 flags);
+static void sparc_add_locked_range(addr_t base, size_t size);
 static uint32 sKernelTsbCollisions;
 
 
@@ -282,6 +302,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 
 	sKernelTsb = (TsbEntry*)base;
 	sKernelTsbPhysical = physicalBase;
+	sparc_add_locked_range(base, size);
 
 	// The first write through the new mapping. If the locked entries were built
 	// wrong this faults here, at a point where the firmware is still handling
@@ -1193,6 +1214,8 @@ sparc_lock_trap_pages()
 			locked += used;
 		}
 
+		sparc_add_locked_range(first, last - first);
+
 		dprintf("sparc_mmu: locked %s, %#" B_PRIxADDR "-%#" B_PRIxADDR ", in %d "
 			"%s-TLB entries\n", ranges[i].name, first, last, locked,
 			ranges[i].instruction ? "I" : "D");
@@ -1452,6 +1475,36 @@ sparc_verify_trap_handlers(struct kernel_args *args)
 }
 
 
+/*!	Records a range as permanently mapped, so nothing invalidates it later. */
+static void
+sparc_add_locked_range(addr_t base, size_t size)
+{
+	if (sLockedRangeCount >= sizeof(sLockedRanges) / sizeof(sLockedRanges[0])) {
+		panic("sparc_mmu: too many locked ranges");
+		return;
+	}
+
+	sLockedRanges[sLockedRangeCount].base = base;
+	sLockedRanges[sLockedRangeCount].size = size;
+	sLockedRangeCount++;
+}
+
+
+/*!	Whether an address belongs to a mapping that must never be taken away. */
+static bool
+sparc_is_locked_address(addr_t virtualAddress)
+{
+	for (uint32 i = 0; i < sLockedRangeCount; i++) {
+		if (virtualAddress >= sLockedRanges[i].base
+			&& virtualAddress < sLockedRanges[i].base + sLockedRanges[i].size) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
 /*!	Drops a TSB line if it is the one describing this address.
 
 	Conditional on the tag, because the TSB is direct-mapped: the line this
@@ -1464,6 +1517,11 @@ void
 sparc_tsb_invalidate(addr_t virtualAddress)
 {
 	if (sKernelTsb == NULL)
+		return;
+
+	// See sparc_add_locked_range(): these mappings are permanent, and dropping
+	// one costs the machine its ability to handle the next trap.
+	if (sparc_is_locked_address(virtualAddress))
 		return;
 
 	uint32 index = (virtualAddress >> 13) & (KERNEL_TSB_ENTRIES - 1);
@@ -1494,6 +1552,13 @@ sparc_tsb_invalidate(addr_t virtualAddress)
 void
 sparc_tlb_demap(addr_t virtualAddress)
 {
+	// A demap removes whatever matches the address, locked or not -- the Lock
+	// bit only exempts an entry from replacement. Refusing here is what keeps
+	// the trap path mapped; the mappings it protects never change, so there is
+	// nothing to invalidate anyway.
+	if (sparc_is_locked_address(virtualAddress))
+		return;
+
 	uint64 address = (uint64)virtualAddress & TLB_TAG_VA_MASK;
 
 	asm volatile(
