@@ -366,6 +366,60 @@ list in software, never using the hardware TSB mechanism. Three consequences:
 
 ---
 
+## 4.3 Trap table layout, and why the handlers fit
+
+A detail that makes the whole thing practical: **the busiest traps are allotted four table entries
+each, not one.**
+
+Trap types are assigned so that related traps are four apart — `spill_n_normal` is
+`0x80 + 4n`, `fill_n_normal` is `0xC0 + 4n`, and the MMU misses occupy `0x64–0x67`,
+`0x68–0x6B` and `0x6C–0x6F` (which is why QEMU's vectoring code reads
+`case TT_DMISS ... TT_DMISS + 3`). Only the first entry of each group is ever vectored to, so a
+handler may run on into the following three.
+
+That gives **128 bytes, or thirty-two instructions**, for exactly the handlers that need to do
+their work inline because they have no stack to branch away with:
+
+| Handler | Instructions | Fits in 32 |
+| --- | ---: | :---: |
+| TLB miss fast path | 10 | ✅ |
+| Window spill | 18 (16 stores, `saved`, `retry`) | ✅ |
+| Window fill | 18 (16 loads, `restored`, `retry`) | ✅ |
+| Clean window | 20 | ✅ |
+
+Ordinary traps get a single 32-byte entry and must branch elsewhere.
+
+### The layout to build
+
+```
+  offset          trap types            handler
+  0x000-0x023     misc                  unhandled
+  0x024-0x027     clean_window          CLEAN_KERNEL_WINDOW
+  0x028-0x063     misc                  unhandled
+  0x064-0x067     instruction MMU miss  sparc_instruction_mmu_miss
+  0x068-0x06B     data MMU miss         sparc_data_mmu_miss
+  0x06C-0x06F     data protection       (slow path, not written)
+  0x070-0x07F     misc                  unhandled
+  0x080-0x09F     spill_0..7_normal     SPILL_KERNEL_WINDOW
+  0x0A0-0x0BF     spill_0..7_other      SPILL_KERNEL_WINDOW
+  0x0C0-0x0DF     fill_0..7_normal      FILL_KERNEL_WINDOW
+  0x0E0-0x0FF     fill_0..7_other       FILL_KERNEL_WINDOW
+  0x100-0x1FF     software traps        unhandled
+```
+
+then the whole thing again for `TL > 0`, at `+0x4000`.
+
+While the port is kernel-only the `_normal` and `_other` variants can share a handler; they
+separate when userspace arrives and a spill has to know whether it is writing a user stack.
+
+**The open question is what "unhandled" should do.** Zero-filling is the easy answer and the wrong
+one: zero is an illegal instruction, so an unhandled trap would take another trap, and four
+levels of that is a watchdog reset with nothing said. It wants a handler that records the trap
+type somewhere the debugger can find it and then halts — which is the same problem as the TSB
+slow path, since neither can call anything or use a stack.
+
+---
+
 ## 5. The one caveat about developing against QEMU
 
 Every mechanism above is emulated faithfully, so the *logic* can be developed and debugged in

@@ -19,7 +19,7 @@ and 4-clause files, sometimes within one directory.
 
 | Our file | Source | Origin licence | What was taken | Notes |
 | --- | --- | --- | --- | --- |
-| *(nothing yet)* | | | | |
+| `src/system/kernel/arch/sparc/arch_traps.S` | OpenBSD `sys/arch/sparc64/sparc64/locore.s` | BSD 4-clause (Kranenburg, Horvath, UCB and others) | The shape of the window spill, fill and clean-window handlers, and the structure of the TLB miss fast path | Not a verbatim copy. The spill and fill bodies are the obvious sixteen stores and loads that any implementation arrives at, and the miss path was written from the manual's section 15.3.1 refill sequence and verified against this machine before the reference was consulted. Two details *are* taken from OpenBSD and were not in our version: the atomic quad load of the TSB line via `ASI_NUCLEUS_QUAD_LDD`, and testing the TTE Valid bit with `brgez` on the data half. The clean-window sequence follows their `KCLEANWIN` closely. |
 
 ## Anticipated sources
 
