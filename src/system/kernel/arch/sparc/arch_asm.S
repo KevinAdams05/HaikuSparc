@@ -14,6 +14,8 @@
 #define SPARC_MINIMUM_FRAME_SIZE	176
 #define CONTEXT_SP			0
 #define CONTEXT_PC			8
+#define CONTEXT_PSTATE			16
+#define CONTEXT_PIL			24
 
 
 .text
@@ -82,8 +84,23 @@ FUNCTION(sparc_context_switch):
 	stx	%i6, [%i0 + CONTEXT_SP]
 	stx	%i7, [%i0 + CONTEXT_PC]
 
+	/* PSTATE and PIL are per-CPU registers that behave as though they were
+	 * per-thread, so the switch has to carry them. A thread suspended inside an
+	 * interrupt handler has interrupts off and the interrupt level raised, and
+	 * the thread resumed in its place must not inherit either.
+	 */
+	rdpr	%pstate, %l0
+	stx	%l0, [%i0 + CONTEXT_PSTATE]
+	rdpr	%pil, %l1
+	stx	%l1, [%i0 + CONTEXT_PIL]
+
 	ldx	[%i1 + CONTEXT_SP], %i6
 	ldx	[%i1 + CONTEXT_PC], %i7
+
+	ldx	[%i1 + CONTEXT_PIL], %l1
+	wrpr	%l1, 0, %pil
+	ldx	[%i1 + CONTEXT_PSTATE], %l0
+	wrpr	%l0, 0, %pstate
 
 	ret
 	 restore
@@ -121,7 +138,7 @@ FUNCTION_END(sparc_thread_entry)
 
 /*	Report this file's idea of the context layout, so C++ can check it.
  *
- *	void sparc_context_offsets(uint64 *out);   // three entries
+ *	void sparc_context_offsets(uint64 *out);   // five entries
  */
 FUNCTION(sparc_context_offsets):
 	mov	CONTEXT_SP, %o1
@@ -130,6 +147,10 @@ FUNCTION(sparc_context_offsets):
 	stx	%o1, [%o0 + (1 * 8)]
 	mov	SPARC_MINIMUM_FRAME_SIZE, %o1
 	stx	%o1, [%o0 + (2 * 8)]
+	mov	CONTEXT_PSTATE, %o1
+	stx	%o1, [%o0 + (3 * 8)]
+	mov	CONTEXT_PIL, %o1
+	stx	%o1, [%o0 + (4 * 8)]
 	retl
 	 nop
 FUNCTION_END(sparc_context_offsets)

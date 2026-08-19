@@ -59,16 +59,18 @@ arch_thread_init_thread_struct(Thread *thread)
 static void
 sparc_verify_context_layout()
 {
-	uint64 assembler[3];
+	uint64 assembler[5];
 	sparc_context_offsets(assembler);
 
-	const uint64 declared[3] = {
+	const uint64 declared[5] = {
 		offsetof(arch_context, sp),
 		offsetof(arch_context, pc),
 		SPARC_MINIMUM_FRAME_SIZE,
+		offsetof(arch_context, pstate),
+		offsetof(arch_context, pil),
 	};
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 5; i++) {
 		if (assembler[i] != declared[i]) {
 			panic("sparc context layout %d: arch_asm.S says %#" B_PRIx64
 				", arch_thread_types.h says %#" B_PRIx64, i, assembler[i],
@@ -125,6 +127,21 @@ arch_thread_init_kthread_stack(Thread* thread, void* _stack, void* _stackTop,
 
 	// Less eight, because "ret" jumps to %i7 + 8.
 	thread->arch_info.context.pc = (addr_t)&sparc_thread_entry - 8;
+
+	// Privileged, FPU usable, interrupts *disabled*, interrupt level zero.
+	//
+	// Disabled is not a conservative guess, it is the contract. Every context
+	// switch in Haiku happens at the same kind of point -- inside
+	// scheduler_reschedule(), holding the thread's scheduler lock with
+	// interrupts off -- and a thread being scheduled for the first time arrives
+	// in exactly that state. common_thread_entry() then does the matching
+	// release_spinlock() and enable_interrupts() itself.
+	//
+	// Starting one with interrupts on instead trips Haiku's own check
+	// immediately: "release_spinlock: attempt to release lock with interrupts
+	// enabled".
+	thread->arch_info.context.pstate = SPARC_PSTATE_PRIV | SPARC_PSTATE_PEF;
+	thread->arch_info.context.pil = 0;
 }
 
 

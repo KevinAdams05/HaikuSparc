@@ -20,6 +20,11 @@
 // SPARC V9 stack bias. Duplicated in arch_traps.S, which cannot see this header.
 #define SPARC_STACK_BIAS			2047
 
+// PSTATE fields a thread's context cares about (TABLE 14-12, printed p.201).
+#define SPARC_PSTATE_IE				0x002
+#define SPARC_PSTATE_PRIV			0x004
+#define SPARC_PSTATE_PEF			0x010
+
 
 #define	IFRAME_TRACE_DEPTH 4
 
@@ -51,6 +56,19 @@ struct arch_context {
 		// Where to resume, less eight. The switch returns with "ret", which
 		// jumps to %i7 + 8, and storing the adjusted value here keeps that
 		// arithmetic in one place instead of splitting it across C and assembly.
+	uint64	pstate;
+		// PSTATE, for its interrupt-enable bit above all.
+	uint64	pil;
+		// The processor interrupt level.
+		//
+		// These two are per-CPU registers, not per-thread ones, and leaving
+		// them out was a real bug rather than an omission of detail. A thread
+		// switched out from inside an interrupt handler has interrupts disabled
+		// and the interrupt level raised; the thread switched *to* expects its
+		// own. Without saving them, whichever thread ran last decides both for
+		// everybody -- so a thread could resume with interrupts enabled inside a
+		// handler that still owed a trap return, and a nested interrupt would
+		// then drive the trap level below zero.
 };
 
 // architecture specific thread info
