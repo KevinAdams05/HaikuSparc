@@ -84,6 +84,7 @@ extern void sparc_get_data_tsb(TsbEntry **_pageTable, size_t *_size);
 
 extern void sparc_dump_openfirmware_translations();
 extern void sparc_verify_tsb_indexing();
+extern status_t sparc_verify_trap_table();
 
 // TSB_Size for the kernel's own TSB. 8192 entries of 16 bytes is 128 KB per
 // TSB, and the split pair is 256 KB aligned to 256 KB. Sized from the measured

@@ -295,6 +295,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_verify_tsb_indexing();
 	sparc_verify_tlb_load(args);
 	sparc_verify_tsb_lookup();
+	sparc_verify_trap_table();
 
 	return B_OK;
 }
@@ -515,3 +516,93 @@ sparc_verify_tsb_lookup()
 }
 
 #endif	// !_BOOT_MODE
+
+
+/*!	Checks the trap table's geometry before anything relies on it.
+
+	The table is laid out by the assembler, and the assembler's own checks --
+	the .org directives in arch_traps.S -- catch a handler that outgrows its
+	group. What they cannot catch is a handler landing at the wrong trap type,
+	because that is a question about which offset means what rather than about
+	sizes.
+
+	Getting that wrong is close to undiagnosable after the fact: every trap
+	would vector into some other handler's code, and the machine would misbehave
+	in a way that looks nothing like a table problem. So verify it here, from a
+	place where a failure can still be printed, and keep verifying it on every
+	boot rather than trusting a check that was run once.
+
+	The first instruction of each handler is distinctive enough to identify it.
+*/
+status_t
+sparc_verify_trap_table()
+{
+	extern uint32 sparc_trap_table[];
+	extern uint32 sparc_trap_table_end[];
+
+	addr_t base = (addr_t)sparc_trap_table;
+	size_t size = (addr_t)sparc_trap_table_end - base;
+
+	dprintf("sparc_mmu: trap table at %#" B_PRIxADDR ", %" B_PRIuSIZE " bytes\n",
+		base, size);
+
+	if (size != 32768) {
+		panic("sparc trap table is %" B_PRIuSIZE " bytes, expected 32768",
+			size);
+		return B_ERROR;
+	}
+	if ((base & 0x7fff) != 0) {
+		panic("sparc trap table at %#" B_PRIxADDR " is not 32 KB aligned",
+			base);
+		return B_ERROR;
+	}
+
+	// Each entry is 32 bytes, so the first instruction of trap type t sits at
+	// t * 8 words. Masks ignore the register and immediate fields and keep only
+	// enough opcode to tell the handlers apart.
+	struct {
+		uint32		trapType;
+		const char*	name;
+		uint32		mask;
+		uint32		expected;
+	} checks[] = {
+		// ldxa [%g0] ASI, %g2 -- the ASI is in bits 12:5.
+		{ 0x064, "instruction MMU miss", 0xffffffff, 0xc4d80a20 },
+		{ 0x068, "data MMU miss",        0xffffffff, 0xc4d80b20 },
+		{ 0x268, "data MMU miss (TL>0)", 0xffffffff, 0xc4d80b20 },
+		// stx %l0, [%sp + 0x7ff] and ldx [%sp + 0x7ff], %l0.
+		{ 0x080, "spill (normal)",       0xffffffff, 0xe073a7ff },
+		{ 0x0a0, "spill (other)",        0xffffffff, 0xe073a7ff },
+		{ 0x0c0, "fill (normal)",        0xffffffff, 0xe05ba7ff },
+		{ 0x0e0, "fill (other)",         0xffffffff, 0xe05ba7ff },
+		// clr %l0. gas emits the register form, or %g0, %g0, %l0, rather than
+		// the immediate one; the mask keeps the opcode, rd and rs1 and ignores
+		// which form was chosen.
+		{ 0x024, "clean window",         0xffffc000, 0xa0100000 },
+		// ba,a -- only the opcode and the annul and condition fields matter,
+		// since the displacement depends on where the handler landed.
+		{ 0x000, "unhandled (reset)",    0xffc00000, 0x30800000 },
+		{ 0x100, "unhandled (soft trap)",0xffc00000, 0x30800000 },
+	};
+
+	uint32 failures = 0;
+	for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+		uint32 found = sparc_trap_table[checks[i].trapType * 8];
+		if ((found & checks[i].mask) != checks[i].expected) {
+			dprintf("sparc_mmu: trap %#" B_PRIx32 " (%s): found %#" B_PRIx32
+				", expected %#" B_PRIx32 "\n", checks[i].trapType,
+				checks[i].name, found, checks[i].expected);
+			failures++;
+		}
+	}
+
+	if (failures != 0) {
+		panic("sparc trap table: %" B_PRIu32 " handlers are in the wrong place",
+			failures);
+		return B_ERROR;
+	}
+
+	dprintf("sparc_mmu: trap table geometry verified, %" B_PRIuSIZE
+		" handlers in place\n", sizeof(checks) / sizeof(checks[0]));
+	return B_OK;
+}

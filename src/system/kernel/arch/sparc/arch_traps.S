@@ -377,3 +377,139 @@ sparc_unhandled_trap_stop:
  *	the assertion worth having: overflowing an entry misaligns everything after
  *	it, so every later trap would vector into the middle of some other handler.
  */
+
+
+/*	Groups of four entries.
+ *
+ *	The trap types that matter most are spaced four apart, so only the first of
+ *	each group of four is ever vectored to and a handler may use all 128 bytes.
+ *	Each group pads itself to that size with .org, which also asserts the fit:
+ *	.org refuses to move backwards, so a handler that outgrows its group fails
+ *	the build instead of silently displacing everything after it.
+ *
+ *	The padding is unreachable -- every handler ends in retry -- so what it
+ *	contains does not matter.
+ */
+.macro TRAP_GROUP_CLEAN
+8:	CLEAN_KERNEL_WINDOW
+	.org 8b + 128
+.endm
+
+.macro TRAP_GROUP_SPILL
+8:	SPILL_KERNEL_WINDOW
+	.org 8b + 128
+.endm
+
+.macro TRAP_GROUP_FILL
+8:	FILL_KERNEL_WINDOW
+	.org 8b + 128
+.endm
+
+.macro TRAP_GROUP_DATA_MISS
+8:	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN
+	.org 8b + 128
+.endm
+
+.macro TRAP_GROUP_INSTRUCTION_MISS
+8:	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN
+	.org 8b + 128
+.endm
+
+
+/*	One half of the trap table: 512 entries of 32 bytes, so 16 KB.
+ *
+ *	The same layout serves TL = 0 and TL > 0. They could differ -- a spill taken
+ *	inside a trap handler is a different situation from one taken in ordinary
+ *	kernel code -- but while the port is kernel-only both are saving a kernel
+ *	window to a kernel stack, so one layout does for both.
+ *
+ *	Likewise the _normal and _other variants of spill and fill share a handler.
+ *	They separate when userspace arrives and a spill has to know whether the
+ *	stack it is writing belongs to a user process.
+ */
+.macro TRAP_TABLE_HALF
+	/* 0x000-0x023: reset, instruction access, illegal instruction, privileged
+	 * action, floating point, tag overflow. Nothing handled yet, but every
+	 * entry is filled: an unhandled trap must reach a handler that reports it,
+	 * not run into blank space.
+	 */
+	.rept 0x024
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x024-0x027: clean_window. The most frequent trap of all. */
+	TRAP_GROUP_CLEAN
+
+	/* 0x028-0x063: interrupt levels, and the traps for watchdog, alignment
+	 * and the rest.
+	 */
+	.rept 0x03c
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x064-0x06b: the two MMU misses, which are the point of all this. */
+	TRAP_GROUP_INSTRUCTION_MISS
+	TRAP_GROUP_DATA_MISS
+
+	/* 0x06c-0x06f: fast_data_access_protection. A write to a read-only page,
+	 * which wants the slow path rather than a refill, so it is left unhandled
+	 * for now and will report itself if it happens.
+	 */
+	.rept 0x004
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x070-0x07f */
+	.rept 0x010
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x080-0x09f: spill_0_normal through spill_7_normal.
+	 * 0x0a0-0x0bf: spill_0_other through spill_7_other.
+	 */
+	.rept 8
+	TRAP_GROUP_SPILL
+	.endr
+	.rept 8
+	TRAP_GROUP_SPILL
+	.endr
+
+	/* 0x0c0-0x0df: fill_0_normal through fill_7_normal.
+	 * 0x0e0-0x0ff: fill_0_other through fill_7_other.
+	 */
+	.rept 8
+	TRAP_GROUP_FILL
+	.endr
+	.rept 8
+	TRAP_GROUP_FILL
+	.endr
+
+	/* 0x100-0x1ff: the software traps, reached by the Tcc instructions. Haiku
+	 * will want one of these for system calls eventually.
+	 */
+	.rept 0x100
+	TRAP_UNHANDLED
+	.endr
+.endm
+
+
+/*	The table.
+ *
+ *	32 KB and 32 KB aligned, because the hardware forms an entry address as
+ *	%tba | (TL > 0 ? 0x4000 : 0) | (trap_type << 5) and simply ignores the low
+ *	bits of %tba. A misaligned table would not be diagnosed; it would just
+ *	vector every trap into the wrong place.
+ *
+ *	The two .org directives are assertions rather than padding: each half must
+ *	come out at exactly 16 KB, and .org fails the build if a half has overrun.
+ *	An assembler .if cannot be used for this -- gas evaluates .if before
+ *	addresses are assigned, so it rejects even a correct table. That was tried
+ *	twice.
+ */
+.align 32768
+FUNCTION(sparc_trap_table):
+	TRAP_TABLE_HALF
+	.org sparc_trap_table + 0x4000
+	TRAP_TABLE_HALF
+	.org sparc_trap_table + 0x8000
+FUNCTION(sparc_trap_table_end):
