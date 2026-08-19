@@ -198,10 +198,17 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 	if (entry->IsValid())
 		sKernelTsbCollisions++;
 
-	// Kernel mappings are Global, so hit detection ignores the context field
-	// and the entry serves every context. See PHASE2_MMU_DESIGN.md section 4
-	// and the plan's section 4.3 for why the port stays in one address space.
-	entry->fTag = TTE_TAG_GLOBAL | (virtualAddress >> 22);
+	// The tag is exactly what the hardware's tag target will be:
+	// (context << 48) | VA<63:22>, and the context is zero throughout the
+	// kernel. That lets the miss handler compare with a single xor.
+	//
+	// The Global bit is deliberately not set here even though the data half
+	// carries it. Its purpose in the tag is to tell a handler that supports
+	// several contexts to ignore the context field, and setting it now would
+	// only force the handler to mask it back off. When user contexts arrive --
+	// see the plan's section 4.3 -- the comparison will need to become
+	// G-aware, and that is the point to set it.
+	entry->fTag = (virtualAddress >> 22);
 	entry->fData = TTE_VALID | ((uint64)TTE_SIZE_8K << TTE_SIZE_SHIFT)
 		| (physicalAddress & TTE_PA_MASK) | TTE_GLOBAL | flags;
 }
@@ -483,7 +490,7 @@ sparc_tsb_lookup(addr_t virtualAddress, uint64_t* _data)
 		return false;
 
 	uint64_t target = ((uint64_t)virtualAddress >> 22);
-	if ((entry->fTag & ~TTE_TAG_GLOBAL) != target)
+	if (entry->fTag != target)
 		return false;
 
 	*_data = entry->fData;

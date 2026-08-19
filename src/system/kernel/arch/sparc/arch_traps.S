@@ -37,6 +37,7 @@
 #define ASI_DMMU			0x58
 #define ASI_DMMU_TSB_8KB_PTR		0x59
 #define ASI_DTLB_DATA_IN		0x5c
+#define ASI_NUCLEUS_QUAD_LDD		0x24
 
 /* Register offsets within ASI_IMMU / ASI_DMMU. */
 #define MMU_TAG_TARGET			0x00
@@ -77,25 +78,30 @@
 .macro TLB_MISS_HANDLER mmu_asi, pointer_asi, data_in_asi
 	/* The pointer the hardware formed from the faulting address, and the tag
 	 * it wants compared. Both are reads from MMU alternate space; neither can
-	 * miss.
+	 * miss. The tag target sits at offset zero in the MMU register block, so
+	 * %g0 addresses it directly.
 	 */
-	ldxa	[%g0] \pointer_asi, %g1
-	mov	MMU_TAG_TARGET, %g2
-	ldxa	[%g2] \mmu_asi, %g2
+	ldxa	[%g0] \pointer_asi, %g2
+	ldxa	[%g0] \mmu_asi, %g1
 
-	/* The TSB line: tag first, then data. A single quad load would be atomic
-	 * against a concurrent writer, which will matter once there is more than
-	 * one CPU; there is not yet, and correctness here is easier to see.
+	/* The TSB line, tag and data together. A quad load is atomic against a
+	 * writer updating the pair, which a tag load followed by a separate data
+	 * load is not -- and the window between them is exactly where a stale
+	 * pairing would be picked up. %g4 takes the tag, %g5 the data.
 	 */
-	ldx	[%g1], %g4
-	ldx	[%g1 + 8], %g5
+	ldda	[%g2] ASI_NUCLEUS_QUAD_LDD, %g4
 
-	/* Hit detection. Stored tags carry the Global bit, which the tag target
-	 * does not, so xor and then discard bit 63 by shifting it out. Anything
-	 * left set means some other bit differed, and it is a miss.
+	/* Valid is bit 63 of the data half, so the entry is invalid precisely
+	 * when the data is non-negative. Checking this matters: a zeroed TSB line
+	 * has a zero tag, which would otherwise match a faulting access to a low
+	 * address and load a null translation.
+	 *
+	 * The comparison itself is a plain xor because sparc_tsb_insert() stores
+	 * tags in exactly the form the hardware builds its tag target, and the
+	 * kernel runs in context zero.
 	 */
-	xor	%g4, %g2, %g4
-	sllx	%g4, 1, %g4
+	brgez,pn %g5, 1f
+	 xor	%g1, %g4, %g4
 	brnz,pn	%g4, 1f
 	 nop
 
@@ -145,3 +151,123 @@ FUNCTION(sparc_instruction_mmu_miss):
 sparc_tsb_miss_trap:
 	ba,a	sparc_tsb_miss_trap
 	 nop
+
+
+/*	Window spill and fill.
+ *
+ *	These are the busiest handlers in the system: a boot takes roughly ten
+ *	thousand spills and as many fills, all currently serviced by the firmware.
+ *
+ *	Spill and fill traps are allotted four table entries each rather than one,
+ *	because the trap type encodes the window number in its low two bits. That
+ *	is 128 bytes, or thirty-two instructions, which is what makes it possible
+ *	to do the whole job inline instead of branching somewhere with no stack to
+ *	branch with.
+ *
+ *	On a spill the hardware has already rotated CWP to the window that needs
+ *	saving, so %sp names that window's frame directly. A SPARC V9 frame keeps
+ *	the register save area at %sp + BIAS: eight locals, then eight ins.
+ *
+ *	Derived from OpenBSD's sys/arch/sparc64/sparc64/locore.s, which is where
+ *	the shape of these handlers and the clean-window sequence come from. See
+ *	sparc-port/THIRD_PARTY.md.
+ */
+
+/* SPARC V9 stack bias: %sp holds the frame address minus 2047. */
+#define BIAS	2047
+
+
+/*	Save the current window to its stack frame.
+ *
+ *	"saved" tells the hardware the window is no longer live, which is what
+ *	updates CANSAVE and CANRESTORE; "retry" then re-runs the save that trapped.
+ */
+.macro SPILL_KERNEL_WINDOW
+	stx	%l0, [%sp + BIAS + (0 * 8)]
+	stx	%l1, [%sp + BIAS + (1 * 8)]
+	stx	%l2, [%sp + BIAS + (2 * 8)]
+	stx	%l3, [%sp + BIAS + (3 * 8)]
+	stx	%l4, [%sp + BIAS + (4 * 8)]
+	stx	%l5, [%sp + BIAS + (5 * 8)]
+	stx	%l6, [%sp + BIAS + (6 * 8)]
+	stx	%l7, [%sp + BIAS + (7 * 8)]
+	stx	%i0, [%sp + BIAS + (8 * 8)]
+	stx	%i1, [%sp + BIAS + (9 * 8)]
+	stx	%i2, [%sp + BIAS + (10 * 8)]
+	stx	%i3, [%sp + BIAS + (11 * 8)]
+	stx	%i4, [%sp + BIAS + (12 * 8)]
+	stx	%i5, [%sp + BIAS + (13 * 8)]
+	stx	%i6, [%sp + BIAS + (14 * 8)]
+	stx	%i7, [%sp + BIAS + (15 * 8)]
+	saved
+	retry
+.endm
+
+
+/*	Restore the current window from its stack frame. */
+.macro FILL_KERNEL_WINDOW
+	ldx	[%sp + BIAS + (0 * 8)], %l0
+	ldx	[%sp + BIAS + (1 * 8)], %l1
+	ldx	[%sp + BIAS + (2 * 8)], %l2
+	ldx	[%sp + BIAS + (3 * 8)], %l3
+	ldx	[%sp + BIAS + (4 * 8)], %l4
+	ldx	[%sp + BIAS + (5 * 8)], %l5
+	ldx	[%sp + BIAS + (6 * 8)], %l6
+	ldx	[%sp + BIAS + (7 * 8)], %l7
+	ldx	[%sp + BIAS + (8 * 8)], %i0
+	ldx	[%sp + BIAS + (9 * 8)], %i1
+	ldx	[%sp + BIAS + (10 * 8)], %i2
+	ldx	[%sp + BIAS + (11 * 8)], %i3
+	ldx	[%sp + BIAS + (12 * 8)], %i4
+	ldx	[%sp + BIAS + (13 * 8)], %i5
+	ldx	[%sp + BIAS + (14 * 8)], %i6
+	ldx	[%sp + BIAS + (15 * 8)], %i7
+	restored
+	retry
+.endm
+
+
+/*	Hand a freshly rotated window to code that may read it before writing.
+ *
+ *	This is the most frequent trap of all -- around fifty thousand per boot --
+ *	because the kernel is constantly entering new windows. Zero the locals and
+ *	the outs, bump CLEANWIN so the hardware knows one more window is safe, and
+ *	retry.
+ *
+ *	%o7 is used as the scratch for CLEANWIN and then zeroed along with the
+ *	rest, so nothing is left behind.
+ */
+.macro CLEAN_KERNEL_WINDOW
+	clr	%l0
+	mov	%l0, %l1
+	mov	%l0, %l2
+	rdpr	%cleanwin, %o7
+	inc	%o7
+	mov	%l0, %l3
+	wrpr	%g0, %o7, %cleanwin
+	mov	%l0, %l4
+	mov	%l0, %l5
+	mov	%l0, %l6
+	mov	%l0, %l7
+	mov	%l0, %o0
+	mov	%l0, %o1
+	mov	%l0, %o2
+	mov	%l0, %o3
+	mov	%l0, %o4
+	mov	%l0, %o5
+	mov	%l0, %o6
+	mov	%l0, %o7
+	retry
+.endm
+
+
+FUNCTION(sparc_spill_kernel):
+	SPILL_KERNEL_WINDOW
+
+
+FUNCTION(sparc_fill_kernel):
+	FILL_KERNEL_WINDOW
+
+
+FUNCTION(sparc_clean_window):
+	CLEAN_KERNEL_WINDOW
