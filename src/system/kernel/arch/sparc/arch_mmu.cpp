@@ -171,6 +171,15 @@ sparc_dump_openfirmware_translations()
 // the split configuration requires. Only the 8 KB half is populated for now --
 // nothing maps with larger pages yet.
 static TsbEntry* sKernelTsb;
+static phys_addr_t sKernelTsbPhysical;
+
+// Defined further down, next to the TLB-reading code they are built on, but
+// needed by the TSB allocation above them.
+static status_t sparc_allocate_aligned_physical(kernel_args *args, size_t size,
+	size_t alignment, phys_addr_t *_physicalBase);
+static int sparc_tlb_lock_range(addr_t virtualAddress,
+	phys_addr_t physicalAddress, size_t size, uint64 pageSize,
+	bool instruction, uint64 flags);
 static uint32 sKernelTsbCollisions;
 
 
@@ -234,7 +243,20 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	// Both halves, aligned to the size of the pair, as FIGURE 15-9 requires.
 	// A misaligned base is not diagnosed by the hardware.
 	size_t size = KERNEL_TSB_BYTES * 2;
-	addr_t base = vm_allocate_early(args, size, size,
+
+	// The TSB has to be locked in the data TLB, because the miss handler reads
+	// it with an atomic quad load and this CPU has no physical-address variant
+	// of that instruction -- see section 4.4 of the design note. Locking 256 KB
+	// as 8 KB pages would take 32 of the 64 entries, so it is locked as 64 KB
+	// pages instead, which takes four.
+	//
+	// That needs the physical half 64 KB aligned and the whole span physically
+	// contiguous, which vm_allocate_early() cannot promise: it takes physical
+	// pages one at a time and its alignment argument constrains only the virtual
+	// base. So the virtual range is taken from it with no physical backing at
+	// all -- a physicalSize of zero maps nothing -- and the physical side is
+	// gathered separately and mapped by the locked entries themselves.
+	addr_t base = vm_allocate_early(args, size, 0,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, size);
 	if (base == 0) {
 		dprintf("sparc_mmu: could not allocate a %" B_PRIuSIZE " byte TSB\n",
@@ -242,12 +264,32 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 		return B_NO_MEMORY;
 	}
 
+	const size_t kLockPageSize = 64 * 1024;
+	phys_addr_t physicalBase;
+	status_t status = sparc_allocate_aligned_physical(args, size, kLockPageSize,
+		&physicalBase);
+	if (status != B_OK)
+		return status;
+
+	int locked = sparc_tlb_lock_range(base, physicalBase, size, TTE_SIZE_64K,
+		false, TTE_WRITABLE | TTE_PRIVILEGED | TTE_CACHEABLE_PHYSICAL
+			| TTE_CACHEABLE_VIRTUAL);
+	if (locked < 0)
+		return B_ERROR;
+
 	sKernelTsb = (TsbEntry*)base;
+	sKernelTsbPhysical = physicalBase;
+
+	// The first write through the new mapping. If the locked entries were built
+	// wrong this faults here, at a point where the firmware is still handling
+	// traps and can still say so -- which is the whole reason for doing it
+	// before the trap table is installed rather than after.
 	memset(sKernelTsb, 0, size);
 
-	dprintf("sparc_mmu: TSB at %#" B_PRIxADDR ", %" B_PRIu32 " entries per half"
-		", %" B_PRIuSIZE " KB total\n", base, (uint32)KERNEL_TSB_ENTRIES,
-		size / 1024);
+	dprintf("sparc_mmu: TSB at %#" B_PRIxADDR " (pa %#" B_PRIxPHYSADDR "), %"
+		B_PRIu32 " entries per half, %" B_PRIuSIZE " KB total, locked in %d "
+		"64 KB D-TLB entries\n", base, physicalBase,
+		(uint32)KERNEL_TSB_ENTRIES, size / 1024, locked);
 
 	// Warm it with what the firmware has mapped. These are the translations
 	// the kernel inherits, and the ones it must be able to service itself once
@@ -299,6 +341,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_verify_tsb_lookup();
 	sparc_verify_trap_table();
 	sparc_verify_trap_globals();
+	sparc_lock_trap_pages();
 	sparc_dump_tlb();
 
 	return B_OK;
@@ -763,6 +806,185 @@ read_tlb_entry(int entry, bool instruction, uint64 *_tag, uint64 *_data)
 }
 
 
+/*!	Writes one TLB entry directly, with the Lock bit set.
+
+	Data Access is the ASI that names an entry explicitly, as opposed to Data In
+	which lets the replacement algorithm choose. The tag does not come from the
+	store: section 15.9.9 says the entry tag is taken from the current contents
+	of the Tag Access register, so that has to be written first and the pair is
+	only atomic from the store onwards.
+
+	The demap first is not belt-and-braces. The manual warns that a store to Data
+	In "is not guaranteed to replace the previous TLB entry causing a fault", and
+	that to change an entry's attribute bits software must explicitly demap the
+	old entry first, "otherwise, a multiple match error condition can result" --
+	and a multiple match is documented as having undefined results, not as being
+	detected. Since these pages are already mapped by ordinary unlocked entries
+	when this runs, that is exactly the situation being walked into.
+*/
+static void
+sparc_tlb_lock_entry(int entry, addr_t virtualAddress,
+	phys_addr_t physicalAddress, uint64 pageSize, bool instruction,
+	uint64 flags)
+{
+	uint64 tag = (uint64)virtualAddress & TLB_TAG_VA_MASK;
+	uint64 data = TTE_VALID | (pageSize << TTE_SIZE_SHIFT)
+		| ((uint64)physicalAddress & TTE_PA_MASK) | TTE_LOCKED | TTE_GLOBAL
+		| flags;
+	uint64 address = SPARC_TLB_ENTRY_ADDRESS(entry);
+
+	// Demap address format is FIGURE 15-15 (printed p.231): VA<63:13>, then
+	// type at bit 6 and context at bits 5:4. Type 0 is demap-page and context
+	// 00 is primary, which is what the existing TLB test uses; for the Global
+	// entries written here the context is ignored during matching anyway.
+	uint64 demap = tag;
+
+	if (instruction) {
+		// ASI_IMMU 0x50, ASI_IMMU_DEMAP 0x57, ASI_IMMU_TLB_DATA 0x55.
+		asm volatile(
+			"stxa %[demap], [%[demap]] 0x57\n\t"
+			"membar #Sync\n\t"
+			"stxa %[tag], [%[tagReg]] 0x50\n\t"
+			"membar #Sync\n\t"
+			"stxa %[data], [%[address]] 0x55\n\t"
+			"membar #Sync"
+			:
+			: [demap] "r"(demap), [tag] "r"(tag), [data] "r"(data),
+			  [tagReg] "r"(tlb_tag_access), [address] "r"(address)
+			: "memory");
+	} else {
+		// ASI_DMMU 0x58, ASI_DMMU_DEMAP 0x5f, ASI_DMMU_TLB_DATA 0x5d.
+		asm volatile(
+			"stxa %[demap], [%[demap]] 0x5f\n\t"
+			"membar #Sync\n\t"
+			"stxa %[tag], [%[tagReg]] 0x58\n\t"
+			"membar #Sync\n\t"
+			"stxa %[data], [%[address]] 0x5d\n\t"
+			"membar #Sync"
+			:
+			: [demap] "r"(demap), [tag] "r"(tag), [data] "r"(data),
+			  [tagReg] "r"(tlb_tag_access), [address] "r"(address)
+			: "memory");
+	}
+}
+
+
+/*!	Finds a TLB entry that may be overwritten, searching from the top down.
+
+	Invalid entries first, then valid but unlocked ones -- those are backed by
+	the TSB, or will be once it is authoritative, so losing one costs a refill
+	and nothing else. A locked entry is never a candidate: the five the firmware
+	holds are its I/O and OBP mappings, and the console we are printing on is
+	among them.
+
+	Top down because the firmware put its locked entries at the bottom, so
+	descending finds room without stepping over them.
+*/
+static int
+sparc_find_tlb_entry(bool instruction)
+{
+	int candidate = -1;
+
+	for (int entry = SPARC_TLB_ENTRIES - 1; entry >= 0; entry--) {
+		uint64 tag;
+		uint64 data;
+		read_tlb_entry(entry, instruction, &tag, &data);
+
+		if ((data & TTE_LOCKED) != 0)
+			continue;
+		if ((data & TTE_VALID) == 0)
+			return entry;
+		if (candidate < 0)
+			candidate = entry;
+	}
+
+	return candidate;
+}
+
+
+/*!	Locks a range of memory into one or both TLBs.
+
+	Returns the number of entries used, or -1 if the TLB ran out of room.
+*/
+static int
+sparc_tlb_lock_range(addr_t virtualAddress, phys_addr_t physicalAddress,
+	size_t size, uint64 pageSize, bool instruction, uint64 flags)
+{
+	size_t pageBytes = (size_t)B_PAGE_SIZE << (3 * pageSize);
+		// 8K, 64K, 512K, 4M -- each step is 8 times the last (TABLE 15-1).
+	int used = 0;
+
+	for (size_t offset = 0; offset < size; offset += pageBytes) {
+		int entry = sparc_find_tlb_entry(instruction);
+		if (entry < 0) {
+			dprintf("sparc_mmu: no %s TLB entry available to lock %#" B_PRIxADDR
+				"\n", instruction ? "I" : "D", virtualAddress + offset);
+			return -1;
+		}
+
+		sparc_tlb_lock_entry(entry, virtualAddress + offset,
+			physicalAddress + offset, pageSize, instruction, flags);
+		used++;
+	}
+
+	return used;
+}
+
+
+/*!	Allocates physical memory that is both contiguous and aligned.
+
+	Needed because vm_allocate_early() cannot do it: it takes physical pages one
+	at a time and its alignment argument constrains only the virtual base. A
+	large TTE needs its physical half aligned to the page size and the whole span
+	physically contiguous, so the pages have to be gathered here and checked.
+
+	The early physical allocator normally grows one range upwards a page at a
+	time, which does produce contiguous runs -- but it can also expand downwards
+	or start a new range, so contiguity is something to verify rather than
+	assume. Pages taken before an aligned run begins, and pages of a run that
+	turns out to be broken, are simply left allocated: a few tens of kilobytes
+	lost once at boot is not worth the bookkeeping to reclaim.
+*/
+static status_t
+sparc_allocate_aligned_physical(kernel_args *args, size_t size,
+	size_t alignment, phys_addr_t *_physicalBase)
+{
+	size_t neededPages = size / B_PAGE_SIZE;
+	// Enough slack to skip into alignment once and then survive one broken run.
+	size_t budget = alignment / B_PAGE_SIZE + 2 * neededPages + 2;
+
+	phys_addr_t runStart = 0;
+	size_t runPages = 0;
+	phys_addr_t previous = 0;
+
+	for (size_t taken = 0; taken < budget; taken++) {
+		page_num_t page = vm_allocate_early_physical_page(args);
+		if (page == 0)
+			break;
+		phys_addr_t address = (phys_addr_t)page * B_PAGE_SIZE;
+
+		if (runPages > 0 && address == previous + B_PAGE_SIZE) {
+			runPages++;
+		} else if ((address & (alignment - 1)) == 0) {
+			runStart = address;
+			runPages = 1;
+		} else {
+			runPages = 0;
+		}
+		previous = address;
+
+		if (runPages == neededPages) {
+			*_physicalBase = runStart;
+			return B_OK;
+		}
+	}
+
+	dprintf("sparc_mmu: could not find %" B_PRIuSIZE " contiguous bytes of "
+		"physical memory aligned to %" B_PRIuSIZE "\n", size, alignment);
+	return B_NO_MEMORY;
+}
+
+
 /*!	Dumps both TLBs, which is the only way to find out what the firmware locked.
 
 	This matters before installing our own trap table. The TLB miss handler is
@@ -817,4 +1039,91 @@ sparc_dump_tlb()
 			instruction ? "I" : "D", valid, locked,
 			SPARC_TLB_ENTRIES - valid);
 	}
+}
+
+
+/*!	Locks every page a trap handler touches while a trap is in progress.
+
+	Section 2.6 of the design note lists what this has to cover, and section 4.4
+	explains why the firmware's own locked entries do not help: it locked only
+	its I/O and OBP mappings, leaving every kernel page an ordinary replaceable
+	8 KB entry -- the trap table's included.
+
+	Three ranges, each for a different reason:
+
+	The trap handler code and the table are instruction fetches, so they go in
+	the I-TLB. A fetch that missed here would be a miss taken inside the miss
+	handler, and the code needed to service it is the code that could not be
+	fetched.
+
+	The trap data block is a store target, so it goes in the D-TLB. Only the slow
+	path writes it today, but the slow path is where a fault would be least
+	welcome.
+
+	The TSB is locked where it is allocated, in sparc_mmu_init_tsb(), because it
+	is the only one of the three whose physical address this code chooses.
+
+	Physical addresses come from the TSB rather than from the firmware, since the
+	TSB has by now been warmed from the firmware's own translations and looking
+	them up there exercises the lookup path as a side effect. A miss means the
+	page was never mapped by the firmware, which would be worth knowing about
+	regardless of what it is wanted for.
+*/
+status_t
+sparc_lock_trap_pages()
+{
+	extern uint32 sparc_trap_handlers_start[];
+	extern uint32 sparc_trap_handlers_end[];
+	extern uint32 sparc_trap_table[];
+	extern uint32 sparc_trap_table_end[];
+
+	struct {
+		addr_t		start;
+		addr_t		end;
+		bool		instruction;
+		const char*	name;
+	} ranges[] = {
+		{ (addr_t)sparc_trap_handlers_start, (addr_t)sparc_trap_handlers_end,
+			true, "trap handlers" },
+		{ (addr_t)sparc_trap_table, (addr_t)sparc_trap_table_end, true,
+			"trap table" },
+		{ (addr_t)&sTrapData, (addr_t)&sTrapData + sizeof(sTrapData), false,
+			"trap data" },
+	};
+
+	int total = 0;
+
+	for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); i++) {
+		addr_t first = ranges[i].start & ~(addr_t)(B_PAGE_SIZE - 1);
+		addr_t last = (ranges[i].end + B_PAGE_SIZE - 1)
+			& ~(addr_t)(B_PAGE_SIZE - 1);
+		int locked = 0;
+
+		for (addr_t page = first; page < last; page += B_PAGE_SIZE) {
+			uint64 data;
+			if (!sparc_tsb_lookup(page, &data)) {
+				panic("sparc_mmu: %s page %#" B_PRIxADDR " is not in the TSB, "
+					"so it cannot be locked", ranges[i].name, page);
+				return B_ERROR;
+			}
+			phys_addr_t physical = data & TTE_PA_MASK;
+
+			int used = sparc_tlb_lock_range(page, physical, B_PAGE_SIZE,
+				TTE_SIZE_8K, ranges[i].instruction,
+				TTE_PRIVILEGED | TTE_CACHEABLE_PHYSICAL
+					| TTE_CACHEABLE_VIRTUAL
+					| (ranges[i].instruction ? 0 : TTE_WRITABLE));
+			if (used < 0)
+				return B_ERROR;
+			locked += used;
+		}
+
+		dprintf("sparc_mmu: locked %s, %#" B_PRIxADDR "-%#" B_PRIxADDR ", in %d "
+			"%s-TLB entries\n", ranges[i].name, first, last, locked,
+			ranges[i].instruction ? "I" : "D");
+		total += locked;
+	}
+
+	dprintf("sparc_mmu: %d pages locked for the trap path\n", total);
+	return B_OK;
 }

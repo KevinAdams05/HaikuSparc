@@ -86,6 +86,7 @@ extern void sparc_dump_openfirmware_translations();
 extern void sparc_verify_tsb_indexing();
 extern status_t sparc_verify_trap_table();
 extern void sparc_dump_tlb();
+extern status_t sparc_lock_trap_pages();
 
 // TLB geometry. Both TLBs on the UltraSPARC-IIi are 64-entry fully associative,
 // and an entry is selected by putting its index in VA<8:3> of the address given

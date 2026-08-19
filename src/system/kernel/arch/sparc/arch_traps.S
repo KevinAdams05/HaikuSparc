@@ -157,6 +157,17 @@
 .endm
 
 
+/*	Everything from here to sparc_trap_handlers_end is reachable with a trap in
+ *	progress, so every page of it has to be locked in the instruction TLB before
+ *	the table is installed. An instruction fetch that missed here would be a miss
+ *	taken inside the miss handler, and the handler needed to service it is the
+ *	code that could not be fetched.
+ *
+ *	The bank helpers further down are deliberately outside this range: they are
+ *	called from C at TL=0, where an ordinary miss is fine.
+ */
+FUNCTION(sparc_trap_handlers_start):
+
 FUNCTION(sparc_data_mmu_miss):
 	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN
 
@@ -228,97 +239,6 @@ sparc_tsb_miss_trap:
 	stx	%g6, [%g7 + TRAP_DATA_MISS_COUNT]
 
 1:	ba,a	1b
-	 nop
-
-
-/*	Point the trap handlers at their per-CPU data.
- *
- *	%g7 has to be set in two banks, because the hardware chooses the bank by
- *	trap type: the MMU miss traps get the MMU globals, most others get the
- *	alternate globals (UltraSPARC-IIi manual, section 15.3.2). Selecting a bank
- *	means writing PSTATE, and the out registers are not part of any global bank,
- *	so they are what carries the value across the switch.
- *
- *	Interrupts come off for the duration. An interrupt taken while a non-normal
- *	bank is selected would run its handler against these globals and clobber
- *	them, and the window is only a handful of instructions, so closing it is
- *	cheaper than reasoning about it.
- *
- *	void sparc_set_trap_globals(struct sparc_trap_data *data);
- */
-FUNCTION(sparc_set_trap_globals):
-	rdpr	%pstate, %o1
-	andn	%o1, PSTATE_IE, %o2
-
-	or	%o2, PSTATE_MG, %o3
-	wrpr	%o3, 0, %pstate
-	mov	%o0, %g7
-
-	/* Straight from the MMU bank to the alternate one: the single write clears
-	 * MG and sets AG together, so no third bank is ever selected.
-	 */
-	or	%o2, PSTATE_AG, %o3
-	wrpr	%o3, 0, %pstate
-	mov	%o0, %g7
-
-	/* Restores the normal bank and the caller's interrupt state at once. */
-	wrpr	%o1, 0, %pstate
-	retl
-	 nop
-
-
-/*	Read %g7 back out of one of the alternate banks, so the write above can be
- *	checked rather than assumed.
- *
- *	uint64 sparc_read_trap_globals(int bank);
- */
-/*	Report this file's idea of where each trap data field lives, so C++ can check
- *	it against the structure the fields were declared in.
- *
- *	void sparc_trap_data_offsets(uint64 *out);   // TRAP_DATA_OFFSET_COUNT entries
- */
-FUNCTION(sparc_trap_data_offsets):
-	mov	TRAP_DATA_TSB_BASE, %o1
-	stx	%o1, [%o0 + (0 * 8)]
-	mov	TRAP_DATA_TSB_MASK, %o1
-	stx	%o1, [%o0 + (1 * 8)]
-	mov	TRAP_DATA_MISS_COUNT, %o1
-	stx	%o1, [%o0 + (2 * 8)]
-	mov	TRAP_DATA_MISS_TAG_TARGET, %o1
-	stx	%o1, [%o0 + (3 * 8)]
-	mov	TRAP_DATA_MISS_TSB_POINTER, %o1
-	stx	%o1, [%o0 + (4 * 8)]
-	mov	TRAP_DATA_MISS_TSB_TAG, %o1
-	stx	%o1, [%o0 + (5 * 8)]
-	mov	TRAP_DATA_MISS_TSB_DATA, %o1
-	stx	%o1, [%o0 + (6 * 8)]
-	mov	TRAP_DATA_MISS_TRAP_TYPE, %o1
-	stx	%o1, [%o0 + (7 * 8)]
-	mov	TRAP_DATA_MISS_TPC, %o1
-	stx	%o1, [%o0 + (8 * 8)]
-	mov	TRAP_DATA_MISS_TSTATE, %o1
-	stx	%o1, [%o0 + (9 * 8)]
-	mov	TRAP_DATA_MISS_TL, %o1
-	stx	%o1, [%o0 + (10 * 8)]
-	retl
-	 nop
-
-
-FUNCTION(sparc_read_trap_globals):
-	rdpr	%pstate, %o1
-	andn	%o1, PSTATE_IE, %o2
-
-	cmp	%o0, SPARC_GLOBALS_MMU
-	be,pt	%icc, 1f
-	 or	%o2, PSTATE_AG, %o3
-	ba,pt	%icc, 2f
-	 nop
-1:	or	%o2, PSTATE_MG, %o3
-
-2:	wrpr	%o3, 0, %pstate
-	mov	%g7, %o0
-	wrpr	%o1, 0, %pstate
-	retl
 	 nop
 
 
@@ -491,6 +411,100 @@ sparc_unhandled_trap:
 	rdpr	%tl, %g5
 sparc_unhandled_trap_stop:
 	ba,a	sparc_unhandled_trap_stop
+	 nop
+
+
+FUNCTION(sparc_trap_handlers_end):
+
+
+/*	Point the trap handlers at their per-CPU data.
+ *
+ *	%g7 has to be set in two banks, because the hardware chooses the bank by
+ *	trap type: the MMU miss traps get the MMU globals, most others get the
+ *	alternate globals (UltraSPARC-IIi manual, section 15.3.2). Selecting a bank
+ *	means writing PSTATE, and the out registers are not part of any global bank,
+ *	so they are what carries the value across the switch.
+ *
+ *	Interrupts come off for the duration. An interrupt taken while a non-normal
+ *	bank is selected would run its handler against these globals and clobber
+ *	them, and the window is only a handful of instructions, so closing it is
+ *	cheaper than reasoning about it.
+ *
+ *	void sparc_set_trap_globals(struct sparc_trap_data *data);
+ */
+FUNCTION(sparc_set_trap_globals):
+	rdpr	%pstate, %o1
+	andn	%o1, PSTATE_IE, %o2
+
+	or	%o2, PSTATE_MG, %o3
+	wrpr	%o3, 0, %pstate
+	mov	%o0, %g7
+
+	/* Straight from the MMU bank to the alternate one: the single write clears
+	 * MG and sets AG together, so no third bank is ever selected.
+	 */
+	or	%o2, PSTATE_AG, %o3
+	wrpr	%o3, 0, %pstate
+	mov	%o0, %g7
+
+	/* Restores the normal bank and the caller's interrupt state at once. */
+	wrpr	%o1, 0, %pstate
+	retl
+	 nop
+
+
+/*	Read %g7 back out of one of the alternate banks, so the write above can be
+ *	checked rather than assumed.
+ *
+ *	uint64 sparc_read_trap_globals(int bank);
+ */
+/*	Report this file's idea of where each trap data field lives, so C++ can check
+ *	it against the structure the fields were declared in.
+ *
+ *	void sparc_trap_data_offsets(uint64 *out);   // TRAP_DATA_OFFSET_COUNT entries
+ */
+FUNCTION(sparc_trap_data_offsets):
+	mov	TRAP_DATA_TSB_BASE, %o1
+	stx	%o1, [%o0 + (0 * 8)]
+	mov	TRAP_DATA_TSB_MASK, %o1
+	stx	%o1, [%o0 + (1 * 8)]
+	mov	TRAP_DATA_MISS_COUNT, %o1
+	stx	%o1, [%o0 + (2 * 8)]
+	mov	TRAP_DATA_MISS_TAG_TARGET, %o1
+	stx	%o1, [%o0 + (3 * 8)]
+	mov	TRAP_DATA_MISS_TSB_POINTER, %o1
+	stx	%o1, [%o0 + (4 * 8)]
+	mov	TRAP_DATA_MISS_TSB_TAG, %o1
+	stx	%o1, [%o0 + (5 * 8)]
+	mov	TRAP_DATA_MISS_TSB_DATA, %o1
+	stx	%o1, [%o0 + (6 * 8)]
+	mov	TRAP_DATA_MISS_TRAP_TYPE, %o1
+	stx	%o1, [%o0 + (7 * 8)]
+	mov	TRAP_DATA_MISS_TPC, %o1
+	stx	%o1, [%o0 + (8 * 8)]
+	mov	TRAP_DATA_MISS_TSTATE, %o1
+	stx	%o1, [%o0 + (9 * 8)]
+	mov	TRAP_DATA_MISS_TL, %o1
+	stx	%o1, [%o0 + (10 * 8)]
+	retl
+	 nop
+
+
+FUNCTION(sparc_read_trap_globals):
+	rdpr	%pstate, %o1
+	andn	%o1, PSTATE_IE, %o2
+
+	cmp	%o0, SPARC_GLOBALS_MMU
+	be,pt	%icc, 1f
+	 or	%o2, PSTATE_AG, %o3
+	ba,pt	%icc, 2f
+	 nop
+1:	or	%o2, PSTATE_MG, %o3
+
+2:	wrpr	%o3, 0, %pstate
+	mov	%g7, %o0
+	wrpr	%o1, 0, %pstate
+	retl
 	 nop
 
 
