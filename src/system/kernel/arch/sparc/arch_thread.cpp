@@ -3,6 +3,7 @@
  */
 
 
+#include <stddef.h>
 #include <string.h>
 
 #include <arch_cpu.h>
@@ -11,6 +12,12 @@
 #include <kernel.h>
 #include <thread.h>
 #include <vm/vm_types.h>
+
+
+extern "C" void sparc_context_switch(struct arch_context *from,
+	struct arch_context *to);
+extern "C" void sparc_thread_entry();
+extern "C" void sparc_context_offsets(uint64 *out);
 
 
 status_t
@@ -41,50 +48,83 @@ arch_thread_init_thread_struct(Thread *thread)
 }
 
 
+/*!	Checks that the assembly and this file agree about struct arch_context.
+
+	The switch routine reaches the structure through numeric offsets, because the
+	assembler cannot see a C++ declaration. Two copies of the same numbers is
+	exactly the arrangement that drifts, and the failure would be a context switch
+	that saves the stack pointer over the resume address -- which does not fault,
+	it just returns to a stack address and executes whatever is there.
+*/
+static void
+sparc_verify_context_layout()
+{
+	uint64 assembler[3];
+	sparc_context_offsets(assembler);
+
+	const uint64 declared[3] = {
+		offsetof(arch_context, sp),
+		offsetof(arch_context, pc),
+		SPARC_MINIMUM_FRAME_SIZE,
+	};
+
+	for (int i = 0; i < 3; i++) {
+		if (assembler[i] != declared[i]) {
+			panic("sparc context layout %d: arch_asm.S says %#" B_PRIx64
+				", arch_thread_types.h says %#" B_PRIx64, i, assembler[i],
+				declared[i]);
+		}
+	}
+
+	if (SPARC_MINIMUM_FRAME_SIZE % 16 != 0)
+		panic("sparc stack frames must be 16-byte aligned");
+}
+
+
+/*!	Fabricates a stack for a thread that has never run.
+
+	The first switch to this thread will do what it does to any other: return
+	with "ret; restore", which fills a window from the stack pointer it finds in
+	the saved context. For a thread that has run before, that window was written
+	there by a spill. For one that has not, it has to be written here.
+
+	So this builds the frame a spill would have left, and puts the entry function
+	and its argument in the first two words -- the positions a fill loads into %l0
+	and %l1, which is where sparc_thread_entry() expects to find them.
+
+	The frame address is what has to be 16-byte aligned, not the stack pointer:
+	SPARC V9 biases %sp by 2047, so the two cannot both be aligned and it is the
+	frame that the hardware cares about.
+*/
 void
 arch_thread_init_kthread_stack(Thread* thread, void* _stack, void* _stackTop,
 	void (*function)(void*), const void* data)
 {
-#if 0
-	addr_t *kstack = (addr_t *)t->kernel_stack_base;
-	addr_t *kstackTop = (addr_t *)t->kernel_stack_base;
+	sparc_verify_context_layout();
 
-	// clear the kernel stack
-#ifdef DEBUG_KERNEL_STACKS
-#	ifdef STACK_GROWS_DOWNWARDS
-	memset((void *)((addr_t)kstack + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE), 0,
-		KERNEL_STACK_SIZE);
-#	else
-	memset(kstack, 0, KERNEL_STACK_SIZE);
-#	endif
-#else
-	memset(kstack, 0, KERNEL_STACK_SIZE);
-#endif
+	// The frame sits at the top of the stack, below nothing.
+	addr_t frame = ROUNDDOWN((addr_t)_stackTop - SPARC_MINIMUM_FRAME_SIZE, 16);
+	uint64* saveArea = (uint64*)frame;
 
-	// space for frame pointer and return address, and stack frames must be
-	// 16 byte aligned
-	kstackTop -= 2;
-	kstackTop = (addr_t*)((addr_t)kstackTop & ~0xf);
+	memset(saveArea, 0, SPARC_MINIMUM_FRAME_SIZE);
 
-	// LR, CR, r2, r13-r31, f13-f31, as pushed by m68k_context_switch()
-	kstackTop -= 22 + 2 * 19;
+	// A spill writes %l0-%l7 then %i0-%i7, in that order, so these are %l0 and
+	// %l1 and the two after the locals are %i6 and %i7.
+	saveArea[0] = (uint64)(addr_t)function;
+	saveArea[1] = (uint64)(addr_t)data;
 
-	// let LR point to m68k_kernel_thread_root()
-	kstackTop[0] = (addr_t)&m68k_kernel_thread_root;
+	// %i6 and %i7 -- the frame pointer and return address of the window
+	// sparc_thread_entry() runs in. Both zero, which is not laziness: it
+	// terminates a stack walk at the bottom of the thread rather than letting a
+	// backtrace wander into whatever the memory used to hold. The entry function
+	// never returns, so the return address is never used.
+	saveArea[14] = 0;
+	saveArea[15] = 0;
 
-	// the arguments of m68k_kernel_thread_root() are the functions to call,
-	// provided in registers r13-r15
-	kstackTop[3] = (addr_t)entry_func;
-	kstackTop[4] = (addr_t)start_func;
-	kstackTop[5] = (addr_t)exit_func;
+	thread->arch_info.context.sp = frame - SPARC_STACK_BIAS;
 
-	// save this stack position
-	t->arch_info.sp = (void *)kstackTop;
-
-	return B_OK;
-#else
-	panic("arch_thread_init_kthread_stack(): Implement me!");
-#endif
+	// Less eight, because "ret" jumps to %i7 + 8.
+	thread->arch_info.context.pc = (addr_t)&sparc_thread_entry - 8;
 }
 
 
@@ -99,6 +139,16 @@ arch_thread_init_tls(Thread *thread)
 void
 arch_thread_context_switch(Thread *from, Thread *to)
 {
+	// Nothing to do about address spaces: there is one, the kernel's, and its
+	// mappings are Global so they are not tagged with a context to switch. That
+	// is the shared-address-space decision in section 4.3 of the porting plan
+	// paying off; when user contexts arrive, the primary context register gets
+	// set here.
+	//
+	// The thread pointer is not set here either. The scheduler writes %g7 through
+	// arch_thread_set_current_thread() immediately before calling this, so by the
+	// time the switch runs it already names the incoming thread.
+	sparc_context_switch(&from->arch_info.context, &to->arch_info.context);
 }
 
 
@@ -162,3 +212,102 @@ arch_restore_fork_frame(struct arch_fork_arg *arg)
 {
 }
 
+
+
+// #pragma mark - the context switch test
+
+
+static int32 sPingPongCount;
+static int32 sPingPongTurn;
+static const int32 kPingPongRounds = 64;
+
+
+/*!	One half of a pair of threads that take turns.
+
+	Yields rather than blocking on a semaphore, because yielding is the thing
+	being tested: each turn costs a voluntary trip through the scheduler and back,
+	which is a full context switch out of this thread's stack and into the other's.
+
+	The spin is bounded so that a switch which loses control -- returns to the
+	wrong stack, or to a thread that never runs again -- fails the test instead of
+	hanging the boot. That distinction matters here more than usual: there is no
+	timer yet, so nothing else would ever take the CPU back.
+*/
+static status_t
+sparc_ping_pong(void* data)
+{
+	int32 which = (int32)(addr_t)data;
+
+	for (int32 round = 0; round < kPingPongRounds; round++) {
+		int32 spins = 0;
+		while (atomic_get(&sPingPongTurn) != which) {
+			if (++spins > 1000000)
+				return B_TIMED_OUT;
+			thread_yield();
+		}
+
+		atomic_add(&sPingPongCount, 1);
+		atomic_set(&sPingPongTurn, 1 - which);
+	}
+
+	return B_OK;
+}
+
+
+/*!	Proves two threads can hand control back and forth.
+
+	The boot already demonstrates context switching by the time this runs -- there
+	is a scheduler, and named threads have run on their own stacks. But "the
+	machine got further" is not the same as knowing the switch is correct, and a
+	switch that is subtly wrong corrupts a register somewhere and shows up as
+	something unrelated much later.
+
+	So: two threads, alternating a shared counter a fixed number of times, with
+	the total checked against what it must be. A switch that returned to the
+	wrong stack would take the count with it.
+*/
+void
+sparc_test_context_switch()
+{
+	sPingPongCount = 0;
+	sPingPongTurn = 0;
+
+	thread_id first = spawn_kernel_thread(sparc_ping_pong, "sparc ping",
+		B_NORMAL_PRIORITY, (void*)(addr_t)0);
+	thread_id second = spawn_kernel_thread(sparc_ping_pong, "sparc pong",
+		B_NORMAL_PRIORITY, (void*)(addr_t)1);
+
+	if (first < 0 || second < 0) {
+		dprintf("sparc_thread: could not spawn the context switch test\n");
+		return;
+	}
+
+	resume_thread(first);
+	resume_thread(second);
+
+	// Waited for by yielding until the count arrives, rather than with
+	// wait_for_thread(). What is being tested is whether control comes back, and
+	// polling tests exactly that with nothing else involved -- no semaphores, no
+	// thread-death bookkeeping, no timer, none of which this port has exercised
+	// yet. An attempt with wait_for_thread() tripped an unrelated invariant in
+	// the semaphore layer, which is worth chasing on its own and not from here.
+	int32 expected = kPingPongRounds * 2;
+	int32 spins = 0;
+	while (atomic_get(&sPingPongCount) < expected) {
+		if (++spins > 2000000)
+			break;
+		thread_yield();
+	}
+
+	int32 count = atomic_get(&sPingPongCount);
+	bool ok = count == expected;
+
+	dprintf("sparc_thread: two threads alternated, counter %" B_PRId32 " of %"
+		B_PRId32 " after %" B_PRId32 " yields -- %s\n", count, expected, spins,
+		ok ? "switched cleanly" : "WRONG");
+
+	if (!ok) {
+		panic("sparc context switch lost control: counter %" B_PRId32 " of %"
+			B_PRId32, count, expected);
+	}
+}

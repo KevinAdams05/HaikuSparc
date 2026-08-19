@@ -11,6 +11,16 @@
 #include <kernel.h>
 
 
+// The smallest stack frame the SPARC V9 ABI allows: 128 bytes for the sixteen
+// window registers a spill writes, then 48 more for the six outgoing argument
+// slots and the hidden structure-return pointer. Frames are 16-byte aligned and
+// 176 is a multiple of 16, so it doubles as the alignment unit.
+#define SPARC_MINIMUM_FRAME_SIZE	176
+
+// SPARC V9 stack bias. Duplicated in arch_traps.S, which cannot see this header.
+#define SPARC_STACK_BIAS			2047
+
+
 #define	IFRAME_TRACE_DEPTH 4
 
 struct iframe_stack {
@@ -18,9 +28,35 @@ struct iframe_stack {
 	int32	index;
 };
 
+/*	Everything a voluntary context switch has to remember about a thread.
+
+	It is a short list, and the reason is the register windows. The SPARC ABI's
+	callee-saved registers are the window registers -- %l0-%l7 and %i0-%i7 -- and
+	a context switch flushes every live window to its own stack frame before
+	changing anything. So the registers save themselves, into the stack they
+	belong to, and what is left to record is where that stack is and where to
+	resume.
+
+	The floating-point registers need no saving either, which is worth stating
+	because it looks like an omission. Every %f register is caller-saved in the
+	SPARC V9 ABI, so a compiler has already spilled anything live across a call --
+	and a voluntary switch happens inside one. Preemption is different, but that
+	arrives with the interrupt frame, which saves what it interrupts.
+*/
+struct arch_context {
+	addr_t	sp;
+		// The stack pointer to resume on, biased: SPARC V9 keeps %sp at the
+		// frame address minus 2047, so the register save area is at sp + 2047.
+	addr_t	pc;
+		// Where to resume, less eight. The switch returns with "ret", which
+		// jumps to %i7 + 8, and storing the adjusted value here keeps that
+		// arithmetic in one place instead of splitting it across C and assembly.
+};
+
 // architecture specific thread info
 struct arch_thread {
-	void	*sp;	// stack pointer
+	struct arch_context	context;
+
 	void	*interrupt_stack;
 
 	// used to track interrupts on this thread
@@ -40,6 +76,10 @@ struct arch_fork_arg {
 	// from both in a consistent way.
 	char	dummy;
 };
+
+// In arch_thread.cpp. Called once, from arch_platform_init_post_thread().
+extern void sparc_test_context_switch();
+
 
 #endif	/* KERNEL_ARCH_SPARC_THREAD_TYPES_H */
 

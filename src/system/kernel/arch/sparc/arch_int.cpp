@@ -7,6 +7,7 @@
  */
 
 
+#include <arch_thread_types.h>
 #include <interrupts.h>
 
 
@@ -27,6 +28,13 @@ arch_int_init_post_vm(kernel_args *args)
 status_t
 arch_int_init_post_device_manager(struct kernel_args *args)
 {
+	// Runs inside main2(), which is the first thread the scheduler ever picks.
+	// That matters: nothing is scheduled before scheduler_start(), as main.cpp
+	// says where it spawns this thread, so the obvious earlier hooks -- including
+	// arch_platform_init_post_thread(), where this was first put -- can create
+	// threads and resume them and watch them never run.
+	sparc_test_context_switch();
+
 	return B_OK;
 }
 
