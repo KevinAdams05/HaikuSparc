@@ -5,25 +5,26 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0–3 complete. The kernel schedules threads and reaches the disk device manager.**
+**State: Phases 0–3 complete. Phase 4 is half done: the clock and the timer interrupt work,
+preemption does not.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The
-kernel brings up the platform, debug output, locking and interrupts, takes the MMU and trap table
-over from Open Firmware, builds its own three-level page table, runs `vm_page_init` and the slab
-allocator, initialises the ELF loader, the commpage and the scheduler, **switches between kernel
-threads**, and gets as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing,
-because there are no disk drivers yet.
+kernel takes the MMU and trap table over from Open Firmware, builds its own three-level page
+table, runs the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler,
+switches between kernel threads, **keeps time from %TICK and takes the timer interrupt**, and gets
+as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no
+disk drivers yet.
 
-**Phase 3's exit criterion is met deliberately:** two kernel threads alternate a counter 64 times
-each and the total is exact — `counter 128 of 128 after 121 yields — switched cleanly` (§23).
+Exit criteria met, each by a deliberate test rather than by inference:
 
-Phase 2's three, likewise:
-
-| | |
-| --- | --- |
-| Maps a page it allocated itself | after the cutover `early_map` writes only the page table and TSB; the firmware is not called (§21) |
-| Survives a provoked TLB miss | page written, translation demapped, read back correctly — no route but the fast path (§21) |
-| Survives a forced window overflow | 24 frames against 8 windows, sum exact, so the stack bias is right too (§21) |
+| Phase | | |
+| --- | --- | --- |
+| 2 | Maps a page it allocated itself | after the cutover `early_map` writes only the page table and TSB (§21) |
+| 2 | Survives a provoked TLB miss | translation demapped, read back correctly — no route but the fast path (§21) |
+| 2 | Survives a forced window overflow | 24 frames against 8 windows, sum exact (§21) |
+| 3 | Two threads hand control back and forth | `counter 128 of 128 after 122 yields` (§23) |
+| 4 | `system_time()` is right | monotonic, and agreeing with the raw %TICK delta (§24) |
+| 4 | **A tick preempts a busy loop** | **not met** — see §24 |
 
 What exists:
 
@@ -31,22 +32,21 @@ What exists:
 | --- | --- |
 | Page table | three levels, 1024 entries each, physical interior pointers, TTE leaves (§22) |
 | TSB | 256 KB split pair, a cache in front of the page table |
-| Index arithmetic and tag target | both **verified against the hardware** (§19, §21) |
 | TLB miss fast path | 10 instructions; slow path walks the page table in about 20 more (§22) |
 | Trap table | 32 KB, geometry asserted at build time and re-checked every boot (§20) |
-| Locking | 10 TLB entries, and the locked ranges are protected from demap (§22) |
 | Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 | Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
-| Memory barriers | real bodies, erratum-51 safe (§23) |
+| Clock | `system_time()` from %TICK and the firmware's clock-frequency (§24) |
+| Timer interrupt | entry path, C handler, `%TICK_CMPR` arming (§24) |
 
-**Next: Phase 4, timer and interrupts.** Nothing preempts yet — every switch so far is voluntary.
-`%TICK_CMPR` for a periodic tick, `system_time()` from `%TICK`, and PIL-based dispatch.
+**Next: finish Phase 4.** Preemption is the one thing missing, and §24 says exactly what is known
+about why.
 
-**Open, and not on the Phase 4 path:** `wait_for_thread()` trips `could acquire exit_sem for
-thread 5`, an invariant in the semaphore or thread-death bookkeeping that nothing had exercised
-before (§23). And the boot ends at `did not find any boot partitions!`, which is simply the
-absence of disk drivers — Phase 7.
+**Open, and not on that path:** `wait_for_thread()` trips `could acquire exit_sem for thread 5`
+(§23); the boot ends at `did not find any boot partitions!`, which is the absence of disk drivers;
+and window-aware backtraces (Phase 5) are still not written, which the plan warned against
+deferring.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1357,3 +1357,102 @@ What an empty body does not do is tell the *compiler*, and that is the half that
 barrier emitting nothing lets GCC hoist a load out of a loop waiting on another thread's store.
 Invisible until threads exist, which they now do. They emit a `"memory"` clobber, and the full
 barrier a `membar #StoreLoad` in the delay slot of an always-taken branch — erratum 51 again.
+
+
+## 24. The clock, and half of the timer
+
+### system_time()
+
+%TICK counts elapsed CPU clock cycles, and Open Firmware publishes the rate as `clock-frequency`
+on the node whose `device_type` is `cpu` — found by walking the root's children, because the path
+differs between an Ultra 10 and a Blade while the device type does not. QEMU reports 100 MHz.
+
+Bit 63 is NPT, and masking it off is not optional: it is set out of reset, so the raw register
+reads as a number that looks like a plausible timestamp right up until two of them are subtracted.
+
+The conversion is two divisions rather than one, because the obvious form overflows — %TICK reaches
+2^62 and multiplying by a million does not fit. Splitting into whole seconds and a remainder keeps
+every intermediate in range and the result exact.
+
+### Open Firmware's clock is the broken one, not ours
+
+The obvious way to check a new clock is against an existing one, and Open Firmware has
+`milliseconds`. The two disagreed by a factor of eleven, and from inside the kernel there is no way
+to tell which is wrong.
+
+The host settled it. With `serial-driver.py --timestamps`, twenty samples that each claimed to have
+waited **101 firmware milliseconds** arrived **17 milliseconds apart** by the host's wall clock,
+while `system_time()` reported **8.9 ms** for the same interval — which matches the host once the
+serial output between samples is accounted for.
+
+So `%TICK` at the advertised frequency is right and **OpenBIOS's `milliseconds` runs about eleven
+times fast**. Worth knowing before anything in this port trusts `of_milliseconds()`, and worth
+re-checking on hardware, where %TICK and `clock-frequency` are related by definition rather than by
+an emulator's opinion.
+
+The self-check that remains does what can be done from inside: an absolute value at boot that is
+plausible rather than the thirty million years an unmasked NPT bit produces, monotonicity across
+two hundred thousand samples, and elapsed time agreeing with the raw %TICK delta — computed by
+different routes, so agreement means the frequency and the arithmetic match the counter.
+
+### The timer interrupt
+
+`%TICK_CMPR` is bit 63 INT_DIS and bits 62:0 a compare value, and a match posts TICK_INT in
+SOFTINT<0>, which arrives as a **level-14** interrupt — trap type 0x4e. The manual is explicit that
+the level-14 handler must check both SOFTINT<14> and TICK_INT, since the two share a level.
+
+**The comparison is for equality, not for "greater than".** A comparator set to a value the counter
+has already passed does not fire late; it fires in about three thousand years. So the timeout has a
+floor, and after arming, the comparator is checked against the counter once more and the interrupt
+posted by hand if the counter got there first.
+
+Those registers are reached by **ASR number**: the assembler rejects `%tick_cmpr`, `%softint`,
+`%set_softint` and `%clear_softint` with "architecture mismatch" while accepting the same registers
+addressed numerically.
+
+The entry path takes a window of its own, reads the trap registers before they go out of scope,
+saves the interrupted globals, drops to trap level zero so that a window spill or TLB miss inside C
+is handled by the ordinary table, and raises the level again on the way out to make `retry`
+meaningful. The interrupted window needs no saving: a trap does not rotate CWP, so `save` makes it
+the previous window and `restore` brings it back.
+
+### Two bugs, both about state that is not where it looks
+
+**Interrupt traps use the interrupt globals.** The entry cleared `PSTATE.AG` to get back to the
+normal register bank, which is what most traps need. UltraSPARC-IIi adds interrupt and MMU global
+sets, selected by `PSTATE.IG` at bit 11 and `MG` at bit 10 (TABLE 14-12, printed p.201) — and
+interrupts use IG. So the handler ran C with the wrong bank, `%g7` was not the thread pointer, and
+the first dereference of it faulted. All three bits are cleared now.
+
+**`%pil` has to be raised, not merely `PSTATE.IE` relied upon.** The handler runs at trap level
+zero, and an interrupt arriving before it returned wrote its own trap level over this one; the two
+returns then drove the level below zero and QEMU stopped with **"Trap 0x0064 while trap level (-1)
+>= MAXTL (5), Error state"**. Blocking at the interrupt level does not depend on anyone else's
+discipline about the enable bit. OpenBSD does this and the first version here did not.
+
+**And `PSTATE` and `%pil` are now part of the thread context.** Both are per-CPU registers that
+behave as though they were per-thread: a thread switched out from inside an interrupt handler has
+interrupts off and the level raised, and the thread switched in has its own idea of both.
+
+That last change also surfaced the rule about new threads. They must start with interrupts
+**disabled**, because every context switch in Haiku happens inside `scheduler_reschedule()` holding
+the scheduler lock with interrupts off, and a thread scheduled for the first time arrives in
+exactly that state — `common_thread_entry()` does the matching `release_spinlock()` and
+`enable_interrupts()` itself. Starting one with interrupts on trips Haiku's own check immediately.
+
+### What is not done: preemption
+
+Rescheduling from the interrupt means switching stacks with a trap frame still on this one. With it
+enabled, the kernel faults inside ordinary code — `BOpenHashTable::Insert` in the runs seen — with
+`%i7` still pointing into this handler's caller, which means **the register window it is running in
+is not the one it thinks**. The entry and exit paths are right for a handler that returns to what it
+interrupted, and are not yet right for one that returns somewhere else entirely.
+
+Without it the timer still runs: `system_time()` advances, `timer_interrupt()` fires, and Haiku's
+timers and timeouts work. What does not happen is a thread being taken off the CPU against its
+will, so scheduling stays cooperative.
+
+The next step is a QEMU `-d int` trace of the failure, which was attempted and abandoned only
+because tracing slows the machine enough that the boot does not reach the failure inside a
+reasonable timeout. Narrowing the window first — forcing a reschedule from the very first tick,
+rather than waiting for the scheduler to want one — would make that trace short enough to read.

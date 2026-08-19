@@ -15,9 +15,9 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel runs its own MMU, page table and VM, schedules threads, and reaches the disk device
-manager.** Phases 0–3 are complete, including Phase 2 — the MMU and trap table, the gate this port
-has always turned on.
+**The kernel runs its own MMU, page table and VM, schedules threads, keeps time, and reaches the
+disk device manager.** Phases 0–3 are complete, including Phase 2 — the MMU and trap table, the
+gate this port has always turned on — and Phase 4 is half done.
 
 On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
 enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
@@ -37,8 +37,14 @@ and the total comes out exact. The context switch is twelve instructions, becaus
 callee-saved registers *are* the window registers — `flushw` spills them to the outgoing thread's
 own stack, and the fill after `restore` pulls them from the incoming one.
 
-Next is Phase 4, the timer and interrupts. Nothing preempts yet; every switch so far is
-voluntary.
+Phase 4 is partly done. `system_time()` runs off `%TICK`, and the kernel takes the level-14 timer
+interrupt and returns from it, so Haiku's timers and timeouts work. Preemption does not yet:
+rescheduling from inside the handler corrupts the register window it returns through, and that is
+the next thing to fix.
+
+Along the way the firmware's own clock turned out to be the unreliable one — OpenBIOS's
+`milliseconds` runs about eleven times fast under QEMU, which took timestamping the serial output
+on the host to establish.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,
