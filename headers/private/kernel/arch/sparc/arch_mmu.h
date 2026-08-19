@@ -85,6 +85,19 @@ extern void sparc_get_data_tsb(TsbEntry **_pageTable, size_t *_size);
 extern void sparc_dump_openfirmware_translations();
 extern void sparc_verify_tsb_indexing();
 extern status_t sparc_verify_trap_table();
+extern void sparc_dump_tlb();
+
+// TLB geometry. Both TLBs on the UltraSPARC-IIi are 64-entry fully associative,
+// and an entry is selected by putting its index in VA<8:3> of the address given
+// to the Data Access or Tag Read ASI -- FIGURE 15-13, printed p.230.
+#define SPARC_TLB_ENTRIES			64
+#define SPARC_TLB_ENTRY_ADDRESS(entry)	((entry) << 3)
+
+// TLB Tag Read register, FIGURE 15-14 (printed p.230). Note the VA field is
+// sign-extended from VA<43>, and that page-offset bits for pages larger than
+// 8 KB are stored and read back here even though translation ignores them.
+#define TLB_TAG_VA_MASK				0xffffffffffffe000ULL
+#define TLB_TAG_CONTEXT_MASK		0x1fffULL
 
 // TSB_Size for the kernel's own TSB. 8192 entries of 16 bytes is 128 KB per
 // TSB, and the split pair is 256 KB aligned to 256 KB. Sized from the measured

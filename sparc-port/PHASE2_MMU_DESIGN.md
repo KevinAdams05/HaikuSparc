@@ -476,6 +476,102 @@ when the same difference was assigned to a symbol instead.
 
 ---
 
+## 4.4 What the firmware locked, and why that dictates the whole design
+
+Section 2.6 says the miss handler, the TSB and the trap data must be locked in the TLB. Before
+locking anything it is worth knowing what is locked already, because Open Firmware had to map the
+kernel in order to load and enter it. `sparc_dump_tlb()` reads both TLBs through the Tag Read and
+Data Access ASIs — entry index in VA<8:3>, FIGURE 15-13, printed p.230 — and the answer is
+unambiguous:
+
+```
+sparc_mmu: D TLB:
+   0 va 0x000000ffe00000 ctx 0 -> pa 0x01ff00000 512K  locked priv write side-effect
+   1 va 0x000000ffe80000 ctx 0 -> pa 0x01ff80000 512K  locked priv write side-effect
+   2 va 0x000000ffd00000 ctx 0 -> pa 0x1fff0000000 512K locked priv side-effect
+   3 va 0x000000ffd80000 ctx 0 -> pa 0x1fff0080000 512K locked priv side-effect
+   4 va 0x000000fef80000 ctx 0 -> pa 0x01fe80000 512K  locked priv write
+   5 va 0x0000008027a000 ctx 0 -> pa 0x000c86000 8K    priv write
+   ...
+sparc_mmu: D TLB has 64 valid entries, 5 locked, 0 free
+sparc_mmu: I TLB has 58 valid entries, 2 locked, 6 free
+```
+
+**The firmware locked only its own mappings.** The five locked D-entries are its I/O and code
+regions, all 512 KB pages: the OBP area at `0xffe00000`, PCI/EBus space at `0xffd00000`, and
+`0xfef80000`. Every kernel page — including the one holding the trap table at `0x801b8000` — is an
+ordinary unlocked 8 KB entry, subject to replacement.
+
+**And the D-TLB is completely full: 64 valid, 0 free.** Every new mapping already evicts something.
+
+Two consequences follow, and together they determine the design.
+
+### The kernel is contiguously mapped, but not at a 4 MB boundary
+
+Every kernel entry has the same virtual-to-physical offset: `0x801b8000 - 0xbc4000`,
+`0x80200000 - 0xc0c000` and `0x80000000 - 0xa0c000` all give `0x7f5f4000`. So the kernel occupies
+one contiguous physical block, which is what would make a large-page mapping possible — except
+that the block starts at PA `0xa0c000`, and `0xa0c000` is not 4 MB aligned. A 4 MB TTE needs both
+halves aligned.
+
+This is exactly the problem OpenBSD solves by moving the kernel. `pmap.c` says so directly: *"Since
+we can't always give the loader the hint to align us on a 4MB boundary"* it *"allocate[s] a new 4MB
+aligned segment for the kernel, then map[s] it"*, and separately *"Kernel text is not 4MB aligned --
+need to fix that"*. Both its text and data segments get relocated and then mapped with permanent
+locked 4 MB TTEs, and its TSB is `valloc`'d out of that same relocated data segment — so one locked
+entry covers kernel data and the TSB together.
+
+### Accessing the TSB physically is not an option on this hardware
+
+The obvious way to sidestep locking the TSB entirely is to address it physically, so that reading it
+needs no TLB entry and can never recurse. That is what later UltraSPARC parts allow via
+`ASI_PHYS_USE_EC_QUAD_LDD` (0x34), and it would have removed the largest locking requirement
+outright.
+
+It does not exist here. TABLE 13-32 (printed p.178) lists the atomic quad load ASIs for this CPU in
+full, and there are exactly two: `ASI_NUCLEUS_QUAD_LDD` (0x24) and `ASI_NUCLEUS_QUAD_LDD_L` (0x2c).
+Both are virtual accesses in the nucleus context. The physical variants arrived with UltraSPARC III.
+
+The atomicity matters too much to give up — a tag load and a separate data load can pick up a stale
+pairing, which is the one race the quad load exists to close — so the TSB **must** be virtually
+mapped, and therefore **must** be locked. OpenBSD reaches the same conclusion by the same route:
+its miss handler uses `ldda [%g2] ASI_NUCLEUS_QUAD_LDD, %g4`, virtually, and its TSB lives in
+permanently locked kernel data.
+
+### What that leaves
+
+Locking a 256 KB TSB with 8 KB entries would take 32 of the 64 D-TLB entries. That is not a design,
+it is a hostage situation. The TSB has to be covered by large pages, and since the standard early
+allocator cannot provide them — `vm_allocate_early()` allocates physical pages one at a time, and
+its `alignment` argument constrains only the virtual base — the trap infrastructure needs its own
+aligned physical allocation.
+
+So: **one 4 MB aligned, 4 MB physical region holding the whole trap infrastructure, locked with one
+I-TLB entry and one D-TLB entry.** Inside it, at offsets a 4 MB-aligned base makes free:
+
+| Offset | Size | Contents | Alignment it needs |
+| --- | --- | --- | --- |
+| `0x000000` | 32 KB | trap table | 32 KB, for `%tba` |
+| `0x008000` | — | out-of-line trap code | none |
+| `0x040000` | 256 KB | the split TSB pair | 256 KB, for the TSB register |
+| `0x080000` | 128 B | trap data block | one cache line |
+| `0x080080` | rest | spare — per-CPU blocks, trap stacks | |
+
+Two locked entries for everything, against 32 or more for the naive arrangement, and it leaves the
+kernel where the loader put it rather than relocating it as OpenBSD must.
+
+The cost is that the trap code has to be **copied** into the region at init rather than executed
+where it was linked. That is safe for this code specifically: every branch in it is PC-relative and
+resolved by the assembler, and no handler touches the GOT or an absolute symbol — the reasons the
+handlers are written that way in the first place. It does mean the table and every handler it
+branches to must move together, so they belong in one section that gets copied as a unit; a branch
+left pointing back at the original copy would work until the original was reclaimed, which is the
+worst kind of bug to leave lying around.
+
+Whether QEMU honours 4 MB TTEs is not in doubt — the firmware's own locked entries above are 512 KB
+pages, so more than one size is in use and working — but it is worth confirming for 4 MB
+specifically once the region exists.
+
 ## 5. The one caveat about developing against QEMU
 
 Every mechanism above is emulated faithfully, so the *logic* can be developed and debugged in

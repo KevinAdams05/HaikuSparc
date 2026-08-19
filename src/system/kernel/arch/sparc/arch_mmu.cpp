@@ -299,6 +299,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_verify_tsb_lookup();
 	sparc_verify_trap_table();
 	sparc_verify_trap_globals();
+	sparc_dump_tlb();
 
 	return B_OK;
 }
@@ -722,4 +723,98 @@ sparc_verify_trap_globals()
 
 	dprintf("sparc_mmu: trap globals verified in both banks\n");
 	return B_OK;
+}
+
+
+/*!	Reads one TLB entry's tag and data.
+
+	The entry index goes in VA<8:3> of the address handed to the ASI, with the
+	low three bits zero (FIGURE 15-13, printed p.230). Each read is an internal
+	MMU operation rather than a memory access, hence the membar after it: without
+	one the result can be observed out of order with respect to the next.
+*/
+static void
+read_tlb_entry(int entry, bool instruction, uint64 *_tag, uint64 *_data)
+{
+	uint64 address = SPARC_TLB_ENTRY_ADDRESS(entry);
+	uint64 tag;
+	uint64 data;
+
+	if (instruction) {
+		// ASI_IMMU_TLB_TAG 0x56, ASI_IMMU_TLB_DATA 0x55.
+		asm volatile("ldxa [%[address]] 0x56, %[tag]\n\t"
+			"membar #Sync\n\t"
+			"ldxa [%[address]] 0x55, %[data]\n\t"
+			"membar #Sync"
+			: [tag] "=&r"(tag), [data] "=r"(data)
+			: [address] "r"(address));
+	} else {
+		// ASI_DMMU_TLB_TAG 0x5e, ASI_DMMU_TLB_DATA 0x5d.
+		asm volatile("ldxa [%[address]] 0x5e, %[tag]\n\t"
+			"membar #Sync\n\t"
+			"ldxa [%[address]] 0x5d, %[data]\n\t"
+			"membar #Sync"
+			: [tag] "=&r"(tag), [data] "=r"(data)
+			: [address] "r"(address));
+	}
+
+	*_tag = tag;
+	*_data = data;
+}
+
+
+/*!	Dumps both TLBs, which is the only way to find out what the firmware locked.
+
+	This matters before installing our own trap table. The TLB miss handler is
+	only safe if the pages it touches -- its own instructions, the TSB it reads,
+	and the trap data block it writes -- can never themselves miss, because a
+	miss taken inside the miss handler nests, and a handful of nested traps ends
+	in a watchdog reset with nothing reported.
+
+	The usual way to guarantee that is to lock those pages in the TLB. But Open
+	Firmware had to map the kernel in order to load and enter it, and if it
+	locked what it mapped then some of that guarantee already exists and the
+	question is only what is missing. Guessing either way is expensive: assume
+	too little and we lock entries the firmware is still relying on, assume too
+	much and the first cutover resets the machine.
+*/
+void
+sparc_dump_tlb()
+{
+	static const char *kSizeNames[] = { "8K", "64K", "512K", "4M" };
+
+	for (int instruction = 0; instruction < 2; instruction++) {
+		int valid = 0;
+		int locked = 0;
+
+		dprintf("sparc_mmu: %s TLB:\n", instruction ? "I" : "D");
+
+		for (int entry = 0; entry < SPARC_TLB_ENTRIES; entry++) {
+			uint64 tag;
+			uint64 data;
+			read_tlb_entry(entry, instruction != 0, &tag, &data);
+
+			if ((data & TTE_VALID) == 0)
+				continue;
+			valid++;
+			if ((data & TTE_LOCKED) != 0)
+				locked++;
+
+			dprintf("  %2d va %#016" B_PRIx64 " ctx %4" B_PRIu64 " -> pa %#011"
+				B_PRIx64 " %-5s %s%s%s%s%s\n", entry,
+				(uint64)(tag & TLB_TAG_VA_MASK),
+				(uint64)(tag & TLB_TAG_CONTEXT_MASK),
+				(uint64)(data & TTE_PA_MASK),
+				kSizeNames[(data >> TTE_SIZE_SHIFT) & TTE_SIZE_MASK],
+				(data & TTE_LOCKED) != 0 ? "locked " : "",
+				(data & TTE_PRIVILEGED) != 0 ? "priv " : "",
+				(data & TTE_WRITABLE) != 0 ? "write " : "",
+				(data & TTE_GLOBAL) != 0 ? "global " : "",
+				(data & TTE_SIDE_EFFECT) != 0 ? "side-effect " : "");
+		}
+
+		dprintf("sparc_mmu: %s TLB has %d valid entries, %d locked, %d free\n",
+			instruction ? "I" : "D", valid, locked,
+			SPARC_TLB_ENTRIES - valid);
+	}
 }
