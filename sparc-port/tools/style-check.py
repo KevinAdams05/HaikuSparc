@@ -256,8 +256,17 @@ def strip_literals(line):
     return CHAR_RE.sub(lambda m: "'" + " " * (len(m.group(0)) - 2) + "'", line)
 
 
+BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/")
+
+
 def strip_comment(line):
-    """Drop a trailing // comment, so rules do not fire on prose."""
+    """Drop comments, so rules do not fire on prose.
+
+    Block comments that open and close on one line have to go too, not just
+    "//" ones: such a line ends in '/', which otherwise reads as a trailing
+    division operator.
+    """
+    line = BLOCK_COMMENT_RE.sub(" ", line)
     index = strip_literals(line).find("//")
     return line if index < 0 else line[:index]
 
@@ -411,6 +420,9 @@ SELF_TEST_CASES = [
     ("a.cpp", "value = one +\n", "operator-eol"),
     # A directive is not an expression: this ends in '>', not an operator.
     ("a.cpp", "#include <string.h>\n", None),
+    # A one-line block comment ends in '/', which is not a trailing operator.
+    ("a.cpp", "/*! Checks the thing. */\n", None),
+    ("a.cpp", "int x; /* note */\n", None),
     ("a.cpp", "#define JOIN(a, b) a##b\n", None),
     ("a.cpp", "value = one\n\t+ two;\n", None),
     ("a.cpp", "   int x;\n", "space-indent"),
