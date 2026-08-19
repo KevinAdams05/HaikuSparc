@@ -10,13 +10,19 @@
  */
 
 
+#include <new>
+
 #include <KernelExport.h>
 #include <arch_mmu.h>
+#include <arch_vm_translation_map.h>
 #include <kernel.h>
 #include <platform/openfirmware/openfirmware.h>
 #include <vm/vm.h>
+#include <vm/vm_page.h>
 #include <vm/vm_priv.h>
 #include <vm/VMAddressSpace.h>
+
+#include "SPARCVMTranslationMap.h"
 
 
 #define TRACE_VM_TMAP
@@ -36,6 +42,30 @@
 
 // Open Firmware's MMU instance, from /chosen. Zero until first needed.
 static int sMmuInstance;
+
+// The kernel's page table root, physical. Every kernel translation map wraps
+// this same table: there is one kernel address space and it outlives everything
+// that describes it.
+static phys_addr_t sKernelPageTable;
+
+// A buffer plus placement new, not a static object.
+//
+// The kernel does not run global constructors. It has a .ctors section with
+// relocations against it and nothing that walks it, which for a plain struct
+// costs nothing -- but this class has virtual methods, so without its
+// constructor the vtable pointer stays zero and the first virtual call jumps to
+// address zero.
+//
+// That is not hypothetical. A static object here got as far as
+// vm_page_allocate_page() asking for a cleared page, which reaches
+// vm_memset_physical(), which loaded the vtable pointer, loaded the method at
+// offset 0x40 from it, and called zero -- reported as an illegal instruction at
+// pc 0x4. This is why x86's paging code constructs its page mapper the same way.
+//
+// A buffer rather than the heap because this has to exist before there is one.
+static char sPhysicalPageMapperBuffer[sizeof(SPARCVMPhysicalPageMapper)]
+	__attribute__((aligned(16)));
+static SPARCVMPhysicalPageMapper* sPhysicalPageMapper;
 
 
 status_t
@@ -74,11 +104,61 @@ arch_vm_translation_map_init(kernel_args *args,
 	// before %tba is repointed -- see sparc-port/PHASE2_MMU_DESIGN.md.
 	sparc_dump_openfirmware_translations();
 
-	// Build the kernel's TSB and warm it with those translations. Nothing
-	// points at it yet: the hardware still uses the firmware's TSB and the
-	// firmware's trap handlers. This only gets the structure in place so it
-	// can be inspected before the cutover depends on it.
-	sparc_mmu_init_tsb(args);
+	// The kernel's page table root. This has to exist before the TSB is warmed,
+	// because warming records the firmware's translations and they belong in the
+	// authoritative structure as much as in the cache -- a TSB line that gets
+	// evicted has to be recoverable, and the page table is the only thing that
+	// can recover it.
+	SPARCPageTableAllocator allocator = { args, NULL };
+	sKernelPageTable = allocator.Allocate();
+	if (sKernelPageTable == 0) {
+		panic("arch_vm_translation_map_init: no page for the kernel page table");
+		return B_NO_MEMORY;
+	}
+	TRACE("kernel page table root at %#" B_PRIxPHYSADDR "\n", sKernelPageTable);
+
+	// Build the kernel's TSB, warm it and the page table with the firmware's
+	// translations, lock what the trap handlers need, and hand the MMU over.
+	status_t status = sparc_mmu_init_tsb(args);
+	if (status != B_OK)
+		return status;
+
+	sPhysicalPageMapper
+		= new(sPhysicalPageMapperBuffer) SPARCVMPhysicalPageMapper;
+	*_physicalPageMapper = sPhysicalPageMapper;
+
+	return B_OK;
+}
+
+
+phys_addr_t
+sparc_kernel_page_table()
+{
+	return sKernelPageTable;
+}
+
+
+/*!	Records an early mapping in the kernel's page table.
+
+	Separate from the translation map class because it runs before any address
+	space exists, and shares the class's walk rather than repeating it.
+*/
+status_t
+sparc_page_table_early_map(kernel_args* args, addr_t virtualAddress,
+	phys_addr_t physicalAddress, uint64 flags)
+{
+	if (sKernelPageTable == 0)
+		return B_NO_INIT;
+
+	SPARCPageTableAllocator allocator = { args, NULL };
+	phys_addr_t entry = sparc_page_table_lookup(sKernelPageTable,
+		virtualAddress, &allocator);
+	if (entry == 0)
+		return B_NO_MEMORY;
+
+	sparc_write_physical(entry, TTE_VALID
+		| ((uint64)TTE_SIZE_8K << TTE_SIZE_SHIFT)
+		| (physicalAddress & TTE_PA_MASK) | flags);
 
 	return B_OK;
 }
@@ -146,10 +226,27 @@ arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
 		}
 	}
 
-	// The kernel's TSB always gets the mapping. Before the cutover that is
-	// bookkeeping for later; afterwards it is the mapping.
-	sparc_tsb_insert(va, pa, TTE_WRITABLE | TTE_PRIVILEGED
-		| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL);
+	// Both structures, always, and the page table first. It is the record; the
+	// TSB is a cache of it. A TSB line can be evicted by a collision at any
+	// moment, and when it is, the only thing that can answer the resulting miss
+	// is the page table.
+	//
+	// Early mappings are writable outright rather than mapped read-only to catch
+	// the first write. Nothing is tracking modified pages this early, and a
+	// protection trap taken before the handler for it exists would be fatal
+	// rather than informative.
+	const uint64 kEarlyFlags = TTE_WRITABLE | TTE_SOFT_REAL_WRITABLE
+		| TTE_SOFT_ACCESSED | TTE_SOFT_MODIFIED | TTE_PRIVILEGED | TTE_GLOBAL
+		| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL;
+
+	status_t status = sparc_page_table_early_map(args, va, pa, kEarlyFlags);
+	if (status != B_OK) {
+		panic("arch_vm_translation_map_early_map: no page table entry for va %#"
+			B_PRIxADDR, va);
+		return status;
+	}
+
+	sparc_tsb_insert(va, pa, kEarlyFlags & ~TTE_GLOBAL);
 
 	// Once the kernel services its own traps, the firmware has no further part
 	// in this. Asking it to map anyway is not merely redundant: every call
@@ -180,14 +277,50 @@ arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
 status_t
 arch_vm_translation_map_create_map(bool kernel, VMTranslationMap** _map)
 {
+	// A kernel map wraps the table that already exists and is already populated;
+	// a user map starts with nothing and grows its levels on demand. Passing zero
+	// for the latter is what makes the first Map() allocate a root.
+	SPARCVMTranslationMap* map = new(std::nothrow) SPARCVMTranslationMap(kernel,
+		kernel ? sKernelPageTable : 0);
+	if (map == NULL)
+		return B_NO_MEMORY;
+
+	*_map = map;
 	return B_OK;
 }
 
 
+/*!	Whether the debugger may touch this address without risking a fault.
+
+	Answered from the page table rather than by guessing at address ranges,
+	because the walk uses physical accesses: it cannot fault, cannot block and
+	needs no lock, which is exactly what makes it safe to run from KDL with the
+	rest of the machine stopped.
+*/
 bool
 arch_vm_translation_map_is_kernel_page_accessible(addr_t virtualAddress,
 	uint32 protection)
 {
-	return false;
+	if (sKernelPageTable == 0)
+		return false;
+
+	phys_addr_t entry = sparc_page_table_lookup(sKernelPageTable,
+		virtualAddress, NULL);
+	if (entry == 0)
+		return false;
+
+	uint64 tte = sparc_read_physical(entry);
+	if ((tte & TTE_VALID) == 0)
+		return false;
+
+	// A write needs the mapping to actually permit one. REAL_WRITABLE rather
+	// than W, since a writable page may be sitting read-only waiting to have its
+	// first write noticed, and the debugger's write would simply set the bit.
+	if ((protection & B_KERNEL_WRITE_AREA) != 0
+			&& (tte & TTE_SOFT_REAL_WRITABLE) == 0) {
+		return false;
+	}
+
+	return true;
 }
 

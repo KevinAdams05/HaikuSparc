@@ -21,6 +21,7 @@ KernelMergeObject kernel_arch_sparc.o :
 	arch_user_debugger.cpp
 	arch_vm.cpp
 	arch_vm_translation_map.cpp
+	SPARCVMTranslationMap.cpp
 	:
 	$(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
 	:
