@@ -15,14 +15,21 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel boots and runs its early initialisation.** On QEMU's `sun4u` machine the loader
-boots from Sun-disklabelled media, mounts a BFS volume, loads and enters the kernel, and the
-kernel brings up the platform, debug output, locking and interrupts before reaching `vm_init`.
+**The kernel services its own TLB misses and window traps.** Phase 2 — the MMU and trap table,
+the gate this port has always turned on — is complete.
 
-Phase 2 — the MMU and trap table, the gate this port has always turned on — is in progress. The
-TSB is allocated and its arithmetic verified against the hardware; the TLB miss fast path, the
-window spill/fill handlers and the unhandled-trap handler are written. None of it is installed
-yet: `%tba` still belongs to Open Firmware.
+On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume, and
+enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
+the MMU and the trap table over from Open Firmware, then runs through `vm_page_init`, brings up
+the slab allocator and reaches `vm_translation_map_init_post_area`.
+
+All three of Phase 2's exit criteria are met by deliberate tests rather than by inference: it maps
+a page it allocated itself with the firmware no longer involved, it survives a TLB miss provoked
+by demapping a translation that exists only in its own TSB, and it survives a 24-frame recursion
+against 8 register windows with the values arriving back intact.
+
+Next is a real `VMTranslationMap`. The authoritative page table it needs is the same structure the
+TSB miss slow path must resolve from, so the two land together.
 
 Fourteen genuine bugs have been found and fixed along the way, several of them
 architecture-neutral and so broken for the PowerPC Open Firmware port too.
