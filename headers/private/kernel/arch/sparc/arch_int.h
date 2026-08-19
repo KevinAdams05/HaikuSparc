@@ -114,4 +114,10 @@ arch_int_are_interrupts_enabled_inline(void)
 	arch_int_are_interrupts_enabled_inline()
 
 
+#ifdef __cplusplus
+// In arch_int.cpp. Called once, from arch_int_init_post_device_manager().
+extern void sparc_test_preemption();
+#endif
+
+
 #endif /* _KERNEL_ARCH_SPARC_INT_H */

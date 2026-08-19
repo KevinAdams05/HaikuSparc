@@ -707,13 +707,40 @@ sparc_interrupt_entry:
 	wrpr	%l6, 0, %pil
 
 	wr	%l4, 0, %y
+
+	/* Point the saved CWP at the window `restore` is about to land on, rather
+	 * than at the one the trap was taken in.
+	 *
+	 * `retry` sets CWP from TSTATE, and TSTATE holds the *numeric* window index
+	 * from the moment of the trap. That is the same window only as long as
+	 * nothing renumbers the register file in between -- and rescheduling from
+	 * this handler does exactly that: the switch flushes every window, the
+	 * thread runs somewhere else, and when it comes back its frames have been
+	 * filled into whichever windows were free. The handler is then at a
+	 * different CWP than it started at, and restoring the recorded one lands on
+	 * a window holding somebody else's registers.
+	 *
+	 * That was the whole of the preemption bug. It showed up as faults in
+	 * ordinary kernel code with %i7 still pointing into this handler's caller --
+	 * code running in a window that was not the one it thought.
+	 *
+	 * Computed before the restore, because afterwards these locals are gone.
+	 * NWINDOWS is 8, so the arithmetic wraps with a mask of 7; CWP is TSTATE
+	 * bits 4:0.
+	 */
+	rdpr	%cwp, %l6
+	sub	%l6, 1, %l6
+	and	%l6, 7, %l6
+	andn	%l0, 0x1f, %l0
+	or	%l0, %l6, %l0
+
 	wrpr	%l0, 0, %tstate
 	wrpr	%l1, 0, %tpc
 	wrpr	%l2, 0, %tnpc
 
 	/* `restore` may fill from the stack, which traps to level 2 and comes back;
 	 * `retry` then re-executes the instruction the interrupt landed on, with
-	 * PSTATE -- including IE -- restored from %tstate.
+	 * PSTATE -- including IE -- and CWP restored from %tstate.
 	 */
 	restore
 	retry

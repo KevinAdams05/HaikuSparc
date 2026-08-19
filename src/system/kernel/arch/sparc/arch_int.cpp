@@ -128,31 +128,31 @@ sparc_interrupt(struct iframe *frame)
 	if (debug_debugger_running())
 		return;
 
-	// Preemption from here is deliberately not done yet, and this is the honest
-	// state of it rather than an oversight.
-	//
-	// Rescheduling from inside the interrupt means switching stacks with a trap
-	// frame still on this one, and two problems showed up in that order. The
-	// first was the trap level: this handler drops to level zero to run C, and a
-	// second interrupt arriving before it returns wrote its own trap level over
-	// this one, so the two returns drove the level below zero and QEMU stopped
-	// with "Trap 0x0064 while trap level (-1) >= MAXTL". Raising %pil to 15 for
-	// the duration fixed that, and it is the right thing regardless -- blocking
-	// at the interrupt level does not depend on anyone else's discipline about
-	// PSTATE.IE.
-	//
-	// What remains is window state. With preemption enabled the kernel faults
-	// inside ordinary code -- BOpenHashTable::Insert, in the runs seen -- with
-	// %i7 still pointing into this handler's caller, which means the register
-	// window it is running in is not the one it thinks. The entry and exit paths
-	// are correct for a handler that returns to what it interrupted; something
-	// about them is not correct for one that returns somewhere else entirely.
-	//
-	// Without it, the timer still runs: system_time() advances, timer_interrupt()
-	// fires, and Haiku's timers and timeouts work. What does not happen is a
-	// thread being taken off the CPU against its will, so scheduling stays
-	// cooperative, as it was before this file existed.
-	(void)thread_get_current_thread;
+	// Interrupts are off -- the trap cleared PSTATE.IE and the entry path raised
+	// %pil to 15 -- and they stay that way across the reschedule. Restoring the
+	// state explicitly afterwards is not a formality: rescheduling switches to
+	// another thread and comes back later, and what the interrupt-enable bit
+	// holds on the way back is whatever the other thread left it as.
+	Thread *thread = thread_get_current_thread();
+	cpu_status state = disable_interrupts();
+
+	if (thread->post_interrupt_callback != NULL) {
+		void (*callback)(void *) = thread->post_interrupt_callback;
+		void *data = thread->post_interrupt_data;
+
+		thread->post_interrupt_callback = NULL;
+		thread->post_interrupt_data = NULL;
+
+		restore_interrupts(state);
+		callback(data);
+	} else if (thread->cpu->invoke_scheduler) {
+		SpinLocker schedulerLocker(thread->scheduler_lock);
+		scheduler_reschedule(B_THREAD_READY);
+		schedulerLocker.Unlock();
+		restore_interrupts(state);
+	} else {
+		restore_interrupts(state);
+	}
 
 }
 
@@ -181,6 +181,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	// arch_platform_init_post_thread(), where this was first put -- can create
 	// threads and resume them and watch them never run.
 	sparc_test_context_switch();
+	sparc_test_preemption();
 
 	return B_OK;
 }
@@ -210,4 +211,80 @@ arch_int_assign_to_cpu(int32 irq, int32 cpu)
 {
 	// Not yet supported.
 	return 0;
+}
+
+
+// #pragma mark - the preemption test
+
+
+static int32 sSpinnerCount;
+static bool sStopSpinner;
+
+
+/*!	Spins, and never gives up the CPU on purpose.
+
+	No yield, no blocking call, nothing that reaches the scheduler. The only way
+	this thread can lose the processor is for a timer interrupt to take it away,
+	which is the point.
+*/
+static status_t
+sparc_preemption_spinner(void *data)
+{
+	while (!sStopSpinner)
+		atomic_add(&sSpinnerCount, 1);
+
+	return B_OK;
+}
+
+
+/*!	Proves a periodic tick preempts a busy loop.
+
+	The context switch test alternates two threads with thread_yield(), which
+	demonstrates that switching works but says nothing about preemption: both
+	threads there ask to be switched away. This one has neither thread ask.
+
+	A spinner is started, and then this thread busy-waits for it without
+	yielding. If nothing can take the CPU away from a running thread, whichever
+	of the two started first keeps it and the counter stays at zero forever. A
+	non-zero counter means the timer interrupt took the processor from one thread
+	and gave it to the other, which is the whole of Phase 4.
+
+	The deadline uses system_time(), which is the other half of this phase, so a
+	failure of either shows up here.
+*/
+void
+sparc_test_preemption()
+{
+	sSpinnerCount = 0;
+	sStopSpinner = false;
+
+	thread_id spinner = spawn_kernel_thread(sparc_preemption_spinner,
+		"sparc spinner", B_NORMAL_PRIORITY, NULL);
+	if (spinner < 0) {
+		dprintf("sparc_int: could not spawn the preemption test\n");
+		return;
+	}
+
+	resume_thread(spinner);
+
+	bigtime_t start = system_time();
+	const bigtime_t kDeadline = 2000000;
+
+	while (atomic_get(&sSpinnerCount) == 0
+		&& system_time() - start < kDeadline) {
+		// Deliberately empty, and deliberately without a yield.
+	}
+
+	bigtime_t elapsed = system_time() - start;
+	int32 count = atomic_get(&sSpinnerCount);
+	sStopSpinner = true;
+
+	dprintf("sparc_int: spinner reached %" B_PRId32 " after %" B_PRIdBIGTIME
+		" us without either thread yielding -- %s\n", count, elapsed,
+		count > 0 ? "preempted" : "NOT PREEMPTED");
+
+	if (count == 0) {
+		panic("sparc: a busy loop was never preempted in %" B_PRIdBIGTIME
+			" us; the timer interrupt is not reaching the scheduler", elapsed);
+	}
 }
