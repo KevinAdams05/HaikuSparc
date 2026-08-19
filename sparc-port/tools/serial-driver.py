@@ -121,6 +121,10 @@ def main():
         help="extra pattern to wait for, paired with --send")
     parser.add_argument("--send", action="append", default=[],
         help="extra text to send (\\r and \\e are interpreted)")
+    parser.add_argument("--timestamps", action="store_true",
+                        help="prefix each logged line with seconds since start, "
+                             "which is the only way to tell how long the target "
+                             "spent between two messages")
     parser.add_argument("--quiet", action="store_true",
         help="do not echo to stdout")
     args = parser.parse_args()
@@ -158,6 +162,24 @@ def main():
     search_from = 0
     carry = ""
     log = open(args.log, "w", buffering=1, errors="replace")
+    started = time.time()
+    pending = [""]
+
+    def write_log(text):
+        """Writes to the log, optionally stamping each completed line.
+
+        Stamps go on line boundaries rather than on each chunk, because a chunk
+        is whatever recv() happened to return and can end mid-word. Whatever is
+        left over is carried to the next call.
+        """
+        if not args.timestamps:
+            log.write(text)
+            return
+
+        pending[0] += text
+        while "\n" in pending[0]:
+            line, pending[0] = pending[0].split("\n", 1)
+            log.write("[%8.3f] %s\n" % (time.time() - started, line))
 
     def pump():
         """Read whatever is available; return False once the socket closes."""
@@ -172,7 +194,7 @@ def main():
             return False
         text = chunk.decode("latin1")
         text = NOISE_RE.sub("", text)
-        log.write(text)
+        write_log(text)
         if not args.quiet:
             sys.stdout.write(text)
             sys.stdout.flush()
