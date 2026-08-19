@@ -5,17 +5,19 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0, 1 and 2 complete. The kernel runs its own MMU, page table and VM, and reaches
-the scheduler.**
+**State: Phases 0–3 complete. The kernel schedules threads and reaches the disk device manager.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The
 kernel brings up the platform, debug output, locking and interrupts, takes the MMU and trap table
 over from Open Firmware, builds its own three-level page table, runs `vm_page_init` and the slab
-allocator, creates its areas, initialises the ELF loader, the commpage and the scheduler — and
-stops on `arch_thread_init_kthread_stack()` being an unimplemented stub, which is Phase 3 work
-rather than a defect.
+allocator, initialises the ELF loader, the commpage and the scheduler, **switches between kernel
+threads**, and gets as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing,
+because there are no disk drivers yet.
 
-**Phase 2's three exit criteria are met, each by a deliberate test rather than by inference:**
+**Phase 3's exit criterion is met deliberately:** two kernel threads alternate a counter 64 times
+each and the total is exact — `counter 128 of 128 after 121 yields — switched cleanly` (§23).
+
+Phase 2's three, likewise:
 
 | | |
 | --- | --- |
@@ -23,7 +25,7 @@ rather than a defect.
 | Survives a provoked TLB miss | page written, translation demapped, read back correctly — no route but the fast path (§21) |
 | Survives a forced window overflow | 24 frames against 8 windows, sum exact, so the stack bias is right too (§21) |
 
-Phase 2 as built:
+What exists:
 
 | | |
 | --- | --- |
@@ -31,15 +33,20 @@ Phase 2 as built:
 | TSB | 256 KB split pair, a cache in front of the page table |
 | Index arithmetic and tag target | both **verified against the hardware** (§19, §21) |
 | TLB miss fast path | 10 instructions; slow path walks the page table in about 20 more (§22) |
-| Window spill / fill / clean | in the 128-byte slots, servicing every spill since the cutover |
 | Trap table | 32 KB, geometry asserted at build time and re-checked every boot (§20) |
-| Locking | 10 TLB entries, and the locked ranges are now protected from demap (§22) |
+| Locking | 10 TLB entries, and the locked ranges are protected from demap (§22) |
 | Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
+| Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
+| Memory barriers | real bodies, erratum-51 safe (§23) |
 
-**Next: Phase 3, threading.** `arch_thread_init_kthread_stack()` and the rest of
-`arch_thread.cpp` are stubs. The register-window machinery Phase 2 built is what makes them
-writable.
+**Next: Phase 4, timer and interrupts.** Nothing preempts yet — every switch so far is voluntary.
+`%TICK_CMPR` for a periodic tick, `system_time()` from `%TICK`, and PIL-based dispatch.
+
+**Open, and not on the Phase 4 path:** `wait_for_thread()` trips `could acquire exit_sem for
+thread 5`, an invariant in the semaphore or thread-death bookkeeping that nothing had exercised
+before (§23). And the boot ends at `did not find any boot partitions!`, which is simply the
+absence of disk drivers — Phase 7.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1273,3 +1280,80 @@ constructs its mapper with placement new into a buffer, and why this one now doe
 - **Execute permission is recorded but not enforced.** sun4u has no per-page execute bit; a page is
   executable exactly when it has an I-TLB entry, so enforcement means deciding which TLB to refill
   from the trap type. The soft bit is there for that decision to consult.
+
+
+## 23. The context switch
+
+Twelve instructions, and short for a reason worth stating: on SPARC the registers save themselves.
+
+### Why it is small
+
+The ABI's callee-saved registers *are* the window registers, %l0-%l7 and %i0-%i7. So
+`sparc_context_switch()` takes a window of its own, executes `flushw` to push every *other* window
+out to the stack frame it belongs to, and is then the only live window in the machine. At that
+point its `%i6` and `%i7` mean exactly "which stack to return onto" and "where to return to" —
+overwrite them with the incoming thread's pair, and the ordinary function epilogue performs the
+switch:
+
+```
+	save	%sp, -SPARC_MINIMUM_FRAME_SIZE, %sp
+	flushw
+	stx	%i6, [%i0 + CONTEXT_SP]
+	stx	%i7, [%i0 + CONTEXT_PC]
+	ldx	[%i1 + CONTEXT_SP], %i6
+	ldx	[%i1 + CONTEXT_PC], %i7
+	ret
+	 restore
+```
+
+`ret` jumps to the new `%i7 + 8`; `restore` in its delay slot drops into a window that has to be
+filled, and the fill reads from the new `%i6`. Nothing is copied anywhere: the registers are
+spilled to one stack and filled from another by the same handlers that service every other window
+trap. **This could not have been written before Phase 2 made those work**, and once they did, it
+was nearly free.
+
+**The floating-point registers need no saving.** Every `%f` register is caller-saved in the SPARC
+V9 ABI, so the compiler has already spilled anything live across a call — and a voluntary switch
+happens inside one. Preemption is a different case and arrives with the interrupt frame, which
+saves what it interrupts.
+
+### The fabricated first frame
+
+A thread that has never run has no spilled window to fill from, so
+`arch_thread_init_kthread_stack()` builds the frame a spill would have left. The entry function and
+its argument go in the first two words — the positions a fill loads into `%l0` and `%l1`, which is
+where `sparc_thread_entry()` looks for them, rather than being passed in the usual argument
+registers.
+
+`%i6` and `%i7` in that frame are both zero, deliberately: it terminates a stack walk at the bottom
+of the thread instead of letting a backtrace wander into whatever the memory used to hold.
+
+The **frame address** is what must be 16-byte aligned, not the stack pointer. SPARC V9 biases `%sp`
+by 2047, so the two cannot both be aligned, and it is the frame the hardware cares about.
+
+### Two things that went wrong
+
+**The test was in the wrong place, twice over.** `arch_platform_init_post_thread()` looks like the
+first point at which threads can be created — and it is — but nothing is *scheduled* before
+`scheduler_start()`, which main.cpp says outright in the comment where it spawns `main2`. Threads
+created there spawn successfully, resume successfully, and never run: the test reported `counter 0
+of 128 after 2000001 yields`. It now runs from `arch_int_init_post_device_manager()`, inside
+`main2`, which is the first thread the scheduler ever picks.
+
+**The first version used `wait_for_thread()`** and tripped `could acquire exit_sem for thread 5` —
+`acquire_sem_etc()` returning `B_OK` on a semaphore created with a count of zero. That is an
+invariant in the semaphore or thread-death bookkeeping, not a context switch problem, and this
+port had never exercised it. **It is left open rather than chased from here**, and the test polls
+with `thread_yield()` instead, which depends on far less: no semaphores, no thread-death path, no
+timer.
+
+### The barriers
+
+All three memory barriers were empty functions with a TODO. Architecturally that is nearly
+harmless on one CPU under Total Store Order, which already orders load-load, load-store and
+store-store — store-load is the only ordering a barrier must add.
+
+What an empty body does not do is tell the *compiler*, and that is the half that mattered: a read
+barrier emitting nothing lets GCC hoist a load out of a loop waiting on another thread's store.
+Invisible until threads exist, which they now do. They emit a `"memory"` clobber, and the full
+barrier a `membar #StoreLoad` in the delay slot of an always-taken branch — erratum 51 again.

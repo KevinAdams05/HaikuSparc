@@ -15,22 +15,30 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel runs its own MMU, page table and VM, and reaches the scheduler.** Phase 2 — the MMU
-and trap table, the gate this port has always turned on — is complete.
+**The kernel runs its own MMU, page table and VM, schedules threads, and reaches the disk device
+manager.** Phases 0–3 are complete, including Phase 2 — the MMU and trap table, the gate this port
+has always turned on.
 
 On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
 enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
 the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
 `vm_page_init` and the slab allocator, creates its areas, and initialises the ELF loader, the
-commpage and the scheduler. It stops on `arch_thread_init_kthread_stack()` being an unimplemented
-stub — which is Phase 3, not a defect.
+commpage and the scheduler, switches between kernel threads, and gets as far as
+`KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk drivers
+yet.
 
 All three of Phase 2's exit criteria are met by deliberate tests rather than by inference: it maps
 a page it allocated itself with the firmware no longer involved, it survives a TLB miss provoked
 by demapping a translation that exists only in its own TSB, and it survives a 24-frame recursion
 against 8 register windows with the values arriving back intact.
 
-Next is Phase 3, threading. The register-window machinery Phase 2 built is what makes it writable.
+Phase 3's exit criterion is met the same way: two kernel threads alternate a counter 64 times each
+and the total comes out exact. The context switch is twelve instructions, because on SPARC the
+callee-saved registers *are* the window registers — `flushw` spills them to the outgoing thread's
+own stack, and the fill after `restore` pulls them from the incoming one.
+
+Next is Phase 4, the timer and interrupts. Nothing preempts yet; every switch so far is
+voluntary.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

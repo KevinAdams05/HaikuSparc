@@ -455,7 +455,7 @@ and survives a forced window overflow.
 **Risk: high.** This is where SPARC ports stall. Budget accordingly and do not let it be
 optimistically reported as nearly-done.
 
-### Phase 3 — Context switch
+### Phase 3 — Context switch  **[DONE]**
 
 Replace the `panic()` in `arch_thread_init_kthread_stack` — delete the stale m68k body — with
 real SPARC frame setup. Write `_sparc_context_switch`. Extend `struct arch_thread` with genuine
