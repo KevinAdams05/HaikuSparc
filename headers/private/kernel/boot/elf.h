@@ -41,6 +41,21 @@ struct preloaded_image {
 		// the ID field will be filled out in the kernel
 	bool		is_module;
 		// set by the module initialization code
+
+	uint8		_padding[2];
+		// Pads the structure to a multiple of eight bytes.
+		//
+		// This structure is packed so that a 32- and a 64-bit build agree on
+		// its layout, and the images that derive from it are packed for the
+		// same reason -- but the sub-structures they add are not. Elf64_Ehdr in
+		// particular is an ordinary structure, so the compiler assumes its
+		// members are naturally aligned and emits full-width loads for them.
+		//
+		// Without this padding the base is 62 bytes, every derived image's
+		// elf_header starts six bytes off alignment, and reading e_phoff is a
+		// 64-bit load from an address ending in 6. x86 and PowerPC take that in
+		// their stride. SPARC does not: it is strict-alignment, and the access
+		// raises mem_address_not_aligned.
 } _PACKED;
 
 struct preloaded_elf32_image : public preloaded_image {

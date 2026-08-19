@@ -29,6 +29,18 @@
 static_assert((1UL << PAGE_SHIFT) == B_PAGE_SIZE,
 	"PAGE_SHIFT and B_PAGE_SIZE disagree");
 
+// The kernel image structures the loader hands over contain sub-structures that
+// are not themselves packed -- Elf64_Ehdr above all -- so the compiler assumes
+// their members are naturally aligned and emits full-width loads for them. That
+// only holds if the enclosing structure ends on an eight-byte boundary, which is
+// not something the header can be relied upon to keep true by accident.
+// Asserted on the base's size rather than with offsetof(), which the compiler
+// refuses on a type with a base class.
+static_assert(sizeof(preloaded_image) % 8 == 0,
+	"preloaded_image must be a multiple of 8 bytes, or the ELF header in every "
+	"image derived from it is misaligned");
+
+
 //#define TRACE_SPARC_VM_TRANSLATION_MAP
 #ifdef TRACE_SPARC_VM_TRANSLATION_MAP
 #	define TRACE(x...) dprintf(x)
