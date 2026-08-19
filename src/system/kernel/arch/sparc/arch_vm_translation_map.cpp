@@ -146,11 +146,19 @@ arch_vm_translation_map_early_map(kernel_args *args, addr_t va, phys_addr_t pa,
 		}
 	}
 
-	// Record it in the kernel's TSB as well, so that structure tracks reality
-	// and is ready when the kernel takes the MMU over. Harmless until then --
-	// nothing reads it yet.
+	// The kernel's TSB always gets the mapping. Before the cutover that is
+	// bookkeeping for later; afterwards it is the mapping.
 	sparc_tsb_insert(va, pa, TTE_WRITABLE | TTE_PRIVILEGED
 		| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL);
+
+	// Once the kernel services its own traps, the firmware has no further part
+	// in this. Asking it to map anyway is not merely redundant: every call
+	// extends its "translations" property, and OpenBIOS's heap does not survive
+	// the thousands of pages vm_page_init() maps -- it fails with "out of malloc
+	// memory" partway through, which is where this port stopped before the
+	// cutover made the call unnecessary.
+	if (sparc_mmu_is_installed())
+		return B_OK;
 
 	// "map" takes ( mode size virt phys.hi phys.lo -- ) and returns nothing, so
 	// the value here reports only whether the client-interface call itself got

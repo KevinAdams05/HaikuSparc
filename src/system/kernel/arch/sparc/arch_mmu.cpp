@@ -172,6 +172,7 @@ sparc_dump_openfirmware_translations()
 // nothing maps with larger pages yet.
 static TsbEntry* sKernelTsb;
 static phys_addr_t sKernelTsbPhysical;
+static bool sMmuInstalled;
 
 // Defined further down, next to the TLB-reading code they are built on, but
 // needed by the TSB allocation above them.
@@ -227,6 +228,7 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 
 static void sparc_verify_tlb_load(struct kernel_args *args);
 static void sparc_verify_tsb_lookup();
+static void sparc_verify_trap_handlers(struct kernel_args *args);
 
 
 /*!	Allocates the kernel TSB and warms it with Open Firmware's translations.
@@ -343,6 +345,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_verify_trap_globals();
 	sparc_lock_trap_pages();
 	sparc_dump_tlb();
+	sparc_install_trap_table(args);
 
 	return B_OK;
 }
@@ -1126,4 +1129,247 @@ sparc_lock_trap_pages()
 
 	dprintf("sparc_mmu: %d pages locked for the trap path\n", total);
 	return B_OK;
+}
+
+
+/*!	Proves the hardware builds the tag the miss handler will be compared against.
+
+	sparc_tsb_insert() stores VA<63:22> and nothing else, on the grounds that the
+	hardware's tag target is (context << 48) | VA<63:22> and the context is zero
+	throughout the kernel. The single xor in the fast path depends entirely on
+	that being true, and if it is not, the comparison never matches: every access
+	misses, the slow path stops the machine on the first one, and nothing says
+	why.
+
+	The context part is the assumption worth testing, because it is about state
+	the firmware set up rather than about arithmetic. At TL>0 the MMU uses the
+	nucleus context, which is zero by definition, but the kernel spends nearly
+	all its time at TL=0 where the primary context register decides -- and that
+	register belongs to whatever the firmware left behind.
+
+	Rather than read the context registers and reason about them, this writes an
+	address into the Tag Access register and reads back the tag target the
+	hardware forms from it, which is the exact value the handler will see.
+*/
+static status_t
+sparc_verify_tag_target()
+{
+	uint64 primaryContext;
+	uint64 secondaryContext;
+	asm volatile("ldxa [%[primary]] 0x58, %[primaryValue]\n\t"
+		"ldxa [%[secondary]] 0x58, %[secondaryValue]"
+		: [primaryValue] "=&r"(primaryContext),
+		  [secondaryValue] "=r"(secondaryContext)
+		: [primary] "r"(primary_context), [secondary] "r"(secondary_context));
+
+	dprintf("sparc_mmu: contexts: primary %" B_PRIu64 ", secondary %" B_PRIu64
+		"\n", primaryContext, secondaryContext);
+
+	static const addr_t kProbes[] = {
+		0x80000000,		// the kernel image
+		0x801b8000,		// the trap table itself
+		0x8023e000,		// the trap data block
+		0xffd00000,		// Open Firmware's own code
+	};
+
+	uint32 mismatches = 0;
+	for (size_t i = 0; i < sizeof(kProbes) / sizeof(kProbes[0]); i++) {
+		uint64 hardware;
+		asm volatile(
+			"stxa %[tag], [%[tagReg]] 0x58\n\t"
+			"membar #Sync\n\t"
+			"ldxa [%[target]] 0x58, %[result]"
+			: [result] "=r"(hardware)
+			: [tag] "r"((uint64)kProbes[i]), [tagReg] "r"(tlb_tag_access),
+			  [target] "r"(tsb_tag_target)
+			: "memory");
+
+		uint64 software = kProbes[i] >> 22;
+		bool ok = hardware == software;
+		if (!ok)
+			mismatches++;
+
+		dprintf("sparc_mmu: tag target %#010" B_PRIxADDR " -> hardware %#014"
+			B_PRIx64 ", stored %#014" B_PRIx64 " -- %s\n", kProbes[i], hardware,
+			software, ok ? "match" : "MISMATCH");
+	}
+
+	if (mismatches != 0) {
+		panic("sparc_mmu: the hardware's tag target disagrees with the tags in "
+			"the TSB on %" B_PRIu32 " probes; the fast path would never hit",
+			mismatches);
+		return B_ERROR;
+	}
+
+	return B_OK;
+}
+
+
+/*!	Hands the MMU and the trap table to the kernel.
+
+	This is the point the whole phase has been working towards, and it is a step
+	that cannot be taken halfway: from the store to %tba onwards, every trap the
+	machine takes goes to our handlers instead of the firmware's, including the
+	window spills and fills that ordinary C code generates by the thousand.
+
+	Order matters more than anything else here. The TSB registers go first,
+	because a trap taken after %tba was set but before the TSB base was
+	programmed would send the fast path to read a TSB at address zero -- it would
+	find whatever is there, treat it as a translation, and load it into the TLB.
+	Programming the TSB first is harmless by comparison: nothing reads those
+	registers until a handler does.
+
+	Interrupts come off for the window between the two, and stay off, because
+	interrupt handling has its own requirements on the trap table that nothing
+	has yet built.
+*/
+status_t
+sparc_install_trap_table(struct kernel_args *args)
+{
+	if (sKernelTsb == NULL)
+		return B_NO_INIT;
+
+	if (sparc_verify_tag_target() != B_OK)
+		return B_ERROR;
+
+	extern uint32 sparc_trap_table[];
+
+	// FIGURE 15-9: base<63:13>, Split at bit 12, Size in bits 3:0.
+	uint64 tsbRegister = ((uint64)(addr_t)sKernelTsb & TSB_BASE_MASK)
+		| TSB_SPLIT | KERNEL_TSB_SIZE;
+	uint64 trapTable = (uint64)(addr_t)sparc_trap_table;
+
+	sTrapData.tsbBase = sKernelTsbPhysical;
+
+	dprintf("sparc_mmu: installing TSB register %#018" B_PRIx64 " and %%tba %#"
+		B_PRIx64 "\n", tsbRegister, trapTable);
+
+	// Both MMUs get the same TSB. They have separate registers because they can
+	// have separate TSBs, but the kernel's mappings are one set and splitting
+	// them would only mean maintaining the same data twice.
+	uint64 savedPstate;
+	uint64 scratch;
+	asm volatile(
+		"rdpr %%pstate, %[saved]\n\t"
+		"andn %[saved], 2, %[scratch]\n\t"	// PSTATE.IE
+		"wrpr %[scratch], 0, %%pstate\n\t"
+
+		"stxa %[tsbValue], [%[tsbReg]] 0x58\n\t"
+		"membar #Sync\n\t"
+		"stxa %[tsbValue], [%[tsbReg]] 0x50\n\t"
+		"membar #Sync\n\t"
+
+		"wrpr %%g0, %[table], %%tba\n\t"
+		"membar #Sync"
+		: [saved] "=&r"(savedPstate), [scratch] "=&r"(scratch)
+		: [tsbValue] "r"(tsbRegister), [tsbReg] "r"(tsb),
+		  [table] "r"(trapTable)
+		: "memory");
+
+	sMmuInstalled = true;
+
+	dprintf("sparc_mmu: the kernel now services its own traps\n");
+
+	sparc_verify_trap_handlers(args);
+	return B_OK;
+}
+
+
+/*!	Whether the kernel has taken the MMU and the trap table over.
+
+	Used by the early mapping path to decide whether the firmware still needs to
+	be told about a mapping, or whether writing it into the TSB is enough.
+*/
+bool
+sparc_mmu_is_installed()
+{
+	return sMmuInstalled;
+}
+
+
+/*!	Recurses deeper than the register file has windows.
+
+	NWINDOWS is 8, so a call chain longer than that cannot keep every frame's
+	registers in the file and the hardware has to spill the oldest to its stack
+	frame -- then fill them back as the chain unwinds. Both directions are our
+	handlers now.
+
+	The marker is live across the recursive call, which is what forces it into a
+	register this window owns rather than a scratch one, and therefore what makes
+	it something a spill has to save and a fill has to restore correctly. A
+	handler that saved the wrong register, or used the wrong stack bias, returns
+	the wrong sum rather than crashing -- which is exactly the failure that would
+	otherwise go unnoticed until something far away misbehaved.
+*/
+static uint64 __attribute__((noinline))
+sparc_probe_window_depth(int depth)
+{
+	if (depth == 0)
+		return 0;
+
+	uint64 marker = 0x5741524bULL * (uint64)depth;
+	uint64 deeper = sparc_probe_window_depth(depth - 1);
+
+	return marker + deeper;
+}
+
+
+/*!	Exercises the two things the firmware used to do for us, on purpose.
+
+	Everything up to here has been the handlers working incidentally: the boot
+	takes thousands of TLB misses and thousands of window spills, and getting
+	this far means most of that worked. But "most of that worked" is not the same
+	as knowing either path is correct, and a handler that is subtly wrong -- one
+	register short, one displacement off -- shows up as corruption somewhere else
+	entirely, long after the evidence has gone.
+
+	So provoke both deliberately, where the answer is known in advance.
+*/
+static void
+sparc_verify_trap_handlers(struct kernel_args *args)
+{
+	// A fresh page, mapped by us and nobody else: after the cutover early_map
+	// writes the TSB and does not call the firmware, so this mapping exists
+	// only because our own code put it there.
+	const uint64 kPattern = 0xfeedfacecafebeefULL;
+	addr_t page = vm_allocate_early(args, B_PAGE_SIZE, B_PAGE_SIZE,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0);
+	if (page == 0) {
+		dprintf("sparc_mmu: no page for the provoked-miss test\n");
+		return;
+	}
+
+	volatile uint64* probe = (volatile uint64*)page;
+	*probe = kPattern;
+
+	// Now take the translation out of the TLB but leave it in the TSB. The next
+	// read has to miss, trap, and be refilled by the fast path -- there is no
+	// other way for it to succeed.
+	asm volatile("stxa %%g0, [%[va]] 0x5f\n\t"
+		"membar #Sync"
+		:
+		: [va] "r"((uint64)page & TLB_TAG_VA_MASK)
+		: "memory");
+
+	uint64 read = *probe;
+	dprintf("sparc_mmu: provoked TLB miss at %#" B_PRIxADDR ": read %#" B_PRIx64
+		" -- %s\n", page, read, read == kPattern ? "refilled" : "WRONG");
+	if (read != kPattern) {
+		panic("sparc_mmu: a provoked TLB miss was not refilled correctly");
+		return;
+	}
+
+	// 24 frames against 8 windows: several rounds of spills on the way down and
+	// fills on the way back.
+	const int kDepth = 24;
+	uint64 expected = 0;
+	for (int i = 1; i <= kDepth; i++)
+		expected += 0x5741524bULL * (uint64)i;
+
+	uint64 sum = sparc_probe_window_depth(kDepth);
+	dprintf("sparc_mmu: forced window overflow %d deep: got %#" B_PRIx64
+		", expected %#" B_PRIx64 " -- %s\n", kDepth, sum, expected,
+		sum == expected ? "spilled and filled" : "WRONG");
+	if (sum != expected)
+		panic("sparc_mmu: window spill/fill lost or corrupted a register");
 }
