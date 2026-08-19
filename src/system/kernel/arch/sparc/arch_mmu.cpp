@@ -6,6 +6,8 @@
 
 #include <arch_mmu.h>
 
+#include <stddef.h>
+
 #include <arch_cpu.h>
 #include <debug.h>
 #include <platform/openfirmware/openfirmware.h>
@@ -296,6 +298,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_verify_tlb_load(args);
 	sparc_verify_tsb_lookup();
 	sparc_verify_trap_table();
+	sparc_verify_trap_globals();
 
 	return B_OK;
 }
@@ -604,5 +607,119 @@ sparc_verify_trap_table()
 
 	dprintf("sparc_mmu: trap table geometry verified, %" B_PRIuSIZE
 		" handlers in place\n", sizeof(checks) / sizeof(checks[0]));
+	return B_OK;
+}
+
+
+/*!	The trap handlers' per-CPU data block.
+
+	Statically allocated rather than taken from the early allocator, for the same
+	reason the handlers themselves are in the kernel image: the page it lands on
+	is one Open Firmware already mapped and locked in order to load the kernel,
+	so a handler can reach it without that reach being the thing that faults.
+
+	Aligned to its own size, which is one cache line, so a store from a trap
+	handler cannot straddle two lines and cannot share a line with anything a
+	handler does not own.
+*/
+static sparc_trap_data sTrapData __attribute__((aligned(TRAP_DATA_SIZE)));
+
+
+/*!	Installs the trap data pointer and proves it went where it should.
+
+	Three separate things can be wrong here and each fails silently:
+
+	The two copies of the field offsets -- this file's structure and
+	arch_traps.S's defines -- can drift apart, in which case handlers write over
+	each other's fields and every recorded value is attributed to the wrong name.
+
+	The bank switch in sparc_set_trap_globals() can select the wrong bank, or
+	fail to select one at all, in which case %g7 is set in the normal bank; the
+	kernel's own %g7 is then corrupt and the handlers still have nothing.
+
+	And the hardware may simply not implement the alternate banks the way the
+	manual says, which is the assumption this whole handler design rests on.
+
+	So check all three, before anything depends on any of them.
+*/
+status_t
+sparc_verify_trap_globals()
+{
+	// The structure's own opinion of its layout, against the assembler's.
+	uint64 assemblerOffsets[TRAP_DATA_OFFSET_COUNT];
+	sparc_trap_data_offsets(assemblerOffsets);
+
+	const uint64 declaredOffsets[TRAP_DATA_OFFSET_COUNT] = {
+		offsetof(sparc_trap_data, tsbBase),
+		offsetof(sparc_trap_data, tsbMask),
+		offsetof(sparc_trap_data, missCount),
+		offsetof(sparc_trap_data, missTagTarget),
+		offsetof(sparc_trap_data, missTsbPointer),
+		offsetof(sparc_trap_data, missTsbTag),
+		offsetof(sparc_trap_data, missTsbData),
+		offsetof(sparc_trap_data, missTrapType),
+		offsetof(sparc_trap_data, missTpc),
+		offsetof(sparc_trap_data, missTstate),
+		offsetof(sparc_trap_data, missTl),
+	};
+
+	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
+		if (assemblerOffsets[i] != declaredOffsets[i]) {
+			panic("sparc trap data offset %d: arch_traps.S says %#" B_PRIx64
+				", arch_mmu.h says %#" B_PRIx64, i, assemblerOffsets[i],
+				declaredOffsets[i]);
+			return B_ERROR;
+		}
+	}
+
+	if (sizeof(sparc_trap_data) != TRAP_DATA_SIZE) {
+		panic("struct sparc_trap_data is %" B_PRIuSIZE " bytes, expected %d",
+			sizeof(sparc_trap_data), TRAP_DATA_SIZE);
+		return B_ERROR;
+	}
+
+	// Remember what the kernel's own %g7 holds, so the check below can tell
+	// whether the bank switch actually happened. Writing the normal bank by
+	// mistake is the failure that would be least obvious and most destructive.
+	uint64 normalBefore;
+	asm volatile("mov %%g7, %0" : "=r"(normalBefore));
+
+	sparc_set_trap_globals(&sTrapData);
+
+	uint64 normalAfter;
+	asm volatile("mov %%g7, %0" : "=r"(normalAfter));
+	uint64 mmuGlobal = sparc_read_trap_globals(SPARC_GLOBALS_MMU);
+	uint64 alternateGlobal = sparc_read_trap_globals(SPARC_GLOBALS_ALTERNATE);
+
+	dprintf("sparc_mmu: trap data at %p, %%g7 mmu %#" B_PRIx64 " alternate %#"
+		B_PRIx64 ", normal %#" B_PRIx64 " -> %#" B_PRIx64 "\n", &sTrapData,
+		mmuGlobal, alternateGlobal, normalBefore, normalAfter);
+
+	if (normalAfter != normalBefore) {
+		panic("sparc_set_trap_globals wrote the normal global bank: %%g7 went "
+			"from %#" B_PRIx64 " to %#" B_PRIx64, normalBefore, normalAfter);
+		return B_ERROR;
+	}
+	if (mmuGlobal != (uint64)(addr_t)&sTrapData) {
+		panic("sparc mmu-global %%g7 is %#" B_PRIx64 ", expected %p",
+			mmuGlobal, &sTrapData);
+		return B_ERROR;
+	}
+	if (alternateGlobal != (uint64)(addr_t)&sTrapData) {
+		panic("sparc alternate-global %%g7 is %#" B_PRIx64 ", expected %p",
+			alternateGlobal, &sTrapData);
+		return B_ERROR;
+	}
+
+	// The banks must be distinct from the normal one, or the "private set" the
+	// stack-free handlers rely on does not exist and they would be scribbling
+	// on the interrupted code's registers. Equal values here would mean the
+	// writes above landed in one shared bank and merely looked correct.
+	if (mmuGlobal == normalAfter && normalAfter != 0) {
+		dprintf("sparc_mmu: WARNING: mmu and normal %%g7 read alike; the "
+			"alternate banks may not be implemented\n");
+	}
+
+	dprintf("sparc_mmu: trap globals verified in both banks\n");
 	return B_OK;
 }

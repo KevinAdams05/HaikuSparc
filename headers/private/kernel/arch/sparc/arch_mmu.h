@@ -93,11 +93,67 @@ extern status_t sparc_verify_trap_table();
 #define KERNEL_TSB_ENTRIES			TSB_ENTRIES(KERNEL_TSB_SIZE)
 #define KERNEL_TSB_BYTES			(KERNEL_TSB_ENTRIES * sizeof(TsbEntry))
 
+// Per-CPU data the trap handlers reach through %g7.
+//
+// A TLB miss handler runs with no stack, and it cannot afford to build an
+// address either: the kernel is linked as a shared object, so a sethi/or of a
+// symbol would need a load-time relocation, and the GOT is only reachable
+// through %l7 -- a register belonging to the interrupted window, which the
+// handler must not touch. So the address is put in a register before any trap
+// can happen, and the register is one the hardware hands the handler for free.
+//
+// Section 15.3.2 of the UltraSPARC-IIi manual gives the MMU miss traps their
+// own bank of globals, and most other traps the alternate bank. Both banks get
+// %g7 pointing here, so a handler in either can find this block with a single
+// displaced load and nothing else.
+//
+// The offsets are duplicated in arch_traps.S, where the assembler cannot see
+// this declaration. sparc_verify_trap_globals() checks the two agree.
+struct sparc_trap_data {
+	uint64	tsbBase;			// 0x00  physical base of the split TSB pair
+	uint64	tsbMask;			// 0x08  reserved for the slow path
+	uint64	missCount;			// 0x10  TSB misses taken since boot
+	uint64	missTagTarget;		// 0x18  context and VA<63:22> of the last miss
+	uint64	missTsbPointer;		// 0x20  ...which also carries VA<21:13>
+	uint64	missTsbTag;			// 0x28  the tag actually found there
+	uint64	missTsbData;		// 0x30  and its data half
+	uint64	missTrapType;		// 0x38
+	uint64	missTpc;			// 0x40
+	uint64	missTstate;			// 0x48
+	uint64	missTl;				// 0x50
+	uint64	reserved[5];		// pad to 128 bytes
+};
+
+#define TRAP_DATA_TSB_BASE			0x00
+#define TRAP_DATA_TSB_MASK			0x08
+#define TRAP_DATA_MISS_COUNT		0x10
+#define TRAP_DATA_MISS_TAG_TARGET	0x18
+#define TRAP_DATA_MISS_TSB_POINTER	0x20
+#define TRAP_DATA_MISS_TSB_TAG		0x28
+#define TRAP_DATA_MISS_TSB_DATA		0x30
+#define TRAP_DATA_MISS_TRAP_TYPE	0x38
+#define TRAP_DATA_MISS_TPC			0x40
+#define TRAP_DATA_MISS_TSTATE		0x48
+#define TRAP_DATA_MISS_TL			0x50
+#define TRAP_DATA_SIZE				0x80
+
+// Which global bank sparc_read_trap_globals() should be asked about.
+#define SPARC_GLOBALS_MMU			0
+#define SPARC_GLOBALS_ALTERNATE		1
+
 struct kernel_args;
 
 extern status_t sparc_mmu_init_tsb(struct kernel_args *args);
 extern void sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 	uint64 flags);
+extern status_t sparc_verify_trap_globals();
+
+// Both in arch_traps.S.
+extern "C" void sparc_set_trap_globals(struct sparc_trap_data *data);
+extern "C" uint64 sparc_read_trap_globals(int bank);
+extern "C" void sparc_trap_data_offsets(uint64 *out);
+
+#define TRAP_DATA_OFFSET_COUNT		11
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

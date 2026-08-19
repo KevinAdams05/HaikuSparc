@@ -40,6 +40,38 @@
 #define ASI_NUCLEUS_QUAD_LDD		0x24
 
 /* Register offsets within ASI_IMMU / ASI_DMMU. */
+/*	PSTATE fields, from the SPARC V9 architecture manual. AG, MG and IG select
+ *	which bank of global registers is visible; at most one may be set.
+ */
+#define PSTATE_AG			0x001
+#define PSTATE_IE			0x002
+#define PSTATE_MG			0x400
+#define PSTATE_IG			0x800
+
+/*	Offsets into struct sparc_trap_data, declared in
+ *	headers/private/kernel/arch/sparc/arch_mmu.h.
+ *
+ *	The assembler cannot see a C++ declaration, so these are a second copy of
+ *	numbers that already exist. Rather than trust the two to stay in step,
+ *	sparc_trap_data_offsets() below hands this file's opinion back to C++, where
+ *	sparc_verify_trap_globals() compares it against offsetof(). A disagreement
+ *	would otherwise mean trap handlers quietly writing over each other's fields.
+ */
+#define TRAP_DATA_TSB_BASE		0x00
+#define TRAP_DATA_TSB_MASK		0x08
+#define TRAP_DATA_MISS_COUNT		0x10
+#define TRAP_DATA_MISS_TAG_TARGET	0x18
+#define TRAP_DATA_MISS_TSB_POINTER	0x20
+#define TRAP_DATA_MISS_TSB_TAG		0x28
+#define TRAP_DATA_MISS_TSB_DATA		0x30
+#define TRAP_DATA_MISS_TRAP_TYPE	0x38
+#define TRAP_DATA_MISS_TPC		0x40
+#define TRAP_DATA_MISS_TSTATE		0x48
+#define TRAP_DATA_MISS_TL		0x50
+#define TRAP_DATA_OFFSET_COUNT		11
+
+#define SPARC_GLOBALS_MMU		0
+
 #define MMU_TAG_TARGET			0x00
 
 /* Trap types we handle, from TABLE 15-3. */
@@ -98,11 +130,13 @@
 	 *
 	 * The comparison itself is a plain xor because sparc_tsb_insert() stores
 	 * tags in exactly the form the hardware builds its tag target, and the
-	 * kernel runs in context zero.
+	 * kernel runs in context zero. The difference goes to %g6 rather than over
+	 * the top of %g4, so that the slow path can report the tag it really found
+	 * instead of a value that has already been folded against the one wanted.
 	 */
 	brgez,pn %g5, 1f
-	 xor	%g1, %g4, %g4
-	brnz,pn	%g4, 1f
+	 xor	%g1, %g4, %g6
+	brnz,pn	%g6, 1f
 	 nop
 
 	/* Hit. Storing the data half to the Data In register is the atomic TLB
@@ -131,13 +165,27 @@ FUNCTION(sparc_instruction_mmu_miss):
 	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN
 
 
-/*	Placeholder for the TSB miss path.
+/*	The TSB miss path.
  *
- *	Spins deliberately rather than returning. Returning would re-run the access
- *	that faulted, take the same miss, and spin just as hard but without saying
- *	where. A stopped machine at a known address is the more debuggable failure,
- *	and gdb can be attached to it -- which is how the early panic in this port
- *	was found.
+ *	Records the miss into this CPU's trap data block and then stops. It does not
+ *	yet resolve anything: resolving needs an authoritative page table to resolve
+ *	from, and this port does not have one -- Open Firmware is still the only
+ *	record of what is mapped, and calling the firmware from a trap handler at
+ *	TL=1, on no stack, with the trap table no longer the firmware's, is not
+ *	something to attempt.
+ *
+ *	So it gathers evidence instead, which is what the first cutover actually
+ *	needs. Stopping rather than returning is deliberate: returning would re-run
+ *	the access, take the same miss, and spin just as hard while overwriting the
+ *	record of the first one. A stopped machine at a known address with the
+ *	faulting state in memory is the most debuggable failure available here, and
+ *	the counter distinguishes "one address we forgot to map" from "the fast path
+ *	never hits at all".
+ *
+ *	Every store here goes to the trap data block, which lives in the kernel
+ *	image alongside this code. That adds no new locking requirement: the page
+ *	holding these instructions must be locked in the TLB anyway, or the handler
+ *	could not have been fetched.
  *
  *	Deliberately a local symbol. A branch to a .global symbol goes through a
  *	relocation even when the target sits in the same section, because the
@@ -149,7 +197,128 @@ FUNCTION(sparc_instruction_mmu_miss):
  *	lets the assembler resolve the displacement outright.
  */
 sparc_tsb_miss_trap:
-	ba,a	sparc_tsb_miss_trap
+	/* %g7 is this CPU's trap data block, put there by
+	 * sparc_set_trap_globals() before the table was installed.
+	 *
+	 * %g1, %g2, %g4 and %g5 still hold what the fast path was working with: the
+	 * tag target wanted, the TSB pointer the hardware formed, and the tag and
+	 * data found at it. Between the tag target and the pointer the whole
+	 * faulting address can be reconstructed -- the target carries VA<63:22> and
+	 * the pointer carries VA<21:13>, which the target has shifted away.
+	 */
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TAG_TARGET]
+	stx	%g2, [%g7 + TRAP_DATA_MISS_TSB_POINTER]
+	stx	%g4, [%g7 + TRAP_DATA_MISS_TSB_TAG]
+	stx	%g5, [%g7 + TRAP_DATA_MISS_TSB_DATA]
+
+	rdpr	%tt, %g6
+	stx	%g6, [%g7 + TRAP_DATA_MISS_TRAP_TYPE]
+	rdpr	%tpc, %g6
+	stx	%g6, [%g7 + TRAP_DATA_MISS_TPC]
+	rdpr	%tstate, %g6
+	stx	%g6, [%g7 + TRAP_DATA_MISS_TSTATE]
+	rdpr	%tl, %g6
+	stx	%g6, [%g7 + TRAP_DATA_MISS_TL]
+
+	/* Counted last, so a non-zero count means the whole record above it is
+	 * complete rather than half written.
+	 */
+	ldx	[%g7 + TRAP_DATA_MISS_COUNT], %g6
+	add	%g6, 1, %g6
+	stx	%g6, [%g7 + TRAP_DATA_MISS_COUNT]
+
+1:	ba,a	1b
+	 nop
+
+
+/*	Point the trap handlers at their per-CPU data.
+ *
+ *	%g7 has to be set in two banks, because the hardware chooses the bank by
+ *	trap type: the MMU miss traps get the MMU globals, most others get the
+ *	alternate globals (UltraSPARC-IIi manual, section 15.3.2). Selecting a bank
+ *	means writing PSTATE, and the out registers are not part of any global bank,
+ *	so they are what carries the value across the switch.
+ *
+ *	Interrupts come off for the duration. An interrupt taken while a non-normal
+ *	bank is selected would run its handler against these globals and clobber
+ *	them, and the window is only a handful of instructions, so closing it is
+ *	cheaper than reasoning about it.
+ *
+ *	void sparc_set_trap_globals(struct sparc_trap_data *data);
+ */
+FUNCTION(sparc_set_trap_globals):
+	rdpr	%pstate, %o1
+	andn	%o1, PSTATE_IE, %o2
+
+	or	%o2, PSTATE_MG, %o3
+	wrpr	%o3, 0, %pstate
+	mov	%o0, %g7
+
+	/* Straight from the MMU bank to the alternate one: the single write clears
+	 * MG and sets AG together, so no third bank is ever selected.
+	 */
+	or	%o2, PSTATE_AG, %o3
+	wrpr	%o3, 0, %pstate
+	mov	%o0, %g7
+
+	/* Restores the normal bank and the caller's interrupt state at once. */
+	wrpr	%o1, 0, %pstate
+	retl
+	 nop
+
+
+/*	Read %g7 back out of one of the alternate banks, so the write above can be
+ *	checked rather than assumed.
+ *
+ *	uint64 sparc_read_trap_globals(int bank);
+ */
+/*	Report this file's idea of where each trap data field lives, so C++ can check
+ *	it against the structure the fields were declared in.
+ *
+ *	void sparc_trap_data_offsets(uint64 *out);   // TRAP_DATA_OFFSET_COUNT entries
+ */
+FUNCTION(sparc_trap_data_offsets):
+	mov	TRAP_DATA_TSB_BASE, %o1
+	stx	%o1, [%o0 + (0 * 8)]
+	mov	TRAP_DATA_TSB_MASK, %o1
+	stx	%o1, [%o0 + (1 * 8)]
+	mov	TRAP_DATA_MISS_COUNT, %o1
+	stx	%o1, [%o0 + (2 * 8)]
+	mov	TRAP_DATA_MISS_TAG_TARGET, %o1
+	stx	%o1, [%o0 + (3 * 8)]
+	mov	TRAP_DATA_MISS_TSB_POINTER, %o1
+	stx	%o1, [%o0 + (4 * 8)]
+	mov	TRAP_DATA_MISS_TSB_TAG, %o1
+	stx	%o1, [%o0 + (5 * 8)]
+	mov	TRAP_DATA_MISS_TSB_DATA, %o1
+	stx	%o1, [%o0 + (6 * 8)]
+	mov	TRAP_DATA_MISS_TRAP_TYPE, %o1
+	stx	%o1, [%o0 + (7 * 8)]
+	mov	TRAP_DATA_MISS_TPC, %o1
+	stx	%o1, [%o0 + (8 * 8)]
+	mov	TRAP_DATA_MISS_TSTATE, %o1
+	stx	%o1, [%o0 + (9 * 8)]
+	mov	TRAP_DATA_MISS_TL, %o1
+	stx	%o1, [%o0 + (10 * 8)]
+	retl
+	 nop
+
+
+FUNCTION(sparc_read_trap_globals):
+	rdpr	%pstate, %o1
+	andn	%o1, PSTATE_IE, %o2
+
+	cmp	%o0, SPARC_GLOBALS_MMU
+	be,pt	%icc, 1f
+	 or	%o2, PSTATE_AG, %o3
+	ba,pt	%icc, 2f
+	 nop
+1:	or	%o2, PSTATE_MG, %o3
+
+2:	wrpr	%o3, 0, %pstate
+	mov	%g7, %o0
+	wrpr	%o1, 0, %pstate
+	retl
 	 nop
 
 
