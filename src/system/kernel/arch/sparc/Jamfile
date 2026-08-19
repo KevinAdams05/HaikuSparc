@@ -4,6 +4,7 @@ UsePrivateKernelHeaders ;
 
 KernelMergeObject kernel_arch_sparc.o :
 	arch_asm.S
+	arch_traps.S
 	arch_commpage.cpp
 	arch_cpu.cpp
 	arch_debug.cpp

@@ -73,6 +73,24 @@ write_hi30(addr_t P, Elf64_Word value)
 }
 
 
+// Branch displacements, in units of instructions and masked to the width the
+// instruction encodes. Bicc carries 22 bits and BPcc 19; assembly that branches
+// to a global symbol produces these, because the linker has to allow for
+// interposition and cannot resolve them itself.
+static inline void
+write_disp22(addr_t P, Elf64_Word value)
+{
+	*(Elf64_Word*)P |= (value >> 2) & 0x3fffff;
+}
+
+
+static inline void
+write_disp19(addr_t P, Elf64_Word value)
+{
+	*(Elf64_Word*)P |= (value >> 2) & 0x7ffff;
+}
+
+
 static inline void
 write_hi22(addr_t P, Elf64_Word value)
 {
@@ -188,6 +206,16 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 					// which then OR'd a second, unrelated value into the same
 					// instruction word -- corrupting the call displacement. The
 					// kernel image carries 196 of these relocations.
+			}
+			case R_SPARC_WDISP22:
+			{
+				write_disp22(P, S + A - P);
+				break;
+			}
+			case R_SPARC_WDISP19:
+			{
+				write_disp19(P, S + A - P);
+				break;
 			}
 			case R_SPARC_HI22:
 			case R_SPARC_LM22:

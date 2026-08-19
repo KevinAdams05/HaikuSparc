@@ -90,6 +90,18 @@ extern void sparc_get_data_tsb(TsbEntry **_pageTable, size_t *_size)
 
 
 
+#ifndef _BOOT_MODE
+
+/*	Everything below is kernel-only.
+ *
+ *	The Open Firmware boot loader compiles this file too, for the TSB register
+ *	readers above -- see the SEARCH rule in
+ *	src/system/boot/platform/openfirmware/arch/sparc/Jamfile. It has no use for
+ *	the rest, and it is built with -Wstack-usage=1023 because it runs on the
+ *	stack the firmware provides, so the 1.5 KB translation buffers these
+ *	functions need would fail the build outright.
+ */
+
 /*!	Dumps the translations Open Firmware currently has installed.
 
 	These are the mappings the kernel inherits and, crucially, the ones that
@@ -196,6 +208,7 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 
 
 static void sparc_verify_tlb_load(struct kernel_args *args);
+static void sparc_verify_tsb_lookup();
 
 
 /*!	Allocates the kernel TSB and warms it with Open Firmware's translations.
@@ -274,6 +287,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 
 	sparc_verify_tsb_indexing();
 	sparc_verify_tlb_load(args);
+	sparc_verify_tsb_lookup();
 
 	return B_OK;
 }
@@ -436,3 +450,61 @@ sparc_verify_tlb_load(struct kernel_args *args)
 		: [va] "r"((uint64_t)kTestAddress | 0x0)
 		: "memory");
 }
+
+
+/*!	The TLB miss lookup, written in C so the algorithm can be checked apart
+	from the assembly that will eventually run it.
+
+	This is steps 2 and 3 of the refill sequence: take the pointer the hardware
+	formed, read the TSB line it names, compare the tag, and on a hit the data
+	half is what gets stored to the TLB. Getting this wrong in assembly, inside
+	a handler with no stack, is expensive to debug; getting it wrong here costs
+	a printf.
+
+	The tag comparison deserves a note. The hardware's tag target is
+	((tag_access & 0x1fff) << 48) | (tag_access >> 22): context in bits 60:48
+	and VA<63:22> below. Our stored tags additionally carry the Global bit,
+	which the manual describes as duplicated into the tag "to optimize the
+	software miss handler" -- when set, the context is ignored during hit
+	detection. Since every kernel entry here is Global and runs in context
+	zero, masking the Global bit off the stored tag and comparing for equality
+	is both correct and the cheapest form the handler can take.
+*/
+static bool
+sparc_tsb_lookup(addr_t virtualAddress, uint64_t* _data)
+{
+	if (sKernelTsb == NULL)
+		return false;
+
+	uint32 index = (virtualAddress >> 13) & (KERNEL_TSB_ENTRIES - 1);
+	TsbEntry* entry = &sKernelTsb[index];
+
+	if (!entry->IsValid())
+		return false;
+
+	uint64_t target = ((uint64_t)virtualAddress >> 22);
+	if ((entry->fTag & ~TTE_TAG_GLOBAL) != target)
+		return false;
+
+	*_data = entry->fData;
+	return true;
+}
+
+
+/*!	Checks the lookup against translations we know are present. */
+static void
+sparc_verify_tsb_lookup()
+{
+	// 0x80000000 is the kernel image, mapped by the firmware and warmed into
+	// the TSB. 0xffe00000 is one of the firmware's own locked regions.
+	static const addr_t kProbes[] = { 0x80000000, 0xffe00000 };
+
+	for (size_t i = 0; i < sizeof(kProbes) / sizeof(kProbes[0]); i++) {
+		uint64_t data = 0;
+		bool found = sparc_tsb_lookup(kProbes[i], &data);
+		dprintf("sparc_mmu: lookup %#12lx -> %s pa %#12llx\n", kProbes[i],
+			found ? "hit " : "MISS", (unsigned long long)(data & TTE_PA_MASK));
+	}
+}
+
+#endif	// !_BOOT_MODE
