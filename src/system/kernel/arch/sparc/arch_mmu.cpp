@@ -195,6 +195,9 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 }
 
 
+static void sparc_verify_tlb_load(struct kernel_args *args);
+
+
 /*!	Allocates the kernel TSB and warms it with Open Firmware's translations.
 
 	This does not point the hardware at it. The TSB register still refers to
@@ -270,6 +273,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 		sKernelTsbCollisions, inserted - sKernelTsbCollisions);
 
 	sparc_verify_tsb_indexing();
+	sparc_verify_tlb_load(args);
 
 	return B_OK;
 }
@@ -357,4 +361,78 @@ sparc_verify_tsb_indexing()
 			"%" B_PRIu32 " of %" B_PRIuSIZE " probes", mismatches,
 			sizeof(kProbes) / sizeof(kProbes[0]));
 	}
+}
+
+
+/*!	Loads a translation directly into the data TLB.
+
+	The tag comes from the Tag Access register rather than from the store, so
+	it has to be set first; the store to ASI_DTLB_DATA_IN then triggers the
+	atomic write of whichever entry the replacement algorithm picks. See the
+	refill sequence in the IIi manual section 15.3.1, step 3.
+*/
+static void
+sparc_tlb_load(addr_t virtualAddress, phys_addr_t physicalAddress, uint64 flags)
+{
+	uint64_t data = TTE_VALID | ((uint64_t)TTE_SIZE_8K << TTE_SIZE_SHIFT)
+		| (physicalAddress & TTE_PA_MASK) | TTE_GLOBAL | flags;
+
+	asm volatile(
+		"stxa %[tag], [%[tagReg]] 0x58\n\t"
+		"membar #Sync\n\t"
+		"stxa %[data], [%[zero]] 0x5c\n\t"
+		"membar #Sync"
+		:
+		: [tag] "r"((uint64_t)virtualAddress), [data] "r"(data),
+		  [tagReg] "r"(tlb_tag_access), [zero] "r"(0UL)
+		: "memory");
+}
+
+
+/*!	Proves that a TTE this code builds actually maps memory.
+
+	Everything about the fast path so far has been read-only: the index
+	arithmetic was checked against the hardware, but nothing has yet built a
+	translation and used it. That code runs inside the miss handler, in
+	assembly, where a mistake is far harder to see -- so exercise it here
+	first, in C, where it can simply be printed.
+
+	Maps a fresh physical page at an address nothing else uses, writes a
+	pattern through it, and reads it back.
+*/
+static void
+sparc_verify_tlb_load(struct kernel_args *args)
+{
+	// Well clear of everything: the kernel image ends by 0x80222000, early_map
+	// works upward from 0x81000000, and the frame buffer starts at 0xfd000000.
+	const addr_t kTestAddress = 0xa0000000;
+	const uint64_t kPattern = 0x0123456789abcdefULL;
+
+	page_num_t page = vm_allocate_early_physical_page(args);
+	if (page == 0) {
+		dprintf("sparc_mmu: no physical page for the TLB test\n");
+		return;
+	}
+	phys_addr_t physicalAddress = (phys_addr_t)page * B_PAGE_SIZE;
+
+	sparc_tlb_load(kTestAddress, physicalAddress, TTE_WRITABLE | TTE_PRIVILEGED
+		| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL);
+
+	volatile uint64_t* probe = (volatile uint64_t*)kTestAddress;
+	*probe = kPattern;
+	uint64_t read = *probe;
+
+	dprintf("sparc_mmu: TLB load test: va %#lx -> pa %#llx, wrote %#llx read "
+		"%#llx -- %s\n", kTestAddress,
+		(unsigned long long)physicalAddress, (unsigned long long)kPattern,
+		(unsigned long long)read, read == kPattern ? "OK" : "MISMATCH");
+
+	// Leave nothing behind: this address is not part of anyone's address space
+	// and the entry would only be a trap waiting for a later allocation.
+	asm volatile(
+		"stxa %%g0, [%[va]] 0x5f\n\t"
+		"membar #Sync"
+		:
+		: [va] "r"((uint64_t)kTestAddress | 0x0)
+		: "memory");
 }
