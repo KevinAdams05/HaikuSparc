@@ -15,11 +15,20 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-Planning. No code yet.
+**The kernel boots and runs its early initialisation.** On QEMU's `sun4u` machine the loader
+boots from Sun-disklabelled media, mounts a BFS volume, loads and enters the kernel, and the
+kernel brings up the platform, debug output, locking and interrupts before reaching `vm_init`.
 
-The immediate next steps are in [§10 of the plan](sparc-port/PORTING_PLAN.md#10-immediate-next-actions):
-fork Haiku here, stand up the QEMU harness and cross toolchain, and get the loader to print its
-banner over serial.
+Phase 2 — the MMU and trap table, the gate this port has always turned on — is in progress. The
+TSB is allocated and its arithmetic verified against the hardware; the TLB miss fast path, the
+window spill/fill handlers and the unhandled-trap handler are written. None of it is installed
+yet: `%tba` still belongs to Open Firmware.
+
+Fourteen genuine bugs have been found and fixed along the way, several of them
+architecture-neutral and so broken for the PowerPC Open Firmware port too.
+
+The running log is [PROGRESS.md](sparc-port/PROGRESS.md), and the current design work is in
+[PHASE2_MMU_DESIGN.md](sparc-port/PHASE2_MMU_DESIGN.md).
 
 ## Scope
 

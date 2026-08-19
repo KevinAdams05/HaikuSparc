@@ -59,6 +59,38 @@ It exists because the recipe has three requirements that are invisible until the
    OpenBIOS's grubfs cannot read, and the boot fails with a bare `File not found`.
 3. Partition a must **not start at cylinder 0**, or the payload overwrites the disk label.
 
+## `make-bfs-image.sh`
+
+Builds the BFS volume the loader boots from: `system/kernel_sparc`, and optionally a kernel
+settings file.
+
+```sh
+./make-bfs-image.sh --output bfs.img
+./make-bfs-image.sh --output bfs.img --kernel /path/to/kernel_sparc
+./make-bfs-image.sh --output bfs.img --serial-debug     # see the warning below
+```
+
+Needs two host tools built first, and will tell you so if they are missing:
+
+```sh
+cd ../../generated.sparc && jam -q '<build>bfs_shell' '<build>fs_shell_command'
+```
+
+`bfs_shell` is a daemon rather than a command-line tool — it talks to `fs_shell_command` over a
+pair of FIFOs on descriptors 3 and 4 — so this script performs the same handshake
+`build/scripts/build_haiku_image` does, without needing all of userland to compile.
+
+**`--serial-debug` is off by default because it currently breaks the boot.** It writes a settings
+file enabling `serial_debug_output`, which should send the kernel's early output to serial instead
+of the frame buffer. Merely having the file present makes the *loader* die first, with
+`mem_address_not_aligned` on a `call %g1` in `of_finddevice` — `gCallOpenFirmware` itself is
+corrupt, so reading driver settings damages loader state. See PROGRESS.md §15. The working route
+to serial output is the boot menu, via `serial-driver.py --script boot-kernel-debug`.
+
+Endianness is not a problem here, though it looks like it should be: the host tool writes a
+little-endian volume, Haiku's BFS is built `BFS_LITTLE_ENDIAN_ONLY`, and the big-endian SPARC
+loader byte-swaps on read.
+
 ## `make-sun-image.py`
 
 Builds and inspects Sun disk labels; `make-boot-disk.sh` uses it. The label is a fixed 512-byte

@@ -2,7 +2,9 @@
 
 **Repository:** [KevinAdams05/HaikuSparc](https://github.com/KevinAdams05/HaikuSparc)
 **Targets:** Sun Blade 150 and Sun Ultra 10 (`sun4u`, UltraSPARC IIe / IIi), developed against QEMU `sun4u`
-**Status of this document:** initial plan, August 2026. Supersedes the earlier scratch notes in the parent directory.
+**Status of this document:** the plan. Revised as findings change it; the running state of the
+work is in [PROGRESS.md](PROGRESS.md), not here. Supersedes the scratch notes in the parent
+directory.
 
 **Companion documents:** [Hardware support matrix](HARDWARE_MATRIX.md) ·
 [Phase 2 MMU design](PHASE2_MMU_DESIGN.md) · [Progress log](PROGRESS.md)
@@ -26,7 +28,11 @@ stale.
 
 ---
 
-## 2. Where the port actually stands
+## 2. Where the port stood at the start
+
+**This section is the baseline, not the current state** — it describes the tree as inherited, so
+that later progress has something to be measured against. For where things stand now see
+[PROGRESS.md](PROGRESS.md).
 
 ![The SPARC boot chain and where Haiku currently stops](diagrams/boot-chain.svg)
 
@@ -38,8 +44,9 @@ Open Firmware MMU node, installs OF callbacks, reads the kernel ELF off BFS, pop
 `kernel_args` with both the physical memory ranges and the framebuffer geometry, and hands
 control to `arch_start_kernel`, which applies the SPARC V9 2047-byte stack bias and jumps.
 
-The OF serial console works. `arch_mmu.cpp` already carries a correct transcription of the
-UltraSPARC MMU ASI and register map, and can read the TSB that Open Firmware set up.
+The OF serial console works. `arch_mmu.cpp` already carries a transcription of the UltraSPARC MMU
+ASI and register map, and can read the TSB that Open Firmware set up — though not correctly: it
+masked `TSB_Size` with 3 where the field is four bits wide, which we later fixed.
 
 ### What does not
 
@@ -49,7 +56,7 @@ empty bodies:
 | File | State |
 | --- | --- |
 | `arch_int.cpp` | Every init returns `B_OK`. No trap table, no dispatch, IRQ enable/disable are empty. |
-| `arch_vm_translation_map.cpp` | Prints the memory ranges, returns a null map. `early_map` is a no-op. |
+| `arch_vm_translation_map.cpp` | Prints the memory ranges, returns a null map. `early_map` is a no-op. *(`early_map` now implemented — PROGRESS.md §18.)* |
 | `arch_thread.cpp` | `arch_thread_context_switch()` is an empty body. `arch_thread_init_kthread_stack()` calls `panic()`, and the commented-out body beneath it is stale m68k/PPC copy-paste. |
 | `arch_timer.cpp` | Nothing programmed; `system_time()` returns 0. |
 | `arch_asm.S` | 34 lines. User memcpy/memset/strlcpy are `retl; nop`. No context switch. |
@@ -113,7 +120,7 @@ about hardware behaviour, the vendor datasheet decides.
 
 Every file containing ported code carries the original copyright block intact, plus our own
 header in Haiku's two-line MIT form under `Kevin Adams <kevinadams05@gmail.com>`. A
-`docs/THIRD_PARTY.md` ledger records what came from where — written as we go, because
+[`THIRD_PARTY.md`](THIRD_PARTY.md) ledger records what came from where — written as we go, because
 reconstructing provenance later is miserable.
 
 ### 3.3 Target hardware
@@ -374,7 +381,7 @@ Each phase below states what it delivers, which files it touches, and a **falsif
 criterion**. A phase is not done because the code is written; it is done because the criterion
 is demonstrated over a serial log.
 
-### Phase 0 — Environment and a building toolchain  **[SUBSTANTIALLY DONE]**
+### Phase 0 — Environment and a building toolchain  **[DONE]**
 
 Fork Haiku. Build the cross toolchain and the loader. Write the launch-and-capture script. Prove
 the gdb stub attaches.
@@ -400,9 +407,10 @@ first — see [UPSTREAM_DELTA.md](UPSTREAM_DELTA.md). Three are architecture-neu
 Open Firmware loader is bit-rotted for PowerPC too, not merely for us. Worth knowing before
 trusting any other "this part already works" claim about this port.
 
-**Remaining:** prove `gdb-multiarch` attaches to the QEMU stub and breaks somewhere useful.
+gdb works too, with caveats worth knowing before relying on it — breakpoints on kernel
+addresses never fire, and `-d int,mmu` tracing is the instrument that does. See PROGRESS.md §14.
 
-### Phase 1 — Bootable media
+### Phase 1 — Bootable media  **[DONE]**
 
 Generate a Sun-disklabelled disk image containing the loader and kernel, and stand up a netboot
 path. Netboot is worth doing even though it seems like the harder option: it is the fastest
@@ -426,7 +434,7 @@ So the open question for this phase is narrow and concrete: what exactly does Op
 OpenBIOS, require of this a.out image and of the media around it. That is a far better starting
 position than "produce bootable media somehow."
 
-### Phase 2 — MMU and trap table ★ THE GATE
+### Phase 2 — MMU and trap table ★ THE GATE  **[IN PROGRESS]**
 
 The one phase that ships as a single unit. Install a `%tba`-aligned trap table. Write window
 spill and fill handlers and set the window state registers. Define a real `struct iframe`.

@@ -5,12 +5,30 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0 and 1 complete. The kernel is being entered — we are now at the Phase 2 gate.**
+**State: Phases 0 and 1 complete. Phase 2 in progress — every piece written, none installed yet.**
 
-The loader boots from Sun-disklabelled media, mounts a BFS volume, loads `kernel_sparc`, sets a
-video mode, and jumps into the kernel. The kernel then runs as far as `create_debug_alloc_pool`
-and takes a `data_access_exception`, which is precisely what a kernel with no trap table and no
-TLB-miss handling should do. See §13.
+The loader boots from Sun-disklabelled media, mounts a BFS volume, loads `kernel_sparc`, and
+jumps in. The kernel initialises the platform, debug output, locking and interrupts, reaches
+`vm_init`, and dies in `vm_page_init` accessing `0x82000000` — an address `early_map` handed out
+and OpenBIOS silently declined to map. **Our TSB already holds that entry**, so the cutover is
+the fix for the fault in front of us (§18, §19).
+
+Phase 2 so far:
+
+| | |
+| --- | --- |
+| TSB allocated and warmed | 256 KB split pair, 3657 live entries, load factor 0.45 (§19) |
+| Index arithmetic | **verified against the hardware**, four probes (§19) |
+| TTE construction and TLB load | **verified** — a page mapped, written, read back (§19) |
+| Lookup algorithm | **verified** in C against known translations (§19) |
+| TLB miss fast path | written, 10 instructions, assembles correctly |
+| Window spill / fill / clean | written, all fit the 128-byte slots |
+| Unhandled-trap handler | written, fault-proof by construction ([design §4.3](PHASE2_MMU_DESIGN.md)) |
+| **The trap table itself** | **not built** |
+| **The cutover** | **not done** — `%tba` and the TSB registers untouched |
+
+Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
+sizing, the table layout and the QEMU-fidelity verification are all there.
 
 ---
 
@@ -47,14 +65,24 @@ cd SPARC/src/generated.sparc && $JAM -q -j24 haiku_loader.openfirmware
 
 ## 2. Fixes made so far
 
-| # | Where | What | Committed? |
-| :-: | --- | --- | --- |
-| 1–4 | `openfirmware/{devices,network,video}.cpp`, `loader/menu.cpp` | Four `-Werror` failures that stopped the loader compiling at all | `b4845b6002` |
-| 5 | `openfirmware/arch/sparc/mmu.cpp` | **PowerPC page-protection constants passed to a sun4u MMU** — see §3 | no |
-| 6 | `openfirmware/devices.cpp` | Boot device opened by a path naming a *file*, not the device — see §6 | no |
+Everything below is committed and pushed. The bugs found so far, in the order they were hit:
 
-Three of the first four are architecture-neutral, so the Open Firmware loader is bit-rotted for
-PowerPC too. Haiku's own guide claims the loader runs. Discount similar claims about this port.
+| # | Where | What |
+| :-: | --- | --- |
+| 1–4 | `openfirmware/{devices,network,video}.cpp`, `loader/menu.cpp` | Four `-Werror` failures that stopped the loader compiling at all |
+| 5 | `openfirmware/arch/sparc/mmu.cpp` | **PowerPC page-protection constants passed to a sun4u MMU** — §3 |
+| 6 | `openfirmware/devices.cpp` | Boot device opened by a path naming a *file*, not the device — §6 |
+| 7 | `openfirmware/devices.cpp` | **A 64-bit Open Firmware handle truncated to `int`** — §7a |
+| 8 | `openfirmware/arch/sparc/start.cpp` | The FPU was never enabled — §7a |
+| 9 | `kernel/arch/sparc/arch_elf.cpp` | `R_SPARC_WDISP30` fell through into `HI22`, corrupting 196 call sites — §13 |
+| 10 | `kernel/arch/sparc/arch_elf.cpp` | **`R_SPARC_RELATIVE` written 32 bits wide**, so every GOT entry held its address shifted left by 32 — §15 |
+| 11 | `openfirmware/arch/sparc/arch_start_kernel.S` | The kernel was entered with interrupts enabled, failing its first assertion — §16 |
+| 12 | `openfirmware/console.cpp` | Three-byte console reads the firmware rejects, 570k warnings and unreliable input per boot — §16 |
+| 13 | `kernel/arch/sparc/arch_platform.cpp` | **Kernel debug output silently discarded** whenever a frame buffer existed — §17 |
+| 14 | `kernel/arch/sparc/arch_elf.cpp` | `WDISP22`/`WDISP19` unimplemented, so a kernel containing either would not load — §19 |
+
+Several are architecture-neutral, so the Open Firmware loader is bit-rotted for PowerPC too.
+Haiku's own guide claims the loader runs. Discount similar claims about this port.
 
 `-Wstack-usage=1023` applies to the `openfirmware` boot target and **no other**
 (`build/jam/ArchitectureRules:554`), because this loader runs on the firmware's small stack. So
@@ -953,7 +981,7 @@ loader compiles that file too — for the TSB register readers — and is built 
 
 ---
 
-## 12. Next steps
+## 20. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
 gate described in the plan's §4.1 and §4.2.
