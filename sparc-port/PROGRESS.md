@@ -873,6 +873,86 @@ is worth checking on hardware.
 
 ---
 
+## 19. Phase 2: the fast path, verified piece by piece
+
+The strategy here was to prove every mechanical step from C, where a mistake costs a `printf`,
+before writing any of it in assembly, where a mistake costs a silent hang with no stack and no
+debugger. All four steps are now verified on the machine.
+
+| Step | How it was proved |
+| --- | --- |
+| **TSB allocation** | 256 KB split pair at `0x80240000`, aligned to its own size |
+| **Index arithmetic** | Programmed the TSB register, set Tag Access, read back `ASI_DMMU_TSB_8KB_PTR`, compared against our own index — **four probes, all match**, and all match values worked out by hand beforehand |
+| **TTE construction and TLB load** | Mapped a fresh page at `0xa0000000`, wrote a pattern through it, read it back — **OK** — then demapped it |
+| **Lookup algorithm** | `0x80000000 → pa 0xa0c000` and `0xffe00000 → pa 0x1ff00000`, both matching the firmware's own translations |
+
+```
+sparc_mmu: TSB at 0x80240000, 8192 entries per half, 256 KB total
+sparc_mmu: warmed with 3963 firmware pages, 306 collisions (3657 distinct entries live)
+sparc_mmu: firmware TSB registers: D 0x0000000000000000 (unused, so free to program)
+sparc_mmu: index arithmetic agrees with the hardware
+sparc_mmu: TLB load test: va 0xa0000000 -> pa 0xc70000, wrote 0x123456789abcdef read 0x123456789abcdef -- OK
+sparc_mmu: lookup   0x80000000 -> hit  pa     0xa0c000
+sparc_mmu: lookup   0xffe00000 -> hit  pa   0x1ff00000
+```
+
+### The handler
+
+`arch_traps.S` now carries both MMU miss handlers, twelve instructions each, assembled and
+disassembly-checked but **not installed** — `%tba` is untouched:
+
+```
+ldxa  [%g0] #ASI_DMMU_TSB_8KB_PTR, %g1    ! pointer the hardware formed
+clr   %g2 ; ldxa [%g2] #ASI_DMMU, %g2     ! tag target
+ldx   [%g1], %g4 ; ldx [%g1 + 8], %g5     ! the TSB line
+xor   %g4, %g2, %g4                        ! compare
+sllx  %g4, 1, %g4                          ! discard the Global bit
+brnz,pn %g4, miss
+stxa  %g5, [%g0] #ASI_DTLB_DATA_IN         ! atomic TLB write
+membar #Sync
+retry                                       ! re-run the faulting access
+```
+
+### The current fault is what the trap table will fix
+
+The kernel still dies in `vm_page_init`, and the trap trace shows it accessing **`0x82000000`** —
+an address `early_map` handed out. That is the OpenBIOS heap exhaustion from §18: the firmware
+silently declined the mapping. **Our TSB has that entry**, because `early_map` records into it
+regardless of what the firmware does. So the cutover is not merely the next step, it is the fix
+for the fault we are looking at.
+
+### Two bugs found while making the assembly build
+
+**The miss branch became a branch to itself.** `FUNCTION()` makes a symbol global; a branch to a
+global symbol goes through a relocation even within one section, because the linker must allow
+for interposition; and the kernel is linked as a shared object, so `ld` left an
+`R_SPARC_WDISP22` for load time with a displacement of zero. The miss path would have spun in
+place with nothing to say why. Fixed by making the target local. **Worth remembering for every
+handler added from here: keep internal branch targets local.**
+
+**`arch_elf.cpp` handled neither `WDISP22` nor `WDISP19`**, so a kernel containing either would
+have refused to load. Both are now implemented.
+
+Also: the kernel-only parts of `arch_mmu.cpp` are now behind `!_BOOT_MODE`, because the boot
+loader compiles that file too — for the TSB register readers — and is built with
+`-Wstack-usage=1023`, which the 1.5 KB translation buffers failed outright.
+
+### What remains before the cutover
+
+1. **Window spill and fill handlers.** The big piece, and unavoidable: the traces show ~10,000
+   spills and ~10,000 fills per boot, all currently serviced by the firmware. Port from OpenBSD's
+   `locore.s`.
+2. **The 32 KB table itself**, with entries for every trap type, both `TL = 0` and `TL > 0`
+   halves.
+3. **A slow path** for TSB misses, resolving from the authoritative translation map. The 306
+   collisions above are exactly the cases that will need it.
+4. **Lock the handler and the TSB in the TLB** before installing, per §2.6 — this is the
+   requirement QEMU will forgive and hardware will not.
+5. **The cutover**: `%tba` and the TSB register together. The firmware's locked entries survive,
+   which keeps its own code mapped, so this can be staged rather than atomic.
+
+---
+
 ## 12. Next steps
 
 Phases 0 and 1 are done and the kernel is being entered. **Everything from here is Phase 2**, the
@@ -889,16 +969,14 @@ gate described in the plan's §4.1 and §4.2.
    VM initialisation.
 5. ~~Phase 2, starting with `early_map`~~ — **implemented via Open Firmware, see §18.** It works
    and moves the kernel to `vm_page_init`, but OpenBIOS's heap gives out after ~1300 mappings.
-6. **Allocate and populate a kernel-owned TSB.** §18 settles that this must come first rather
-   than after the trap table: `early_map` cannot keep delegating to firmware. Once the TSB
-   exists, `early_map` becomes a few stores into it.
-   The mechanism, the sizing, and the QEMU-fidelity verification are all worked out in
-   [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) — read that first.
-7. **Then the trap table and the TLB-miss fast path**, to service misses against our own TSB,
-   plus window spill/fill and a real `struct iframe`. Port closely from OpenBSD's `pmap.c` and
-   `locore.s` rather than inventing. Open Firmware's own mappings must survive the cutover:
-   they are servicing every trap the kernel currently takes, so the machine loses its trap
-   handlers the moment `%tba` changes without them being carried across.
+6. ~~Allocate and populate a kernel-owned TSB~~ — **done, and the whole fast path is verified
+   step by step against the machine. See §19.**
+7. **Window spill and fill handlers**, ported from OpenBSD's `locore.s`. The one genuinely large
+   remaining piece, and unavoidable: ~10,000 spills and ~10,000 fills per boot, all currently
+   serviced by the firmware.
+8. **The 32 KB trap table**, both halves, and a slow path for TSB misses.
+9. **Lock the handler and the TSB in the TLB**, then cut over `%tba` and the TSB register. §2.6
+   of the design note is the requirement QEMU forgives and hardware does not.
 6. **Chase the settings-file corruption** (§15): with a driver settings file present, the loader
    dies with `gCallOpenFirmware` corrupt. Shared with PowerPC, so likely upstreamable.
 3. **Start the KDL backtrace early**, per the plan's Phase 5 note — a window-state bug corrupts
