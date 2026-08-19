@@ -28,6 +28,8 @@ commits.
 | `.../openfirmware/console.cpp` | `3c864d9f` | **Console reads asked the firmware for three bytes at a time.** Open Firmware's `read` returns what it has, and OpenBIOS rejects a multi-byte request outright — logging `pc_serial_read: bad len` *to the console*, so every key poll produced a warning that then had to be read back as input. 570,000 of them and a 26 MB log per boot, plus unreliable input. Now reads one byte at a time, reassembling the `ESC [ X` cursor sequences across calls. | **Yes** — one-byte reads are what every implementation supports, and PowerPC has the same bug. |
 | `.../openfirmware/devices.cpp` | `9e61df30` | **`int handle = of_open(...)` truncated a 64-bit Open Firmware handle.** `of_open` returns `intptr_t`; storing it in `int` dropped the high half, and the value then sign-extended back into a non-handle. The firmware dereferenced it and took a data access exception *inside itself*, which is why this presented as a broken `seek`. Harmless on 32-bit PowerPC where `int` and `intptr_t` coincide. | **Yes** — textbook 32-to-64-bit porting bug. |
 | `.../openfirmware/arch/sparc/start.cpp` | `9e61df30` | **The FPU was never enabled.** SPARC V9 gates floating point behind PSTATE.PEF (bit 4) and FPRS.FEF (bit 2), and Open Firmware does not set them for a client program; any FP instruction traps `fp_disabled`. The loader does use floating point — the menu formats partition sizes with `%f`, and GCC emits FP register loads to move small structures. Enabled in `_start` before the constructors run. | Not directly — SPARC-only file, so effectively Class A. |
+| `src/system/boot/platform/openfirmware/start.cpp` | `8cff17f` | **The kernel_args range arrays were never sorted.** The kernel's early allocators require ascending order and do not check -- `allocate_early_virtual()` looks for a gap between `range[i-1]` and `range[i]`, `vm_allocate_early_physical_page()` checks the next page does not run into `range[i+1]`. `insert_address_range()` appends a non-touching range wherever there is room, so the order is arbitrary. Every other platform sorts before handing over; openfirmware was the exception. Unsorted, the kernel handed out early virtual addresses straight through memory the loader had already allocated. | **Yes** — and PowerPC has been carrying it too. |
+| `headers/private/kernel/boot/elf.h` | `769c8d3` | **`preloaded_image` was 62 bytes**, so every derived image's `elf_header` sat six bytes off alignment. `Elf64_Ehdr` is not packed, so the compiler emits full-width loads for its members, and reading `e_phoff` became a 64-bit load from an address ending in 6. Harmless on x86 and PowerPC; `mem_address_not_aligned` on SPARC. Two bytes of padding. | **Yes** — required by any strict-alignment target, and the change is deterministic for both widths. |
 
 ### Why the loader-build fixes exist
 
@@ -43,7 +45,10 @@ limit for SPARC, even though SPARC's mandatory 176-byte register-window save are
 every frame inherently larger.
 
 **Follow-up:** `menu.cpp` is cross-architecture and has not yet been compile-tested on x86_64.
-Do that before the first upstream submission.
+Do that before the first upstream submission. The same applies to the
+`headers/private/kernel/boot/elf.h` padding, which changes a structure every architecture uses --
+deterministically, and loader and kernel are always built together, but it wants a build of each
+before it is offered upstream.
 
 ## Decisions that keep this list short
 

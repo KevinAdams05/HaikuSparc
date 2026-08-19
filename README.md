@@ -15,24 +15,26 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel services its own TLB misses and window traps.** Phase 2 — the MMU and trap table,
-the gate this port has always turned on — is complete.
+**The kernel runs its own MMU, page table and VM, and reaches the scheduler.** Phase 2 — the MMU
+and trap table, the gate this port has always turned on — is complete.
 
-On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume, and
+On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
 enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
-the MMU and the trap table over from Open Firmware, then runs through `vm_page_init`, brings up
-the slab allocator and reaches `vm_translation_map_init_post_area`.
+the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
+`vm_page_init` and the slab allocator, creates its areas, and initialises the ELF loader, the
+commpage and the scheduler. It stops on `arch_thread_init_kthread_stack()` being an unimplemented
+stub — which is Phase 3, not a defect.
 
 All three of Phase 2's exit criteria are met by deliberate tests rather than by inference: it maps
 a page it allocated itself with the firmware no longer involved, it survives a TLB miss provoked
 by demapping a translation that exists only in its own TSB, and it survives a 24-frame recursion
 against 8 register windows with the values arriving back intact.
 
-Next is a real `VMTranslationMap`. The authoritative page table it needs is the same structure the
-TSB miss slow path must resolve from, so the two land together.
+Next is Phase 3, threading. The register-window machinery Phase 2 built is what makes it writable.
 
-Fourteen genuine bugs have been found and fixed along the way, several of them
-architecture-neutral and so broken for the PowerPC Open Firmware port too.
+Twenty genuine bugs have been found and fixed along the way, several of them
+architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,
+`PAGE_SHIFT`, that had been quietly corrupting physical memory for as long as the port existed.
 
 The running log is [PROGRESS.md](sparc-port/PROGRESS.md), and the current design work is in
 [PHASE2_MMU_DESIGN.md](sparc-port/PHASE2_MMU_DESIGN.md).

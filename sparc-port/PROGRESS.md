@@ -5,20 +5,21 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0, 1 and 2 complete. The kernel services its own TLB misses and window traps.**
+**State: Phases 0, 1 and 2 complete. The kernel runs its own MMU, page table and VM, and reaches
+the scheduler.**
 
-The loader boots from Sun-disklabelled media, mounts a BFS volume, loads `kernel_sparc`, and
-jumps in. The kernel initialises the platform, debug output, locking and interrupts, takes the
-MMU and the trap table over from Open Firmware, then runs through `vm_page_init`, brings up the
-slab allocator, reserves the boot loader ranges and reaches
-`vm_translation_map_init_post_area` — where it stops on an ordinary Haiku porting bug rather
-than a trap (§21).
+The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The
+kernel brings up the platform, debug output, locking and interrupts, takes the MMU and trap table
+over from Open Firmware, builds its own three-level page table, runs `vm_page_init` and the slab
+allocator, creates its areas, initialises the ELF loader, the commpage and the scheduler — and
+stops on `arch_thread_init_kthread_stack()` being an unimplemented stub, which is Phase 3 work
+rather than a defect.
 
 **Phase 2's three exit criteria are met, each by a deliberate test rather than by inference:**
 
 | | |
 | --- | --- |
-| Maps a page it allocated itself | after the cutover `early_map` writes only the TSB; the firmware is not called (§21) |
+| Maps a page it allocated itself | after the cutover `early_map` writes only the page table and TSB; the firmware is not called (§21) |
 | Survives a provoked TLB miss | page written, translation demapped, read back correctly — no route but the fast path (§21) |
 | Survives a forced window overflow | 24 frames against 8 windows, sum exact, so the stack bias is right too (§21) |
 
@@ -26,21 +27,19 @@ Phase 2 as built:
 
 | | |
 | --- | --- |
-| TSB | 256 KB split pair, 3657 live entries, load factor 0.45 (§19) |
-| Index arithmetic | **verified against the hardware**, four probes (§19) |
-| TTE construction and TLB load | **verified** — a page mapped, written, read back (§19) |
-| Tag target | **verified against the hardware** — both contexts zero, four probes match (§21) |
-| TLB miss fast path | 10 instructions, servicing every miss since the cutover |
+| Page table | three levels, 1024 entries each, physical interior pointers, TTE leaves (§22) |
+| TSB | 256 KB split pair, a cache in front of the page table |
+| Index arithmetic and tag target | both **verified against the hardware** (§19, §21) |
+| TLB miss fast path | 10 instructions; slow path walks the page table in about 20 more (§22) |
 | Window spill / fill / clean | in the 128-byte slots, servicing every spill since the cutover |
-| Trap table | 32 KB, geometry asserted by `.org` at build time and re-checked every boot (§20) |
-| Trap data block | reachable from any handler through `%g7` in both alternate banks (§20) |
-| Locking | 10 TLB entries: 4 for the TSB as 64 KB pages, 6 for the trap path (§21) |
-| **The cutover** | **done** — TSB registers then `%tba`, interrupts off (§21) |
+| Trap table | 32 KB, geometry asserted at build time and re-checked every boot (§20) |
+| Locking | 10 TLB entries, and the locked ranges are now protected from demap (§22) |
+| Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
+| `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 
-**Next: a real `VMTranslationMap` for SPARC.** `arch_vm_translation_map_create_map()` returns
-`B_OK` without ever setting `*_map`, so the kernel address space has no translation map at all
-and `B_ALREADY_WIRED`'s `map->Query()` cannot work. The authoritative page table that needs is
-the same structure the TSB slow path must resolve from, so the two land together.
+**Next: Phase 3, threading.** `arch_thread_init_kthread_stack()` and the rest of
+`arch_thread.cpp` are stubs. The register-window machinery Phase 2 built is what makes them
+writable.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1153,3 +1152,124 @@ confirms the stack bias.
   output; reading it means attaching gdb and looking at the trap data block, whose address is
   printed at boot. A trampoline that returns to TL=0 and panics with the recorded address would be
   better, and the address for it can live in the still-unused MMU-global `%g3`.
+
+
+## 22. The page table, and five bugs that were not the page table
+
+Phase 2 left the TSB as the only translation structure, and it was never going to be enough on its
+own: it is direct-mapped on VA<25:13>, so any two live regions more than 64 MB apart index to the
+same lines and one of them silently loses. Warming it from the firmware's translations alone
+produced 554 collisions. Something has to be able to answer for every address.
+
+### What was built
+
+**A three-level page table**, each level one page of 1024 eight-byte entries, ten bits of virtual
+address each, covering VA<42:13> — which is the whole usable space, since sun4u implements a
+44-bit address with a hole and VA<63:43> must be all ones or all zeroes. The geometry is
+OpenBSD's, deliberately: its miss handler faces the same constraint, so matching the layout makes
+the walk a known quantity.
+
+Two properties make it work at all. Interior entries hold **physical** addresses, read through
+`ASI_PHYS_USE_EC`, so no level needs a TLB entry and the walk cannot fault — which is what lets it
+run from a trap handler on no stack, and lets the table itself live in ordinary unlocked memory.
+Leaf entries are **TTE data halves**, so what comes out of the table is exactly what goes into the
+TLB, and the slow path ends in the same three instructions as the fast path.
+
+**`SPARCVMTranslationMap`**, wired into `arch_vm_translation_map_create_map()`, maintaining table,
+then TSB, then TLB in that order. **The assembly slow path**, about twenty instructions. And
+**failure reporting**: both the unresolved-miss path and the unhandled-trap handler now record
+what happened, overwrite `%tnpc` and execute `done`, returning to TL=0 on the interrupted stack
+where `panic()` can be called.
+
+That last piece paid for itself immediately and repeatedly. Every previous version of these
+handlers spun at a named symbol, which made a null function pointer indistinguishable from a hang.
+
+### Five bugs, none of them in the page table
+
+Each was silent, each surfaced far from its cause, and each is recorded because the *shape* of the
+failure is the reusable part.
+
+**The kernel address space was x86_64's.** `arch_kernel.h` had `KERNEL_BASE 0xffffff0000000000`
+and a 512 GB size, copied verbatim, while the kernel is loaded at `0x80000000` and has never been
+anywhere near that address. `IS_KERNEL_ADDRESS` therefore rejected every address the kernel
+actually uses, `reserve_boot_loader_ranges()` skipped all of them including the kernel image's own
+37 MB, and the first attempt to create an area for already-mapped memory failed with
+`B_BAD_VALUE`. The correct bounds follow from `-mcmodel=medlow`, which requires the kernel inside
+the low 32 bits: the upper 2 GB of the low 4 GB, the same shape as 32-bit x86.
+
+**The loader allocated outside the kernel address space.** The block that based anonymous
+allocations at `KERNEL_BASE` has been `#if 0`'d upstream, and the comment above it describes
+exactly what that costs. Re-enabled — but not at `KERNEL_BASE` itself, since the heap is allocated
+before the kernel is loaded and would take its address. The first attempt used a round 256 MB
+above the kernel image and produced a *worse* failure than the original: 256 MB is a multiple of
+the TSB's 64 MB indexing span, so those allocations aliased the kernel image line for line and
+evicted it entirely as the TSB was warmed. Eight megabytes, inside the same window, keeps them
+apart.
+
+**The range arrays were never sorted.** The kernel's early allocators require ascending order and
+do not check. Every other platform sorts before handing over; openfirmware was the exception, so
+Open Firmware's own regions — recorded first, at the top of the address space — left the kernel
+image's range last in the array, and `allocate_early_virtual()` took its "gap after the last
+range" path and handed out addresses straight through the loader's heap.
+
+**`PAGE_SHIFT` was 12 while `PAGESIZE` was 8192.** sparc64 was the only architecture where the two
+disagreed, and the kernel uses them interchangeably. `vm_page.cpp` clears a freshly allocated page
+with `vm_memset_physical(page->physical_page_number << PAGE_SHIFT, ...)`, so every clear landed at
+half the page's real address, wiping 8 KB somewhere in the bottom half of physical memory — where
+the boot loader's data lives. It surfaced as the kernel image structure reading back as zeroes.
+
+Finding it is the part worth keeping: bracket the corruption with probes until the window is one
+function wide, then guard the physical write paths and let one of them catch its own caller. The
+giveaway was the address in that report, `0x9ff000` — not a multiple of 8192, so not a physical
+page address that can exist.
+
+**`preloaded_image` was 62 bytes.** It is packed so 32- and 64-bit builds agree, but the
+sub-structures the derived images add are not, so the compiler emits full-width loads for
+`Elf64_Ehdr`'s members. Six bytes off alignment made `verify_eheader()`'s read of `e_phoff` a
+64-bit load from an address ending in 6 — absorbed by x86 and PowerPC, `mem_address_not_aligned`
+on SPARC. Two bytes of padding.
+
+### And one that was ours
+
+**"Locked" does not mean what it sounds like.** The Lock bit exempts a TLB entry from the
+*replacement* algorithm; it does nothing about an explicit demap. The trap table lives inside the
+kernel image, so creating the areas for the preloaded image reached `sparc_tlb_demap()` with an
+address in the middle of it and took the locked entry away. The next instruction fetch of the miss
+handler then missed, and the handler needed to service that miss was the code that could not be
+fetched.
+
+QEMU reported it precisely: `Trap 0x0064 while trap level (5) >= MAXTL (5), Error state`, with the
+trace showing every level vectoring to `0x801c4c80` — the table's own TL>0 entry for an
+instruction miss — and immediately missing again. **This is the nested-trap death
+[design note §2.8](PHASE2_MMU_DESIGN.md) describes, observed for the first time**, and it took
+QEMU modelling MAXTL faithfully to be legible at all.
+
+The fix records the ranges whose mappings are permanent as they are locked, and has both
+`sparc_tlb_demap()` and `sparc_tsb_invalidate()` decline addresses inside them. Declining loses
+nothing, because those mappings never change.
+
+### A constraint worth remembering
+
+**The kernel does not run global constructors.** There is a `.ctors` section with relocations
+against it and nothing that walks it. For a plain struct that costs nothing, but a class with
+virtual methods gets a null vtable pointer, and the first virtual call jumps to zero.
+
+The physical page mapper was a static object, and `vm_page_allocate_page()` asking for a cleared
+page reached `vm_memset_physical()`, which loaded the vtable, loaded the method at offset 0x40 and
+called zero — reported as an illegal instruction at `pc 0x4`. This is why x86's paging code
+constructs its mapper with placement new into a buffer, and why this one now does too.
+
+### Still owed
+
+- **Modified tracking.** Doing it properly means mapping writable pages read-only and catching the
+  first write with a `fast_data_access_protection` handler, and there is no such handler yet. So W
+  and MODIFIED are set up front: the VM sees every writable page as dirty, which costs writebacks
+  that were not needed and never the reverse. `TTE_SOFT_REAL_WRITABLE` is already recorded, so the
+  change is to stop setting two bits.
+- **`GetPage()`** returns `B_NOT_SUPPORTED`. Handing back a usable virtual address for an arbitrary
+  physical page needs either a physical map over all of RAM or the generic slot-pool mapper. An
+  error rather than a plausible wrong address, which would corrupt memory quietly.
+- **User page table teardown** panics rather than leaking, since nothing creates one yet.
+- **Execute permission is recorded but not enforced.** sun4u has no per-page execute bit; a page is
+  executable exactly when it has an I-TLB entry, so enforcement means deciding which TLB to refill
+  from the trap type. The soft bit is there for that decision to consult.
