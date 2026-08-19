@@ -9,6 +9,7 @@
 #include <stddef.h>
 
 #include <arch_cpu.h>
+#include <arch_vm_translation_map.h>
 #include <debug.h>
 #include <platform/openfirmware/openfirmware.h>
 #include <vm/vm.h>
@@ -326,10 +327,19 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 		// each into individual entries.
 		for (addr_t offset = 0; offset < (addr_t)map->length;
 				offset += B_PAGE_SIZE) {
-			sparc_tsb_insert(va + offset, pa + offset,
-				data & (TTE_WRITABLE | TTE_PRIVILEGED | TTE_LOCKED
-					| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL
-					| TTE_SIDE_EFFECT));
+			uint64 flags = data & (TTE_WRITABLE | TTE_PRIVILEGED | TTE_LOCKED
+				| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL
+				| TTE_SIDE_EFFECT);
+
+			// The page table as well as the TSB, and this is not optional. The
+			// TSB is direct-mapped on VA<25:13>, so two regions more than 64 MB
+			// apart index to the same lines and the later one silently wins --
+			// the loader's own allocations alias the kernel image exactly. Only
+			// the page table can answer for whichever of them lost.
+			sparc_page_table_early_map(args, va + offset, pa + offset,
+				flags | TTE_SOFT_ACCESSED | TTE_SOFT_MODIFIED
+					| TTE_SOFT_REAL_WRITABLE | TTE_GLOBAL);
+			sparc_tsb_insert(va + offset, pa + offset, flags);
 			inserted++;
 		}
 	}
@@ -565,8 +575,6 @@ sparc_verify_tsb_lookup()
 	}
 }
 
-#endif	// !_BOOT_MODE
-
 
 /*!	Checks the trap table's geometry before anything relies on it.
 
@@ -672,6 +680,51 @@ sparc_verify_trap_table()
 static sparc_trap_data sTrapData __attribute__((aligned(TRAP_DATA_SIZE)));
 
 
+/*!	Reports a trap the kernel could not handle, from TL=0.
+
+	Reached by the slow path overwriting %tnpc and executing done, so this runs
+	on the interrupted thread's stack with the normal register bank restored and
+	the trap level back to zero. That is what makes it possible to call panic()
+	at all: everything about trap context -- no stack, alternate globals, a trap
+	level that turns the next fault into a watchdog reset -- rules out reporting
+	from where the failure was detected.
+
+	The faulting address is reassembled rather than read directly, because the
+	Tag Access register holds VA<63:13> in the top bits with the context in the
+	low thirteen. Shifting the context off and back leaves the page address.
+
+	This does not return.
+*/
+extern "C" void
+sparc_report_unresolved_miss()
+{
+	if (sTrapData.trapKind == SPARC_TRAP_UNRESOLVED_MISS) {
+		// Tag Access holds VA<63:13> with the context in the low thirteen bits,
+		// so shifting the context off leaves the page address.
+		uint64 tagAccess = sTrapData.missTagAccess;
+		panic("sparc: no page table entry for %#" B_PRIxADDR " (context %"
+			B_PRIu64 ", trap %#" B_PRIx64 " at pc %#" B_PRIx64 ", tl %" B_PRIu64
+			", leaf %#" B_PRIx64 ", %" B_PRIu64 " unresolved so far)",
+			(addr_t)(tagAccess & ~(uint64)0x1fff), tagAccess & 0x1fff,
+			sTrapData.missTrapType, sTrapData.missTpc, sTrapData.missTl,
+			sTrapData.missEntry, sTrapData.missCount);
+	} else {
+		panic("sparc: unhandled trap %#" B_PRIx64 " at pc %#" B_PRIx64
+			" (tl %" B_PRIu64 ", tstate %#" B_PRIx64 ", fault address %#"
+			B_PRIx64 ", called from %#" B_PRIx64 ", frame returns to %#"
+			B_PRIx64 ")", sTrapData.missTrapType, sTrapData.missTpc,
+			sTrapData.missTl, sTrapData.missTstate, sTrapData.missTagAccess,
+			sTrapData.trapCallSite, sTrapData.trapReturnAddress);
+	}
+
+	// panic() returns if the user continues from KDL, and there is nothing
+	// sensible to continue into: the access that faulted was skipped rather than
+	// retried, so the caller's state is already inconsistent.
+	for (;;)
+		;
+}
+
+
 /*!	Installs the trap data pointer and proves it went where it should.
 
 	Three separate things can be wrong here and each fails silently:
@@ -698,16 +751,20 @@ sparc_verify_trap_globals()
 
 	const uint64 declaredOffsets[TRAP_DATA_OFFSET_COUNT] = {
 		offsetof(sparc_trap_data, tsbBase),
-		offsetof(sparc_trap_data, tsbMask),
+		offsetof(sparc_trap_data, pageTableRoot),
 		offsetof(sparc_trap_data, missCount),
 		offsetof(sparc_trap_data, missTagTarget),
 		offsetof(sparc_trap_data, missTsbPointer),
-		offsetof(sparc_trap_data, missTsbTag),
-		offsetof(sparc_trap_data, missTsbData),
+		offsetof(sparc_trap_data, missTagAccess),
+		offsetof(sparc_trap_data, missEntry),
 		offsetof(sparc_trap_data, missTrapType),
 		offsetof(sparc_trap_data, missTpc),
 		offsetof(sparc_trap_data, missTstate),
 		offsetof(sparc_trap_data, missTl),
+		offsetof(sparc_trap_data, reportHandler),
+		offsetof(sparc_trap_data, trapKind),
+		offsetof(sparc_trap_data, trapCallSite),
+		offsetof(sparc_trap_data, trapReturnAddress),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -731,12 +788,13 @@ sparc_verify_trap_globals()
 	uint64 normalBefore;
 	asm volatile("mov %%g7, %0" : "=r"(normalBefore));
 
-	sparc_set_trap_globals(&sTrapData);
+	sparc_set_trap_globals(&sTrapData, sparc_kernel_page_table());
 
 	uint64 normalAfter;
 	asm volatile("mov %%g7, %0" : "=r"(normalAfter));
 	uint64 mmuGlobal = sparc_read_trap_globals(SPARC_GLOBALS_MMU);
 	uint64 alternateGlobal = sparc_read_trap_globals(SPARC_GLOBALS_ALTERNATE);
+	uint64 mmuRoot = sparc_read_trap_page_table(SPARC_GLOBALS_MMU);
 
 	dprintf("sparc_mmu: trap data at %p, %%g7 mmu %#" B_PRIx64 " alternate %#"
 		B_PRIx64 ", normal %#" B_PRIx64 " -> %#" B_PRIx64 "\n", &sTrapData,
@@ -767,7 +825,14 @@ sparc_verify_trap_globals()
 			"alternate banks may not be implemented\n");
 	}
 
-	dprintf("sparc_mmu: trap globals verified in both banks\n");
+	if (mmuRoot != (uint64)sparc_kernel_page_table()) {
+		panic("sparc mmu-global %%g3 is %#" B_PRIx64 ", expected the page table "
+			"root %#" B_PRIxPHYSADDR, mmuRoot, sparc_kernel_page_table());
+		return B_ERROR;
+	}
+
+	dprintf("sparc_mmu: trap globals verified in both banks, page table root %#"
+		B_PRIxPHYSADDR "\n", sparc_kernel_page_table());
 	return B_OK;
 }
 
@@ -1103,10 +1168,17 @@ sparc_lock_trap_pages()
 		int locked = 0;
 
 		for (addr_t page = first; page < last; page += B_PAGE_SIZE) {
-			uint64 data;
-			if (!sparc_tsb_lookup(page, &data)) {
-				panic("sparc_mmu: %s page %#" B_PRIxADDR " is not in the TSB, "
-					"so it cannot be locked", ranges[i].name, page);
+			// From the page table, not the TSB. The TSB is a direct-mapped
+			// cache and any given line may currently belong to a colliding
+			// address, so a miss there means nothing about whether the page is
+			// mapped. Asking the cache what the record says is how the first
+			// version of this got the wrong answer.
+			phys_addr_t entry = sparc_page_table_lookup(
+				sparc_kernel_page_table(), page, NULL);
+			uint64 data = entry != 0 ? sparc_read_physical(entry) : 0;
+			if ((data & TTE_VALID) == 0) {
+				panic("sparc_mmu: %s page %#" B_PRIxADDR " is not in the page "
+					"table, so it cannot be locked", ranges[i].name, page);
 				return B_ERROR;
 			}
 			phys_addr_t physical = data & TTE_PA_MASK;
@@ -1240,6 +1312,11 @@ sparc_install_trap_table(struct kernel_args *args)
 	uint64 trapTable = (uint64)(addr_t)sparc_trap_table;
 
 	sTrapData.tsbBase = sKernelTsbPhysical;
+	sTrapData.pageTableRoot = sparc_kernel_page_table();
+
+	// Where an unresolved miss goes to be reported. Set before %tba, so the very
+	// first miss after the cutover already has somewhere to complain to.
+	sTrapData.reportHandler = (uint64)(addr_t)&sparc_report_unresolved_miss;
 
 	dprintf("sparc_mmu: installing TSB register %#018" B_PRIx64 " and %%tba %#"
 		B_PRIx64 "\n", tsbRegister, trapTable);
@@ -1373,3 +1450,60 @@ sparc_verify_trap_handlers(struct kernel_args *args)
 	if (sum != expected)
 		panic("sparc_mmu: window spill/fill lost or corrupted a register");
 }
+
+
+/*!	Drops a TSB line if it is the one describing this address.
+
+	Conditional on the tag, because the TSB is direct-mapped: the line this
+	address indexes to may currently belong to a different address that collided
+	with it, and clearing that would evict a live translation for no reason. Not
+	a correctness problem -- it would be refilled from the page table -- but the
+	whole point of the TSB is to make that unnecessary.
+*/
+void
+sparc_tsb_invalidate(addr_t virtualAddress)
+{
+	if (sKernelTsb == NULL)
+		return;
+
+	uint32 index = (virtualAddress >> 13) & (KERNEL_TSB_ENTRIES - 1);
+	TsbEntry* entry = &sKernelTsb[index];
+
+	if (entry->fTag != (virtualAddress >> 22))
+		return;
+
+	// Data first. A reader that sees a valid tag with cleared data treats the
+	// line as invalid and goes to the page table, which is correct; a reader
+	// that saw a cleared tag with stale data would compare against a tag of
+	// zero and could match a low address.
+	entry->fData = 0;
+	entry->fTag = 0;
+}
+
+
+/*!	Removes an address's translation from both TLBs.
+
+	Demap-page rather than demap-context: it removes the entry matching this
+	virtual page and leaves everything else alone (FIGURE 15-15, printed p.231,
+	with type 0 at bit 6 and the primary context selected at bits 5:4).
+
+	Both TLBs unconditionally. Asking which one holds it would cost more than
+	demapping the one that does not, and a demap of an address with no entry is
+	defined to remove nothing.
+*/
+void
+sparc_tlb_demap(addr_t virtualAddress)
+{
+	uint64 address = (uint64)virtualAddress & TLB_TAG_VA_MASK;
+
+	asm volatile(
+		"stxa %%g0, [%[address]] 0x5f\n\t"	// ASI_DMMU_DEMAP
+		"membar #Sync\n\t"
+		"stxa %%g0, [%[address]] 0x57\n\t"	// ASI_IMMU_DEMAP
+		"membar #Sync"
+		:
+		: [address] "r"(address)
+		: "memory");
+}
+
+#endif	// !_BOOT_MODE

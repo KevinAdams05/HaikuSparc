@@ -58,19 +58,43 @@
  *	would otherwise mean trap handlers quietly writing over each other's fields.
  */
 #define TRAP_DATA_TSB_BASE		0x00
-#define TRAP_DATA_TSB_MASK		0x08
+#define TRAP_DATA_PAGE_TABLE_ROOT	0x08
 #define TRAP_DATA_MISS_COUNT		0x10
 #define TRAP_DATA_MISS_TAG_TARGET	0x18
 #define TRAP_DATA_MISS_TSB_POINTER	0x20
-#define TRAP_DATA_MISS_TSB_TAG		0x28
-#define TRAP_DATA_MISS_TSB_DATA		0x30
+#define TRAP_DATA_MISS_TAG_ACCESS	0x28
+#define TRAP_DATA_MISS_ENTRY		0x30
 #define TRAP_DATA_MISS_TRAP_TYPE	0x38
 #define TRAP_DATA_MISS_TPC		0x40
 #define TRAP_DATA_MISS_TSTATE		0x48
 #define TRAP_DATA_MISS_TL		0x50
-#define TRAP_DATA_OFFSET_COUNT		11
+#define TRAP_DATA_REPORT_HANDLER	0x58
+#define TRAP_DATA_TRAP_KIND		0x60
+#define TRAP_DATA_TRAP_CALL_SITE	0x68
+#define TRAP_DATA_TRAP_RETURN		0x70
+#define TRAP_DATA_OFFSET_COUNT		15
+
+#define SPARC_TRAP_UNRESOLVED_MISS	0
+#define SPARC_TRAP_UNHANDLED		1
 
 #define SPARC_GLOBALS_MMU		0
+
+/*	Page table geometry, from arch_vm_translation_map.h. Three levels of 1024
+ *	eight-byte entries, ten bits of virtual address each, covering VA<42:13>.
+ */
+#define PT_SEGMENT_SHIFT		33
+#define PT_DIRECTORY_SHIFT		23
+#define PT_TABLE_SHIFT			13
+#define PT_INDEX_MASK			1023
+#define PT_VA_HOLE_SHIFT		43
+
+#define ASI_PHYS_USE_EC			0x14
+
+// TTE_SOFT_ACCESSED, from arch_mmu.h.
+#define TTE_SOFT_ACCESSED_BIT		0x200
+
+// The Tag Access register's offset in the MMU register block.
+#define MMU_TLB_TAG_ACCESS		0x30
 
 #define MMU_TAG_TARGET			0x00
 
@@ -107,7 +131,7 @@
  *	TSB and this code must be locked in the TLB for the same reason -- see the
  *	design note, section 2.6.
  */
-.macro TLB_MISS_HANDLER mmu_asi, pointer_asi, data_in_asi
+.macro TLB_MISS_HANDLER mmu_asi, pointer_asi, data_in_asi, slow_path
 	/* The pointer the hardware formed from the faulting address, and the tag
 	 * it wants compared. Both are reads from MMU alternate space; neither can
 	 * miss. The tag target sits at offset zero in the MMU register block, so
@@ -148,11 +172,10 @@
 	retry
 
 1:
-	/* Miss. The slow path resolves this from the authoritative translation
-	 * map and refills the TSB. It does not exist yet, and cannot be reached
-	 * while this table is uninstalled.
+	/* Miss, or a line that belongs to a colliding address. The slow path walks
+	 * the page table, which is the record this is only a cache of.
 	 */
-	ba,a	sparc_tsb_miss_trap
+	ba,a	\slow_path
 	 nop
 .endm
 
@@ -169,58 +192,122 @@
 FUNCTION(sparc_trap_handlers_start):
 
 FUNCTION(sparc_data_mmu_miss):
-	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN
+	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN, \
+		sparc_dmmu_miss_slow
 
 
 FUNCTION(sparc_instruction_mmu_miss):
-	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN
+	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN, \
+		sparc_immu_miss_slow
 
 
-/*	The TSB miss path.
+/*	The TSB miss path: walk the page table.
  *
- *	Records the miss into this CPU's trap data block and then stops. It does not
- *	yet resolve anything: resolving needs an authoritative page table to resolve
- *	from, and this port does not have one -- Open Firmware is still the only
- *	record of what is mapped, and calling the firmware from a trap handler at
- *	TL=1, on no stack, with the trap table no longer the firmware's, is not
- *	something to attempt.
+ *	Reached when the TSB line for the faulting address does not describe it --
+ *	either nothing has been cached for it yet, or the line currently belongs to a
+ *	different address that indexes to the same place. The second case is not an
+ *	edge case. The TSB is direct-mapped on VA<25:13>, so any two regions more
+ *	than 64 MB apart alias completely, and the loader's own allocations alias the
+ *	kernel image exactly. That is why there is a page table underneath, and why
+ *	this path is ordinary rather than exceptional.
  *
- *	So it gathers evidence instead, which is what the first cutover actually
- *	needs. Stopping rather than returning is deliberate: returning would re-run
- *	the access, take the same miss, and spin just as hard while overwriting the
- *	record of the first one. A stopped machine at a known address with the
- *	faulting state in memory is the most debuggable failure available here, and
- *	the counter distinguishes "one address we forgot to map" from "the fast path
- *	never hits at all".
+ *	The walk needs nothing mapped. Interior entries hold physical addresses and
+ *	are read through ASI_PHYS_USE_EC, so no level of the table needs a TLB entry
+ *	and none of them can fault -- which is what makes it safe to run at TL=1 on
+ *	no stack, where a fault would nest towards a watchdog reset.
  *
- *	Every store here goes to the trap data block, which lives in the kernel
- *	image alongside this code. That adds no new locking requirement: the page
- *	holding these instructions must be locked in the TLB anyway, or the handler
- *	could not have been fetched.
+ *	The root arrives in %g3, put there at cutover in both alternate global banks.
+ *	A register rather than a memory location, for the same reason %g7 is one:
+ *	finding out where the table is must not itself require a translation.
  *
- *	Deliberately a local symbol. A branch to a .global symbol goes through a
- *	relocation even when the target sits in the same section, because the
- *	linker must allow for interposition. The kernel is linked as a shared
- *	object, so ld leaves an R_SPARC_WDISP22 for load time rather than
- *	resolving it, and the branch sits in the image with a displacement of
- *	zero -- a branch to itself. The miss path would spin in place instead of
- *	reaching the handler, and nothing would say so. Keeping the symbol local
- *	lets the assembler resolve the displacement outright.
+ *	Registers: %g1 holds the tag target from the fast path, %g2 the TSB pointer
+ *	the hardware formed, %g3 the root; all three are kept. %g4, %g5 and %g6 are
+ *	scratch.
+ *
+ *	Derived from OpenBSD's PTE_GET in sys/arch/sparc64/sparc64/locore.s -- the
+ *	same geometry and the same order of operations. See sparc-port/THIRD_PARTY.md.
  */
-sparc_tsb_miss_trap:
-	/* %g7 is this CPU's trap data block, put there by
-	 * sparc_set_trap_globals() before the table was installed.
-	 *
-	 * %g1, %g2, %g4 and %g5 still hold what the fast path was working with: the
-	 * tag target wanted, the TSB pointer the hardware formed, and the tag and
-	 * data found at it. Between the tag target and the pointer the whole
-	 * faulting address can be reconstructed -- the target carries VA<63:22> and
-	 * the pointer carries VA<21:13>, which the target has shifted away.
+.macro TLB_MISS_SLOW_PATH mmu_asi, data_in_asi
+	/* The faulting address, from the Tag Access register: VA<63:13> in the top
+	 * bits, the context in the low thirteen. Those context bits sit below every
+	 * index this walk takes and below the hole check, so there is nothing to
+	 * mask off.
+	 */
+	mov	MMU_TLB_TAG_ACCESS, %g6
+	ldxa	[%g6] \mmu_asi, %g6
+
+	/* The sun4u address hole: VA<63:43> must be all ones or all zeroes. An
+	 * arithmetic shift leaves -1 or 0, incrementing makes those 0 or 1, and one
+	 * unsigned comparison rejects everything else. An address in the hole has no
+	 * entry to find and never will have one.
+	 */
+	srax	%g6, PT_VA_HOLE_SHIFT, %g4
+	inc	%g4
+	cmp	%g4, 1
+	bgu,pn	%xcc, 1f
+	 nop
+
+	/* Level 1: the segment table, indexed by VA<42:33>. */
+	srlx	%g6, PT_SEGMENT_SHIFT, %g4
+	and	%g4, PT_INDEX_MASK, %g4
+	sllx	%g4, 3, %g4
+	add	%g3, %g4, %g4
+	ldxa	[%g4] ASI_PHYS_USE_EC, %g4
+	brz,pn	%g4, 1f
+
+	/* Level 2: the directory, indexed by VA<32:23>. */
+	 srlx	%g6, PT_DIRECTORY_SHIFT, %g5
+	and	%g5, PT_INDEX_MASK, %g5
+	sllx	%g5, 3, %g5
+	add	%g4, %g5, %g5
+	ldxa	[%g5] ASI_PHYS_USE_EC, %g5
+	brz,pn	%g5, 1f
+
+	/* Level 3: the leaf, indexed by VA<22:13>. Its entries are TTE data halves
+	 * already, so what comes out of here is what goes into the TLB.
+	 */
+	 srlx	%g6, PT_TABLE_SHIFT, %g4
+	and	%g4, PT_INDEX_MASK, %g4
+	sllx	%g4, 3, %g4
+	add	%g5, %g4, %g4
+	ldxa	[%g4] ASI_PHYS_USE_EC, %g5
+
+	/* Valid is bit 63, so an invalid entry is a non-negative one. */
+	brgez,pn %g5, 1f
+	 nop
+
+	/* Record that the page has been touched. The hardware tracks nothing of the
+	 * sort, so this bit being set here is the only reason the VM can ever see a
+	 * page as accessed. A plain store rather than a compare-and-swap, because
+	 * there is one CPU and no other writer.
+	 */
+	or	%g5, TTE_SOFT_ACCESSED_BIT, %g5
+	stxa	%g5, [%g4] ASI_PHYS_USE_EC
+
+	/* Refill the TSB line, so the next miss on this address takes the fast path.
+	 * Data before tag: a reader seeing the new tag with the old data would accept
+	 * a translation that was never in the table, whereas the reverse merely
+	 * misses again and comes back here.
+	 */
+	stx	%g5, [%g2 + 8]
+	stx	%g1, [%g2]
+
+	/* And into the TLB. The same three instructions the fast path ends with,
+	 * because the leaf entry was already in TTE form.
+	 */
+	stxa	%g5, [%g0] \data_in_asi
+	membar	#Sync
+	retry
+
+1:
+	/* Nothing mapped for this address. Record everything about it first: every
+	 * store goes to the trap data block, whose page is locked in the TLB for
+	 * exactly this reason.
 	 */
 	stx	%g1, [%g7 + TRAP_DATA_MISS_TAG_TARGET]
 	stx	%g2, [%g7 + TRAP_DATA_MISS_TSB_POINTER]
-	stx	%g4, [%g7 + TRAP_DATA_MISS_TSB_TAG]
-	stx	%g5, [%g7 + TRAP_DATA_MISS_TSB_DATA]
+	stx	%g6, [%g7 + TRAP_DATA_MISS_TAG_ACCESS]
+	stx	%g5, [%g7 + TRAP_DATA_MISS_ENTRY]
 
 	rdpr	%tt, %g6
 	stx	%g6, [%g7 + TRAP_DATA_MISS_TRAP_TYPE]
@@ -228,18 +315,68 @@ sparc_tsb_miss_trap:
 	stx	%g6, [%g7 + TRAP_DATA_MISS_TPC]
 	rdpr	%tstate, %g6
 	stx	%g6, [%g7 + TRAP_DATA_MISS_TSTATE]
+
+	/* Counted last, so a non-zero count means the record above it is complete
+	 * rather than half written.
+	 */
+	stx	%o7, [%g7 + TRAP_DATA_TRAP_CALL_SITE]
+	stx	%i7, [%g7 + TRAP_DATA_TRAP_RETURN]
+
+	mov	SPARC_TRAP_UNRESOLVED_MISS, %g5
+	stx	%g5, [%g7 + TRAP_DATA_TRAP_KIND]
+
+	ldx	[%g7 + TRAP_DATA_MISS_COUNT], %g5
+	add	%g5, 1, %g5
+	stx	%g5, [%g7 + TRAP_DATA_MISS_COUNT]
+
+	/* Now get out of trap context and say so.
+	 *
+	 * Stopping here would be correct but useless: the machine would sit at a
+	 * known address with a complete record in memory and no way to print it, and
+	 * every unmapped address for the rest of the port would look like an
+	 * unexplained hang. Instead, return to TL=0 at a C function that panics with
+	 * what was just recorded.
+	 *
+	 * done restores TSTATE -- the normal global bank, the interrupted CWP and its
+	 * stack -- and sets the PC from TNPC, so overwriting TNPC first is what
+	 * redirects it. The instruction that faulted is not re-run, which would
+	 * matter if this were recoverable; it is not.
+	 *
+	 * Only from TL=1. Deeper than that, the level below is one of our own
+	 * handlers rather than ordinary kernel code, and returning into it with
+	 * different registers than it left would produce a second failure that told
+	 * us nothing about the first.
+	 */
 	rdpr	%tl, %g6
 	stx	%g6, [%g7 + TRAP_DATA_MISS_TL]
+	cmp	%g6, 1
+	bne,pn	%xcc, 2f
+	 ldx	[%g7 + TRAP_DATA_REPORT_HANDLER], %g6
 
-	/* Counted last, so a non-zero count means the whole record above it is
-	 * complete rather than half written.
-	 */
-	ldx	[%g7 + TRAP_DATA_MISS_COUNT], %g6
-	add	%g6, 1, %g6
-	stx	%g6, [%g7 + TRAP_DATA_MISS_COUNT]
-
-1:	ba,a	1b
+	brz,pn	%g6, 2f
 	 nop
+	wrpr	%g6, 0, %tnpc
+	done
+
+2:	ba,a	2b
+	 nop
+.endm
+
+
+/*	Deliberately local symbols. A branch to a .global symbol goes through a
+ *	relocation even when the target sits in the same section, because the linker
+ *	must allow for interposition. The kernel is linked as a shared object, so ld
+ *	leaves an R_SPARC_WDISP22 for load time rather than resolving it, and the
+ *	branch sits in the image with a displacement of zero -- a branch to itself,
+ *	silently. Keeping these local lets the assembler resolve the displacement
+ *	outright.
+ */
+sparc_dmmu_miss_slow:
+	TLB_MISS_SLOW_PATH ASI_DMMU, ASI_DTLB_DATA_IN
+
+
+sparc_immu_miss_slow:
+	TLB_MISS_SLOW_PATH ASI_IMMU, ASI_ITLB_DATA_IN
 
 
 /*	Window spill and fill.
@@ -380,35 +517,59 @@ FUNCTION(sparc_clean_window):
  *	another trap immediately, and that is the watchdog reset again with the
  *	original cause thrown away.
  *
- *	Reading the result, in order of convenience:
+ *	It records what happened into the trap data block and then leaves trap
+ *	context to report it, exactly as the unresolved-miss path does. Spinning at a
+ *	named symbol was the previous behaviour and it is not good enough: every trap
+ *	the kernel does not yet handle -- a protection fault, an alignment fault, an
+ *	access exception, a Tcc -- looked identical to a hang, with the evidence
+ *	sitting in registers that nothing could print.
  *
- *	  - QEMU's -d int trace prints the whole register file at every trap, so
- *	    the values are in the log without attaching anything.
- *	  - gdb: break in, and the registers below say what happened. The spin is
- *	    at a named symbol, so $pc identifies this handler immediately.
- *	  - On hardware with neither, the machine stops rather than resetting,
- *	    which at least distinguishes a trap from a hang.
+ *	The registers are read before anything else, because %tt and friends are
+ *	stacked per trap level and a nested trap would push them out of reach.
  *
- *	Recording to memory as well would let a later boot recover this, but it
- *	needs a page locked in the TLB to be fault-proof, and that has to wait
- *	until the table is installed and the locking is in place.
- *
- *	    %g1  trap type          (%tt)
- *	    %g2  trapped pc         (%tpc)
- *	    %g3  trapped next pc    (%tnpc)
- *	    %g4  trap state         (%tstate)
- *	    %g5  trap level         (%tl)
- *
- *	%g6 and %g7 are left alone: they are reserved for system software, and a
- *	handler that stops the machine has no business disturbing more than it
- *	must.
+ *	Only from TL=1 can it return. Deeper than that the level below is one of our
+ *	own handlers rather than ordinary kernel code, so it stops instead -- at a
+ *	named symbol, which is still the most a debugger needs.
  */
 sparc_unhandled_trap:
 	rdpr	%tt, %g1
-	rdpr	%tpc, %g2
-	rdpr	%tnpc, %g3
-	rdpr	%tstate, %g4
-	rdpr	%tl, %g5
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TRAP_TYPE]
+	rdpr	%tpc, %g1
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TPC]
+	rdpr	%tstate, %g1
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TSTATE]
+
+	/* The faulting address for the traps that have one. SFAR is the D-MMU's
+	 * Synchronous Fault Address register at offset 0x20; for a trap with no
+	 * address of its own it simply holds whatever the last one left, which the
+	 * reporter accounts for by naming the trap type alongside it.
+	 */
+	mov	0x20, %g1
+	ldxa	[%g1] ASI_DMMU, %g1
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TAG_ACCESS]
+
+	/* A trap leaves CWP alone, so %o7 and %i7 still belong to the code that
+	 * faulted: %o7 is where its last call came from, %i7 where its own frame
+	 * returns to. For a jump through a null function pointer that pair is the
+	 * whole diagnosis, and neither is recoverable once the window is reused.
+	 */
+	stx	%o7, [%g7 + TRAP_DATA_TRAP_CALL_SITE]
+	stx	%i7, [%g7 + TRAP_DATA_TRAP_RETURN]
+
+	mov	SPARC_TRAP_UNHANDLED, %g1
+	stx	%g1, [%g7 + TRAP_DATA_TRAP_KIND]
+
+	rdpr	%tl, %g1
+	stx	%g1, [%g7 + TRAP_DATA_MISS_TL]
+	cmp	%g1, 1
+	bne,pn	%xcc, sparc_unhandled_trap_stop
+	 ldx	[%g7 + TRAP_DATA_REPORT_HANDLER], %g1
+
+	brz,pn	%g1, sparc_unhandled_trap_stop
+	 nop
+	wrpr	%g1, 0, %tnpc
+	done
+
 sparc_unhandled_trap_stop:
 	ba,a	sparc_unhandled_trap_stop
 	 nop
@@ -430,25 +591,32 @@ FUNCTION(sparc_trap_handlers_end):
  *	them, and the window is only a handful of instructions, so closing it is
  *	cheaper than reasoning about it.
  *
- *	void sparc_set_trap_globals(struct sparc_trap_data *data);
+ *	%g3 takes the page table root, physical, for the same reason: the slow path
+ *	walks the table with physical loads, and finding out where the table is must
+ *	not itself require a translation.
+ *
+ *	void sparc_set_trap_globals(struct sparc_trap_data *data,
+ *		phys_addr_t pageTableRoot);
  */
 FUNCTION(sparc_set_trap_globals):
-	rdpr	%pstate, %o1
-	andn	%o1, PSTATE_IE, %o2
+	rdpr	%pstate, %o2
+	andn	%o2, PSTATE_IE, %o3
 
-	or	%o2, PSTATE_MG, %o3
-	wrpr	%o3, 0, %pstate
+	or	%o3, PSTATE_MG, %o4
+	wrpr	%o4, 0, %pstate
 	mov	%o0, %g7
+	mov	%o1, %g3
 
 	/* Straight from the MMU bank to the alternate one: the single write clears
 	 * MG and sets AG together, so no third bank is ever selected.
 	 */
-	or	%o2, PSTATE_AG, %o3
-	wrpr	%o3, 0, %pstate
+	or	%o3, PSTATE_AG, %o4
+	wrpr	%o4, 0, %pstate
 	mov	%o0, %g7
+	mov	%o1, %g3
 
 	/* Restores the normal bank and the caller's interrupt state at once. */
-	wrpr	%o1, 0, %pstate
+	wrpr	%o2, 0, %pstate
 	retl
 	 nop
 
@@ -466,7 +634,7 @@ FUNCTION(sparc_set_trap_globals):
 FUNCTION(sparc_trap_data_offsets):
 	mov	TRAP_DATA_TSB_BASE, %o1
 	stx	%o1, [%o0 + (0 * 8)]
-	mov	TRAP_DATA_TSB_MASK, %o1
+	mov	TRAP_DATA_PAGE_TABLE_ROOT, %o1
 	stx	%o1, [%o0 + (1 * 8)]
 	mov	TRAP_DATA_MISS_COUNT, %o1
 	stx	%o1, [%o0 + (2 * 8)]
@@ -474,9 +642,9 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (3 * 8)]
 	mov	TRAP_DATA_MISS_TSB_POINTER, %o1
 	stx	%o1, [%o0 + (4 * 8)]
-	mov	TRAP_DATA_MISS_TSB_TAG, %o1
+	mov	TRAP_DATA_MISS_TAG_ACCESS, %o1
 	stx	%o1, [%o0 + (5 * 8)]
-	mov	TRAP_DATA_MISS_TSB_DATA, %o1
+	mov	TRAP_DATA_MISS_ENTRY, %o1
 	stx	%o1, [%o0 + (6 * 8)]
 	mov	TRAP_DATA_MISS_TRAP_TYPE, %o1
 	stx	%o1, [%o0 + (7 * 8)]
@@ -486,6 +654,14 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (9 * 8)]
 	mov	TRAP_DATA_MISS_TL, %o1
 	stx	%o1, [%o0 + (10 * 8)]
+	mov	TRAP_DATA_REPORT_HANDLER, %o1
+	stx	%o1, [%o0 + (11 * 8)]
+	mov	TRAP_DATA_TRAP_KIND, %o1
+	stx	%o1, [%o0 + (12 * 8)]
+	mov	TRAP_DATA_TRAP_CALL_SITE, %o1
+	stx	%o1, [%o0 + (13 * 8)]
+	mov	TRAP_DATA_TRAP_RETURN, %o1
+	stx	%o1, [%o0 + (14 * 8)]
 	retl
 	 nop
 
@@ -503,6 +679,28 @@ FUNCTION(sparc_read_trap_globals):
 
 2:	wrpr	%o3, 0, %pstate
 	mov	%g7, %o0
+	wrpr	%o1, 0, %pstate
+	retl
+	 nop
+
+
+/*	The same, for the page table root in %g3.
+ *
+ *	uint64 sparc_read_trap_page_table(int bank);
+ */
+FUNCTION(sparc_read_trap_page_table):
+	rdpr	%pstate, %o1
+	andn	%o1, PSTATE_IE, %o2
+
+	cmp	%o0, SPARC_GLOBALS_MMU
+	be,pt	%icc, 1f
+	 or	%o2, PSTATE_AG, %o3
+	ba,pt	%icc, 2f
+	 nop
+1:	or	%o2, PSTATE_MG, %o3
+
+2:	wrpr	%o3, 0, %pstate
+	mov	%g3, %o0
 	wrpr	%o1, 0, %pstate
 	retl
 	 nop
@@ -589,12 +787,14 @@ FUNCTION(sparc_read_trap_globals):
 .endm
 
 .macro TRAP_GROUP_DATA_MISS
-8:	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN
+8:	TLB_MISS_HANDLER ASI_DMMU, ASI_DMMU_TSB_8KB_PTR, ASI_DTLB_DATA_IN, \
+		sparc_dmmu_miss_slow
 	.org 8b + 128
 .endm
 
 .macro TRAP_GROUP_INSTRUCTION_MISS
-8:	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN
+8:	TLB_MISS_HANDLER ASI_IMMU, ASI_IMMU_TSB_8KB_PTR, ASI_ITLB_DATA_IN, \
+		sparc_immu_miss_slow
 	.org 8b + 128
 .endm
 

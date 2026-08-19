@@ -51,6 +51,24 @@
 	// context field is ignored during hit detection, so the page is shared by
 	// every context.
 
+// The Soft field, TTE data bits 12:7, is ignored by the hardware and available
+// to software. sun4u has no accessed or modified bit of its own -- the hardware
+// records neither -- so the ones the VM needs live here and are maintained by
+// the miss and protection handlers.
+//
+// The positions are OpenBSD's, from sys/arch/sparc64/include/pte.h. They are
+// arbitrary in themselves, and matching a working implementation costs nothing
+// and makes the handlers comparable against a reference. See
+// sparc-port/THIRD_PARTY.md.
+#define TTE_SOFT_MASK				0x0000000000001f80ULL
+#define TTE_SOFT_EXECUTE			(1ULL << 8)
+#define TTE_SOFT_ACCESSED			(1ULL << 9)
+#define TTE_SOFT_REAL_WRITABLE		(1ULL << 10)
+	// What the mapping's protection actually permits, as opposed to what the
+	// hardware W bit currently says. The two differ while a writable page is
+	// mapped read-only in order to catch the first write and set MODIFIED.
+#define TTE_SOFT_MODIFIED			(1ULL << 11)
+
 // TTE_SIZE_* values, from TABLE 15-1.
 #define TTE_SIZE_8K					0
 #define TTE_SIZE_64K				1
@@ -89,6 +107,8 @@ extern void sparc_dump_tlb();
 extern status_t sparc_lock_trap_pages();
 extern status_t sparc_install_trap_table(struct kernel_args *args);
 extern bool sparc_mmu_is_installed();
+extern void sparc_tsb_invalidate(addr_t virtualAddress);
+extern void sparc_tlb_demap(addr_t virtualAddress);
 
 // TLB geometry. Both TLBs on the UltraSPARC-IIi are 64-entry fully associative,
 // and an entry is selected by putting its index in VA<8:3> of the address given
@@ -127,30 +147,42 @@ extern bool sparc_mmu_is_installed();
 // this declaration. sparc_verify_trap_globals() checks the two agree.
 struct sparc_trap_data {
 	uint64	tsbBase;			// 0x00  physical base of the split TSB pair
-	uint64	tsbMask;			// 0x08  reserved for the slow path
-	uint64	missCount;			// 0x10  TSB misses taken since boot
-	uint64	missTagTarget;		// 0x18  context and VA<63:22> of the last miss
-	uint64	missTsbPointer;		// 0x20  ...which also carries VA<21:13>
-	uint64	missTsbTag;			// 0x28  the tag actually found there
-	uint64	missTsbData;		// 0x30  and its data half
+	uint64	pageTableRoot;		// 0x08  physical root, as also held in %g3
+	uint64	missCount;			// 0x10  unresolved misses taken since boot
+	uint64	missTagTarget;		// 0x18  context and VA<63:22>, as compared
+	uint64	missTsbPointer;		// 0x20  the TSB line the hardware chose
+	uint64	missTagAccess;		// 0x28  VA<63:13> and context, from the MMU
+	uint64	missEntry;			// 0x30  the leaf the walk reached, if any
 	uint64	missTrapType;		// 0x38
 	uint64	missTpc;			// 0x40
 	uint64	missTstate;			// 0x48
 	uint64	missTl;				// 0x50
-	uint64	reserved[5];		// pad to 128 bytes
+	uint64	reportHandler;		// 0x58  where a failed trap returns to report
+	uint64	trapKind;			// 0x60  which failure filled the fields above
+	uint64	trapCallSite;		// 0x68  %o7 -- the trapped window's call site
+	uint64	trapReturnAddress;	// 0x70  %i7 -- and where that frame returns to
+	uint64	reserved[1];		// pad to 128 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
-#define TRAP_DATA_TSB_MASK			0x08
+#define TRAP_DATA_PAGE_TABLE_ROOT	0x08
 #define TRAP_DATA_MISS_COUNT		0x10
 #define TRAP_DATA_MISS_TAG_TARGET	0x18
 #define TRAP_DATA_MISS_TSB_POINTER	0x20
-#define TRAP_DATA_MISS_TSB_TAG		0x28
-#define TRAP_DATA_MISS_TSB_DATA		0x30
+#define TRAP_DATA_MISS_TAG_ACCESS	0x28
+#define TRAP_DATA_MISS_ENTRY		0x30
 #define TRAP_DATA_MISS_TRAP_TYPE	0x38
 #define TRAP_DATA_MISS_TPC			0x40
 #define TRAP_DATA_MISS_TSTATE		0x48
 #define TRAP_DATA_MISS_TL			0x50
+#define TRAP_DATA_REPORT_HANDLER	0x58
+#define TRAP_DATA_TRAP_KIND			0x60
+#define TRAP_DATA_TRAP_CALL_SITE	0x68
+#define TRAP_DATA_TRAP_RETURN		0x70
+
+// Values for sparc_trap_data::trapKind.
+#define SPARC_TRAP_UNRESOLVED_MISS	0
+#define SPARC_TRAP_UNHANDLED		1
 #define TRAP_DATA_SIZE				0x80
 
 // Which global bank sparc_read_trap_globals() should be asked about.
@@ -165,11 +197,13 @@ extern void sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 extern status_t sparc_verify_trap_globals();
 
 // Both in arch_traps.S.
-extern "C" void sparc_set_trap_globals(struct sparc_trap_data *data);
+extern "C" void sparc_set_trap_globals(struct sparc_trap_data *data,
+	phys_addr_t pageTableRoot);
 extern "C" uint64 sparc_read_trap_globals(int bank);
+extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		11
+#define TRAP_DATA_OFFSET_COUNT		15
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */
