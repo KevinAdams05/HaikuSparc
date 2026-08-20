@@ -94,7 +94,9 @@ write_disp19(addr_t P, Elf64_Word value)
 static inline void
 write_hi22(addr_t P, Elf64_Word value)
 {
-	*(Elf64_Word*)P |= value >> 10;
+	// Twenty-two bits is what sethi has room for; the mask keeps a value too
+	// large for the field from reaching the opcode bits above it.
+	*(Elf64_Word*)P |= (value >> 10) & 0x3fffff;
 }
 
 
@@ -171,14 +173,15 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 		// https://docs.oracle.com/cd/E19120-01/open.solaris/819-0690/chapter6-24-1/index.html
 		switch (ELF64_R_TYPE(rel[i].r_info)) {
 			case R_SPARC_WDISP30:
-			case R_SPARC_HI22:
-			case R_SPARC_LO10:
 			case R_SPARC_HH22:
 			case R_SPARC_LM22:
 			case R_SPARC_HM10:
 			case R_SPARC_GLOB_DAT:
 			case R_SPARC_JMP_SLOT:
 			case R_SPARC_64:
+				// R_SPARC_HI22 and R_SPARC_LO10 are deliberately not here: the
+				// only thing they carry in a linked object is the GOT-base
+				// idiom, which needs no symbol. See their case below.
 				sym = SYMBOL(image, ELF64_R_SYM(rel[i].r_info));
 #ifdef _BOOT_MODE
 				vlErr = boot_elf_resolve_symbol(image, sym, &S);
@@ -218,14 +221,56 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 				break;
 			}
 			case R_SPARC_HI22:
+			case R_SPARC_LO10:
+			{
+				// Position-independent code reaches its own globals through the
+				// GOT, and finds the GOT with this three-instruction idiom that
+				// GCC emits at the top of every function that needs it:
+				//
+				//	sethi	%hi(_GLOBAL_OFFSET_TABLE_-4), %l7
+				//	call	__sparc_get_pc_thunk.l7		! %o7 = this address
+				//	 add	%l7, %lo(_GLOBAL_OFFSET_TABLE_+4), %l7
+				//	! thunk:  add %o7, %l7, %l7
+				//
+				// The thunk adds the address of the call, so what the two
+				// immediates have to encode between them is the distance from
+				// the call to the GOT -- and that is why the addends are the
+				// GOT minus four and the GOT plus four rather than the GOT
+				// twice. The sethi sits four bytes before the call and the add
+				// four bytes after it, so those offsets cancel the instructions'
+				// own positions and both halves of the pair come out as the same
+				// value: (B + A) - P.
+				//
+				// Which is not what the psABI says these relocation types are.
+				// It defines them as (S + A) >> 10 and (S + A) & 0x3ff, and that
+				// is what they mean in an object file, where the symbol is
+				// _GLOBAL_OFFSET_TABLE_ itself. But the link editor rewrites
+				// them against the .got section symbol while leaving the addend
+				// as the whole object-relative address, so adding the symbol's
+				// value counts the GOT twice: for the scsi bus manager that
+				// produced a %l7 of 0x102740000 for a GOT that belonged at
+				// 0x8139e1c0, and the first string literal read through it
+				// faulted.
+				//
+				// Both halves of the pair agreeing under (B + A) - P is what
+				// makes this reading certain rather than plausible. It holds for
+				// every one of these relocations in the kernel and in every
+				// add-on: thirteen distinct addend pairs in the kernel image,
+				// each pair four bytes apart, matching two instructions four
+				// bytes either side of a call.
+				//
+				// The two cases share a body because the value is the same; only
+				// the field it goes into differs, and each writer takes the part
+				// of the value its instruction has room for.
+				if (ELF64_R_TYPE(rel[i].r_info) == R_SPARC_HI22)
+					write_hi22(P, B + A - P);
+				else
+					write_lo10(P, B + A - P);
+				break;
+			}
 			case R_SPARC_LM22:
 			{
 				write_hi22(P, S + A);
-				break;
-			}
-			case R_SPARC_LO10:
-			{
-				write_lo10(P, S + A);
 				break;
 			}
 			case R_SPARC_HH22:
