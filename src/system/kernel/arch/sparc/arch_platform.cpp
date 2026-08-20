@@ -308,6 +308,58 @@ arch_platform_init_post_thread(struct kernel_args *kernelArgs)
 }
 
 
+/*!	Prints a node's "interrupt-map", if it has one.
+
+	This is the table that turns a child's interrupt number into the parent's.
+	Each entry is a child unit address and interrupt specifier, then the parent's
+	phandle, then the parent's interrupt specifier -- and the widths of those
+	come from #address-cells and #interrupt-cells on the two nodes, so an entry's
+	length is not fixed by the binding.
+
+	Rather than guess those widths, the mask is printed beside the raw cells and
+	the entry stride is taken from "interrupt-map-mask", whose length is exactly
+	the child half of one entry. That is the one piece of the layout a node
+	states about itself.
+*/
+static void
+sparc_dump_interrupt_map(intptr_t node, int depth)
+{
+	uint32 mask[8];
+	intptr_t maskLength = of_getprop(node, "interrupt-map-mask", mask,
+		sizeof(mask));
+	if (maskLength == OF_FAILED || maskLength < (intptr_t)sizeof(uint32))
+		return;
+
+	uint32 maskCells = maskLength / sizeof(uint32);
+
+	dprintf("%*sinterrupt-map-mask", depth * 2 + 3, " ");
+	for (uint32 i = 0; i < maskCells; i++)
+		dprintf(" %#" B_PRIx32, mask[i]);
+	dprintf("\n");
+
+	uint32 map[128];
+	intptr_t mapLength = of_getprop(node, "interrupt-map", map, sizeof(map));
+	if (mapLength == OF_FAILED)
+		return;
+
+	uint32 mapCells = mapLength / sizeof(uint32);
+	dprintf("%*sinterrupt-map, %" B_PRIu32 " cells%s\n", depth * 2 + 3, " ",
+		mapCells,
+		of_getproplen(node, "interrupt-map") > (intptr_t)sizeof(map)
+			? " (truncated)" : "");
+
+	// The parent half is whatever is left once the child half is accounted for:
+	// its phandle plus its interrupt specifier. One line per entry, raw, because
+	// the point of this dump is to find out what the shape is.
+	for (uint32 i = 0; i + maskCells <= mapCells; i += maskCells + 2) {
+		dprintf("%*s ", depth * 2 + 3, " ");
+		for (uint32 j = 0; j < maskCells + 2 && i + j < mapCells; j++)
+			dprintf(" %#" B_PRIx32, map[i + j]);
+		dprintf("\n");
+	}
+}
+
+
 /*!	Walks the Open Firmware device tree, reporting what the machine has.
 
 	The first step of the device stack, and the reason it comes first: on sun4u
@@ -353,6 +405,16 @@ sparc_dump_device_tree(intptr_t node, int depth)
 
 		intptr_t regLength = of_getprop(node, "reg", reg, sizeof(reg));
 
+		// What the firmware says this device's interrupt is. On sun4u a device
+		// node's "interrupts" property is the number as its *parent* sees it,
+		// and the parent's "interrupt-map" translates that to the interrupt
+		// number the host bridge knows -- so both halves are needed to route
+		// anything, and printing them is how one finds out what a given firmware
+		// actually supplies.
+		uint32 interrupts[4];
+		intptr_t interruptsLength = of_getprop(node, "interrupts", interrupts,
+			sizeof(interrupts));
+
 		dprintf("%*s%s", depth * 2 + 1, " ", name);
 		if (type[0] != '\0')
 			dprintf(" (%s)", type);
@@ -360,7 +422,17 @@ sparc_dump_device_tree(intptr_t node, int depth)
 			dprintf(" %04" B_PRIx32 ":%04" B_PRIx32, vendor, device);
 		if (regLength != OF_FAILED && regLength >= (intptr_t)sizeof(uint32))
 			dprintf(" reg %08" B_PRIx32, reg[0]);
+		if (interruptsLength != OF_FAILED
+			&& interruptsLength >= (intptr_t)sizeof(uint32)) {
+			dprintf(" interrupts");
+			for (uint32 i = 0;
+					i < interruptsLength / sizeof(uint32) && i < 4; i++) {
+				dprintf(" %#" B_PRIx32, interrupts[i]);
+			}
+		}
 		dprintf("\n");
+
+		sparc_dump_interrupt_map(node, depth);
 
 		sparc_dump_device_tree(of_child(node), depth + 1);
 	}

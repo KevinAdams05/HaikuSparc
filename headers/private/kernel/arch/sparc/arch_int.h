@@ -71,6 +71,20 @@ struct iframe {
 #define TRAP_INTERRUPT_LEVEL_BASE	0x40
 #define TRAP_INTERRUPT_LEVEL_14		0x4e
 
+/*	How a device interrupt arrives, and it is not one of the levels above.
+ *
+ *	sun4u delivers a device interrupt as an interrupt *packet* rather than by
+ *	asserting a level: the bridge sends a vector, the processor takes this trap,
+ *	and the handler reads the vector out of an ASI register to find out what
+ *	happened. The manual calls the mechanism "Mondo" (chapter 11). The level
+ *	traps above are for the processor's own SOFTINT register, which is how the
+ *	%TICK comparator and software-posted interrupts arrive.
+ *
+ *	So this is a second, independent interrupt path, and the two share only the
+ *	entry code.
+ */
+#define TRAP_INTERRUPT_VECTOR		0x60
+
 // Traps that mean "this address needs the VM's attention".
 #define TRAP_INSTRUCTION_ACCESS		0x08
 #define TRAP_DATA_ACCESS		0x30
@@ -79,6 +93,54 @@ struct iframe {
 #define TRAP_DATA_PROTECTION		0x6c
 	// The three "fast" MMU traps reach this handler too, by way of the miss
 	// slow path: a miss the page table cannot answer is a page fault.
+
+/*	What a device interrupt is called on sun4u.
+ *
+ *	An Interrupt Number Register value -- an INR -- is eleven bits: a five-bit
+ *	Interrupt Group Number and a six-bit Interrupt Number Offset. The INO is what
+ *	identifies the source; the IGN identifies which bridge it came through, and
+ *	on UltraSPARC-IIi it is fixed at 0x1f and not programmable (manual chapter
+ *	11, "Compatibility Note").
+ *
+ *	This port uses the bare INO as its interrupt vector, which fits Haiku's
+ *	NUM_IO_VECTORS with room to spare and keeps the number a driver sees equal to
+ *	the one the firmware's interrupt-map published. The IGN is added and removed
+ *	at the two points that talk to the hardware.
+ */
+#define INR_IGN_SHIFT			6
+#define INR_IGN_MASK			0x7c0
+#define INR_INO_MASK			0x03f
+#define SPARC_IIi_IGN			(0x1f << INR_IGN_SHIFT)
+
+// INOs below this are PCI slot interrupts, identified by bus, slot and pin.
+// From this one up they are the on-board devices -- and the two halves live in
+// different register files, which is the whole reason the distinction matters
+// here. TABLE 19-28.
+#define INO_FIRST_OBIO			0x20
+
+// An interrupt mapping register. Bit 31 is what gates delivery: with it clear
+// the interrupt is held, not lost. The target-processor field is read-only zero
+// on UltraSPARC-IIi. FIGURE 11-2.
+#define INTMAP_VALID			(1ULL << 31)
+
+// An interrupt clear register is write-only, and its low two bits are the state
+// machine for that INO. Writing IDLE after servicing is not optional: the state
+// machine stays in RECEIVED otherwise and that INO never fires again.
+// TABLE 19-34.
+#define INTCLR_IDLE			0
+#define INTCLR_RECEIVED			1
+#define INTCLR_PENDING			3
+
+// Where the processor reports an incoming interrupt packet. BUSY says a vector
+// has been received and must be cleared by writing zero, or nothing further is
+// delivered. Sections 11.10.4 and 11.10.5.
+#define ASI_INTR_RECEIVE		0x49
+#define ASI_INTR_DATA			0x7f
+#define INTR_RECEIVE_BUSY		(1ULL << 5)
+#define INTR_DATA_0			0x40
+	// On UltraSPARC-IIi only data 0 carries anything, and only its low eleven
+	// bits: the INR. Data 1 and 2 always read zero.
+
 
 // Synchronous Fault Status Register fields, from the UltraSPARC-IIi manual's
 // I-/D-SFSR description. Only the ones this port reads.

@@ -1120,21 +1120,55 @@ FUNCTION(sparc_read_trap_page_table):
 	/* 0x030: data_access_exception -- the ordinary page fault. */
 	TRAP_TO_HANDLER sparc_fault_entry
 
-	/* 0x031-0x04d: alignment, interrupt levels 1 to 13, and the rest. */
-	.rept 0x01d
+	/* 0x031-0x040: alignment and the rest. */
+	.rept 0x010
 	TRAP_UNHANDLED
 	.endr
 
-	/* 0x04e: interrupt_level_14, which is where the %TICK comparison lands --
-	 * one entry, not four, because the interrupt levels are consecutive rather
-	 * than spaced apart the way the busier traps are.
+	/* 0x041-0x04f: interrupt_level_1 through interrupt_level_15. One entry each,
+	 * not four, because the levels are consecutive rather than spaced apart the
+	 * way the busier traps are.
+	 *
+	 * All fifteen, not just the one the %TICK comparator uses. Two reasons. The
+	 * SOFTINT register can post any of them and the kernel is entitled to use
+	 * that. And a device interrupt reaches the processor as a packet -- trap 0x60
+	 * -- which the operating system is expected to turn into a SOFTINT at the
+	 * priority the device deserves, so these are the traps that servicing
+	 * actually happens on. Leaving them unhandled makes a level nobody has
+	 * arranged for yet stop the machine, which is the wrong answer for something
+	 * the hardware can raise on its own.
+	 */
+	.rept 0x00f
+8:	ba,a	sparc_interrupt_entry
+	 nop
+	.org 8b + 32
+	.endr
+
+	/* 0x050-0x05f: the rest. */
+	.rept 0x010
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x060: interrupt_vector -- how a *device* interrupt arrives, as a packet
+	 * rather than as an asserted level. One entry, like the levels beside it.
+	 *
+	 * Shares the entry path with the level interrupts because the work is
+	 * identical: save the globals, drop to trap level zero, raise %pil so
+	 * nothing nests, call C. What differs is only what C reads to find out what
+	 * happened, and sparc_interrupt() tells the two apart by the trap type in
+	 * the frame.
+	 *
+	 * The hardware selects the *interrupt* globals for this trap rather than the
+	 * alternate ones (PSTATE.IG, manual section 11.10), which the entry path
+	 * already handles -- it clears AG, MG and IG together for exactly this
+	 * reason.
 	 */
 8:	ba,a	sparc_interrupt_entry
 	 nop
 	.org 8b + 32
 
-	/* 0x04f-0x063: interrupt level 15 and the rest. */
-	.rept 0x015
+	/* 0x061-0x063: the rest. */
+	.rept 0x003
 	TRAP_UNHANDLED
 	.endr
 

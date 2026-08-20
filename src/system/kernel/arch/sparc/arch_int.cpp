@@ -21,8 +21,14 @@
 #include <vm/vm_priv.h>
 #include <util/AutoLock.h>
 
+#include <platform/openfirmware/openfirmware.h>
+
 
 extern "C" void sparc_iframe_offsets(uint64 *out);
+
+// Defined below sparc_interrupt(), which is where it is easiest to read, and
+// called from both of the paths that reach it.
+static void sparc_interrupt_epilogue();
 
 
 /*	The SOFTINT register, ASR 22, and the two write-only aliases that set and
@@ -56,6 +62,183 @@ static inline void
 sparc_clear_softint(uint64 bits)
 {
 	asm volatile("wr %0, 0, %%asr21" : : "r"(bits));
+}
+
+
+/*	sabre's interrupt controller.
+
+	On sun4u the thing that decides whether a device interrupt reaches the
+	processor is not a separate chip on a bus that could be driven by a driver --
+	it is a register file inside the host bridge, which on UltraSPARC-IIi is
+	inside the processor module. So it belongs to the kernel, the way the openpic
+	belongs to the kernel on PowerPC, and not to the PCI bus driver. The bus
+	driver's job stops at telling us which INO a device is wired to.
+
+	Two register files, and which one an INO uses is decided by its value rather
+	than by what kind of device it is. That distinction is easy to get wrong and
+	the consequence is silent: the IDE controller on this machine is a PCI device
+	whose interrupt is INO 0x20 -- the on-board SCSI slot, because that is the
+	slot the onboard storage occupies on an Ultra 5/10 -- so it is programmed
+	through the OBIO registers and not the PCI ones. The firmware's interrupt-map
+	says 0x20, and believing "PCI device therefore PCI register" would have
+	programmed a register belonging to nothing.
+
+	Addresses from the UltraSPARC-IIi User's Manual, section 19.3.3, printed
+	pages 316 to 319. The mapping registers are the "partial" kind: the INO is
+	fixed by which register it is and only the group number and the valid bit are
+	writable, which is why enabling one is a read-modify-write of a single bit and
+	never a write of the number itself.
+
+	Note that a mapping register covers a whole PCI slot -- all four of its pins
+	share one -- while a clear register is per pin. Hence the different shifts.
+*/
+#define SABRE_PCI_INTERRUPT_MAP		0x0c00
+#define SABRE_OBIO_INTERRUPT_MAP	0x1000
+#define SABRE_PCI_INTERRUPT_CLEAR	0x1400
+#define SABRE_OBIO_INTERRUPT_CLEAR	0x1800
+
+/*	Physical, non-cacheable. Not the 0x14 the page table walk uses, which is
+	"physical, external cacheable only": these are device registers, and reads of
+	them have to reach the bridge rather than a cache line that was filled from it
+	once. Big-endian, unlike PCI configuration space -- these registers belong to
+	the host side of the bridge, so no byte swap.
+*/
+#define ASI_PHYS_NON_CACHED		0x15
+
+// The bridge's own register block, from its Open Firmware node. Zero until
+// arch_int_init_io() finds it, and every accessor below declines while it is.
+static phys_addr_t sInterruptControllerBase;
+
+
+static inline uint64
+sparc_read_physical64(phys_addr_t address)
+{
+	uint64 value;
+	asm volatile("ldxa [%[address]] %[asi], %[value]"
+		: [value] "=r"(value)
+		: [address] "r"(address), [asi] "i"(ASI_PHYS_NON_CACHED));
+	return value;
+}
+
+
+static inline void
+sparc_write_physical64(phys_addr_t address, uint64 value)
+{
+	asm volatile("stxa %[value], [%[address]] %[asi]"
+		: : [value] "r"(value), [address] "r"(address),
+			[asi] "i"(ASI_PHYS_NON_CACHED)
+		: "memory");
+}
+
+
+/*!	Physical address of the mapping register that gates this INO. */
+static phys_addr_t
+sparc_interrupt_map_register(int32 ino)
+{
+	if (sInterruptControllerBase == 0)
+		return 0;
+
+	if (ino >= INO_FIRST_OBIO) {
+		return sInterruptControllerBase + SABRE_OBIO_INTERRUPT_MAP
+			+ ((ino & 0x1f) << 3);
+	}
+
+	// One register per slot rather than per pin, so the two pin bits drop out.
+	return sInterruptControllerBase + SABRE_PCI_INTERRUPT_MAP
+		+ ((ino & 0x3c) << 1);
+}
+
+
+/*!	Physical address of the clear register for this INO. */
+static phys_addr_t
+sparc_interrupt_clear_register(int32 ino)
+{
+	if (sInterruptControllerBase == 0)
+		return 0;
+
+	return sInterruptControllerBase
+		+ (ino >= INO_FIRST_OBIO
+			? SABRE_OBIO_INTERRUPT_CLEAR : SABRE_PCI_INTERRUPT_CLEAR)
+		+ ((ino & 0x1f) << 3);
+}
+
+
+/*!	Finds the interrupt controller's registers in the device tree.
+
+	The bridge's "reg" property is its register block, two cells of address on a
+	machine whose root has #address-cells of 2. Read rather than hardcoded for
+	the same reason the PCI address ranges are: sabre is on-die and always at
+	0x1fe.00000000 on the machines this port has run on, and a base address is
+	exactly the kind of constant that turns out to differ on the next one.
+*/
+static status_t
+sparc_find_interrupt_controller()
+{
+	intptr_t root = of_finddevice("/");
+	if (root == OF_FAILED)
+		return B_ERROR;
+
+	for (intptr_t node = of_child(root); node != 0 && node != OF_FAILED;
+			node = of_peer(node)) {
+		char type[16];
+		if (of_getprop(node, "device_type", type, sizeof(type)) == OF_FAILED)
+			continue;
+		if (strcmp(type, "pci") != 0)
+			continue;
+
+		uint32 reg[2];
+		if (of_getprop(node, "reg", reg, sizeof(reg)) == OF_FAILED)
+			continue;
+
+		sInterruptControllerBase = ((phys_addr_t)reg[0] << 32) | reg[1];
+		return B_OK;
+	}
+
+	return B_ENTRY_NOT_FOUND;
+}
+
+
+/*!	Services one interrupt packet.
+
+	The vector is read before anything else, because BUSY has to be cleared for
+	the processor to accept another packet and the vector is gone once it is. Then
+	the handler, and only then the bridge's state machine back to IDLE -- in that
+	order because the interrupt is level-sensitive at the device: clearing before
+	the handler has quietened the device just means taking it again immediately.
+
+	Nothing here can nest. The trap cleared PSTATE.IE and the entry path raised
+	%pil, so a second packet waits until this returns.
+*/
+static void
+sparc_interrupt_vector()
+{
+	uint64 inr;
+	asm volatile("ldxa [%[offset]] %[asi], %[value]"
+		: [value] "=r"(inr)
+		: [offset] "r"((uint64)INTR_DATA_0), [asi] "i"(ASI_INTR_DATA));
+
+	asm volatile("stxa %%g0, [%%g0] %[asi]" : : [asi] "i"(ASI_INTR_RECEIVE)
+		: "memory");
+
+	int32 ino = inr & INR_INO_MASK;
+
+	// The first packet on each INO, said once. Whether a device interrupt is
+	// being *delivered* is not otherwise visible from a boot log -- a driver
+	// that polls and a driver whose interrupts work look the same from outside --
+	// and one line per source is a cheap way to be sure rather than hopeful.
+	// There are 64 INOs, so the record of which have been seen is one word.
+	static uint64 sReported;
+	if ((sReported & (1ULL << ino)) == 0) {
+		sReported |= 1ULL << ino;
+		dprintf("sparc_int: first interrupt packet on vector %" B_PRId32 "\n",
+			ino);
+	}
+
+	io_interrupt_handler(ino, true);
+
+	phys_addr_t clear = sparc_interrupt_clear_register(ino);
+	if (clear != 0)
+		sparc_write_physical64(clear, INTCLR_IDLE);
 }
 
 
@@ -100,14 +283,36 @@ sparc_verify_iframe_layout()
 	PSTATE.IE still clear -- the hardware cleared it on the trap and nothing here
 	sets it, so this cannot nest.
 
-	Only the timer exists so far. The level-14 handler has to check both
-	SOFTINT<14> and TICK_INT, because the two share a level: section 14.5.1 of
-	the manual says so outright, and treating the level as implying the source
-	would misreport a software interrupt as a clock tick the day one is used.
+	Two unrelated paths arrive here, and only the entry code is shared. A device
+	interrupt is an interrupt *packet* -- trap type 0x60, the vector read from an
+	ASI register. The processor's own SOFTINT register arrives as one of the
+	level traps, and that is what the %TICK comparator uses.
+
+	The level-14 handler has to check both SOFTINT<14> and TICK_INT, because the
+	two share a level: section 14.5.1 of the manual says so outright, and treating
+	the level as implying the source would misreport a software interrupt as a
+	clock tick the day one is used.
 */
 extern "C" void
 sparc_interrupt(struct iframe *frame)
 {
+	if (frame->tt == TRAP_INTERRUPT_VECTOR) {
+		sparc_interrupt_vector();
+		sparc_interrupt_epilogue();
+		return;
+	}
+
+	// The first arrival of each trap type, said once. Which interrupt paths a
+	// machine actually uses is not something a manual settles -- an emulator may
+	// deliver as a packet what silicon delivers as a level, or the reverse -- and
+	// this is how to find out rather than assume.
+	static bool sReportedTrap[256];
+	if (frame->tt < 256 && !sReportedTrap[frame->tt]) {
+		sReportedTrap[frame->tt] = true;
+		dprintf("sparc_int: first interrupt with trap type %#" B_PRIx64
+			", softint %#" B_PRIx64 "\n", frame->tt, sparc_read_softint());
+	}
+
 	uint64 pending = sparc_read_softint();
 
 	if ((pending & SOFTINT_TICK) != 0) {
@@ -126,10 +331,20 @@ sparc_interrupt(struct iframe *frame)
 			", softint %#" B_PRIx64, frame->tt, pending);
 	}
 
-	// The scheduler cannot be invoked from inside the trap: it would switch
-	// stacks with a trap frame still on this one. Haiku's convention is to note
-	// the request and act on it here, on the way out, which is also where a
-	// thread's post-interrupt callback runs.
+	sparc_interrupt_epilogue();
+}
+
+
+/*!	What every interrupt does on the way out, whichever path brought it here.
+
+	The scheduler cannot be invoked from inside the trap: it would switch stacks
+	with a trap frame still on this one. Haiku's convention is to note the request
+	and act on it here, on the way out, which is also where a thread's
+	post-interrupt callback runs.
+*/
+static void
+sparc_interrupt_epilogue()
+{
 	if (debug_debugger_running())
 		return;
 
@@ -198,19 +413,77 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 status_t
 arch_int_init_io(kernel_args* args)
 {
+	status_t status = sparc_find_interrupt_controller();
+	if (status != B_OK) {
+		dprintf("sparc_int: no host bridge to take interrupts from; devices "
+			"will have to poll\n");
+		return B_OK;
+	}
+
+	dprintf("sparc_int: interrupt controller at %#" B_PRIxPHYSADDR "\n",
+		sInterruptControllerBase);
+
 	return B_OK;
 }
 
 
+/*!	Lets an interrupt through, or holds it.
+
+	The valid bit is the only field of a partial mapping register this may touch:
+	the interrupt number is fixed by which register it is, and the target
+	processor is read-only. So read, change one bit, write -- which is also what
+	makes disabling safe, since a held interrupt is not a lost one.
+*/
 void
 arch_int_enable_io_interrupt(int32 irq)
 {
+	phys_addr_t map = sparc_interrupt_map_register(irq);
+	if (map == 0)
+		return;
+
+	// The group number goes in at the same time. On this processor it is fixed
+	// and the firmware has usually already written it, but a register the
+	// firmware never touched reads as zero, and an INR of zero is not this
+	// bridge's.
+	uint64 value = sparc_read_physical64(map);
+	value &= ~(uint64)INR_IGN_MASK;
+	value |= SPARC_IIi_IGN | INTMAP_VALID;
+
+	sparc_write_physical64(map, value);
+
+	// Read back, because there is no other way to know the register is there.
+	// This runs a handful of times a boot -- once per installed handler -- and
+	// the address it writes is arithmetic from a manual, against a bridge that
+	// may be emulated. A register that silently ignores writes would otherwise
+	// present as a device whose interrupts never arrive, which is a much longer
+	// road to the same conclusion.
+	uint64 readback = sparc_read_physical64(map);
+	if (readback != value) {
+		dprintf("sparc_int: vector %" B_PRId32 " mapping register %#"
+			B_PRIxPHYSADDR " reads %#" B_PRIx64 " after writing %#" B_PRIx64
+			"\n", irq, map, readback, value);
+	} else {
+		dprintf("sparc_int: vector %" B_PRId32 " enabled (%#" B_PRIxPHYSADDR
+			" = %#" B_PRIx64 ")\n", irq, map, value);
+	}
+
+	// A device may have been asserting while the interrupt was held, in which
+	// case the state machine is already out of IDLE and would deliver a packet
+	// for something no handler has seen yet.
+	phys_addr_t clear = sparc_interrupt_clear_register(irq);
+	if (clear != 0)
+		sparc_write_physical64(clear, INTCLR_IDLE);
 }
 
 
 void
 arch_int_disable_io_interrupt(int32 irq)
 {
+	phys_addr_t map = sparc_interrupt_map_register(irq);
+	if (map == 0)
+		return;
+
+	sparc_write_physical64(map, sparc_read_physical64(map) & ~INTMAP_VALID);
 }
 
 
