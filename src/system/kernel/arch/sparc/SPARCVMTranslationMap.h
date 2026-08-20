@@ -48,6 +48,16 @@ phys_addr_t sparc_page_table_lookup(phys_addr_t root, addr_t virtualAddress,
 	const SPARCPageTableAllocator* allocator);
 
 
+/*!	Records where physical RAM ends, so mappings above it can be made uncached.
+
+	Has to be called before anything is mapped: a device page mapped write-back
+	is read from the cache and never reaches the device. See
+	tte_cache_flags_for_page() in the implementation for why the physical address
+	is what decides this.
+*/
+void sparc_record_physical_memory_top(kernel_args* args);
+
+
 /*!	A sun4u address space's translation map.
 
 	The page table this wraps is the authoritative record; the TSB is a cache in

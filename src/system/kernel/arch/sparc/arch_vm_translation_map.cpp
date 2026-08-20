@@ -99,6 +99,10 @@ arch_vm_translation_map_init(kernel_args *args,
 	}
 #endif
 
+	// Before anything is mapped, because every TTE built from here on consults
+	// it to decide whether the page may be cached.
+	sparc_record_physical_memory_top(args);
+
 	// What Open Firmware currently has mapped, with physical addresses and
 	// modes. This is the set that has to be carried into the kernel's own TSB
 	// before %tba is repointed -- see sparc-port/PHASE2_MMU_DESIGN.md.

@@ -112,12 +112,60 @@ arch_vm_unset_memory_type(VMArea *area)
 }
 
 
+/*!	Accepts a memory type for an area, and says what it will really get.
+
+	There is nothing to program. sun4u carries the memory type in each page's
+	TTE rather than in a separate register file the way x86 carries it in the
+	MTRRs, so the decision is made where the entries are built --
+	SPARCVMTranslationMap::Map() reads area->MemoryType() and turns it into the
+	cacheability and side-effect bits. All this has to do is agree.
+
+	Which means agreeing about two states, because that is all the hardware has:
+	a page is cacheable, or it is uncached with side effects. Write-through and
+	write-back both become cacheable, which weakens a write-through request to a
+	guarantee about whether a store becomes visible rather than when.
+	Write-combining becomes uncached -- combining writes is exactly what a device
+	page must not do, and it is a performance hint rather than a semantic one, so
+	honouring it as uncached is a slow answer and not a wrong one. Write-protected
+	is accepted because protection is expressed by the TTE's W bit and enforced
+	there, not by the memory type.
+
+	Refusing them instead is what this used to do, and it made
+	map_physical_memory() fail for every caller: vm_map_physical_memory() asks
+	for B_UNCACHED_MEMORY when the caller expresses no preference, so the
+	"type == 0" case never arrived. The PCI bus manager's sixteen megabytes of
+	I/O ports failed to map, pci_read_io_8() added the port number to a null
+	base, and the ATA driver read the loader's low identity-mapped memory --
+	which answered every probe with the same plausible-looking rubbish rather
+	than with an error.
+*/
 status_t
 arch_vm_set_memory_type(VMArea *area, phys_addr_t physicalBase, uint32 type,
 	uint32 *effectiveType)
 {
-	if (type == 0)
-		return B_OK;
+	switch (type) {
+		case 0:
+			break;
 
-	return B_ERROR;
+		case B_UNCACHED_MEMORY:
+		case B_WRITE_PROTECTED_MEMORY:
+		case B_WRITE_THROUGH_MEMORY:
+		case B_WRITE_BACK_MEMORY:
+			break;
+
+		case B_WRITE_COMBINING_MEMORY:
+			// Reported as uncached rather than as asked for, so that a caller
+			// that wanted to know what it got is not told something the
+			// hardware cannot do.
+			type = B_UNCACHED_MEMORY;
+			break;
+
+		default:
+			return B_BAD_VALUE;
+	}
+
+	if (effectiveType != NULL)
+		*effectiveType = type;
+
+	return B_OK;
 }

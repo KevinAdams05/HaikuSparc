@@ -49,7 +49,92 @@ static_assert(sizeof(preloaded_image) % 8 == 0,
 #endif
 
 
+/*	Where physical RAM ends, from the boot loader's memory map.
+
+	Recorded because a TTE has to say whether the page it describes may be
+	cached, and on this machine the physical address answers that better than the
+	caller does -- see tte_cache_flags_for_page().
+
+	Set by sparc_record_physical_memory_top() before anything is mapped.
+*/
+static phys_addr_t sPhysicalMemoryTop;
+
+
+/*!	Records the end of physical RAM. Call before the first mapping is made. */
+void
+sparc_record_physical_memory_top(kernel_args* args)
+{
+	for (uint32 i = 0; i < args->num_physical_memory_ranges; i++) {
+		phys_addr_t end = args->physical_memory_range[i].start
+			+ args->physical_memory_range[i].size;
+		if (end > sPhysicalMemoryTop)
+			sPhysicalMemoryTop = end;
+	}
+}
+
+
+/*!	Decides whether a page may be cached, and whether it has side effects.
+
+	The caller's memoryType is honoured when it expresses an opinion, but most
+	callers do not have one: map_physical_memory() takes protection flags and
+	nothing else, so the PCI bus manager maps sixteen megabytes of I/O ports with
+	memoryType zero, meaning "default". Taking that at face value and mapping it
+	write-back is what made the ATA driver read nonsense -- the first status
+	register read filled a cache line from sixty-four bytes of device registers
+	and every read after it was answered from the cache, so the controller was
+	never asked again and never saw the commands.
+
+	So the physical address decides when nothing else does. Above the top of RAM
+	there is no memory on this machine, only device register blocks and firmware
+	ROM, and neither is ever correct to cache: sun4u puts PCI configuration space
+	at 0x1fe.01000000, I/O at 0x1fe.02000000 and memory at 0x1ff.00000000, all
+	far above any RAM a Blade 150 or an Ultra 10 can hold. The rule is therefore
+	exact rather than heuristic here, and it does not depend on drivers
+	remembering to ask.
+
+	Uncached implies TTE_SIDE_EFFECT as well, which is the more important half:
+	it tells the processor that accesses to the page have consequences beyond
+	their value, so they may not be issued speculatively, merged, or reordered
+	with respect to each other. A device register block without it is a
+	correctness problem that does not show up until the timing changes.
+	UltraSPARC-IIi User's Manual section 6.2, printed page 76.
+
+	Both cacheability bits are cleared together. Keeping CV while clearing CP is
+	a legal combination the manual describes for aliased pages, and is not what
+	is wanted for a device.
+*/
+static uint64
+tte_cache_flags_for_page(phys_addr_t physicalAddress, uint32 memoryType)
+{
+	switch (memoryType & B_MEMORY_TYPE_MASK) {
+		case B_UNCACHED_MEMORY:
+		case B_WRITE_COMBINING_MEMORY:
+			// sun4u has no write-combining mode to ask for, and combining is
+			// exactly what a device page must not do, so both mean uncached.
+			return TTE_SIDE_EFFECT;
+
+		case B_WRITE_THROUGH_MEMORY:
+		case B_WRITE_PROTECTED_MEMORY:
+		case B_WRITE_BACK_MEMORY:
+			// The hardware has one cacheable mode. A caller asking for
+			// write-through gets write-back, which is a weaker guarantee about
+			// when a store becomes visible, not about whether it does.
+			return TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL;
+	}
+
+	if (physicalAddress >= sPhysicalMemoryTop)
+		return TTE_SIDE_EFFECT;
+
+	return TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL;
+}
+
+
 /*!	Turns Haiku's area protection flags into the TTE bits that express them.
+
+	Cacheability is not decided here -- see tte_cache_flags_for_page(), which
+	needs the physical address this function does not have. Protect() depends on
+	that split: it changes permissions on a page whose physical address it does
+	not re-read, so it keeps the cacheability bits already in the entry.
 
 	Two things here are not a direct translation.
 
@@ -77,7 +162,7 @@ static_assert(sizeof(preloaded_image) % 8 == 0,
 static uint64
 tte_flags_for_attributes(uint32 attributes, bool kernel)
 {
-	uint64 flags = TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL;
+	uint64 flags = 0;
 
 	bool writable;
 	bool executable;
@@ -351,6 +436,7 @@ SPARCVMTranslationMap::Map(addr_t virtualAddress, phys_addr_t physicalAddress,
 
 	uint64 tte = TTE_VALID | ((uint64)TTE_SIZE_8K << TTE_SIZE_SHIFT)
 		| (physicalAddress & TTE_PA_MASK)
+		| tte_cache_flags_for_page(physicalAddress, memoryType)
 		| tte_flags_for_attributes(attributes, fIsKernel);
 
 	sparc_write_physical(entry, tte);
@@ -515,12 +601,16 @@ SPARCVMTranslationMap::Protect(addr_t base, addr_t top, uint32 attributes,
 		if ((tte & TTE_VALID) == 0)
 			continue;
 
-		// Keep the size, the physical address, and what has been observed about
-		// the page; replace what the protection decides. Losing ACCESSED or
-		// MODIFIED here would tell the VM a written page was clean.
+		// Keep the size, the physical address, what has been observed about the
+		// page, and how it may be cached; replace what the protection decides.
+		// Losing ACCESSED or MODIFIED here would tell the VM a written page was
+		// clean, and losing the cacheability bits would turn a device register
+		// block into cacheable memory the first time anything reprotected it.
 		uint64 preserved = tte
 			& (TTE_VALID | ((uint64)TTE_SIZE_MASK << TTE_SIZE_SHIFT)
-				| TTE_PA_MASK | TTE_SOFT_ACCESSED | TTE_SOFT_MODIFIED);
+				| TTE_PA_MASK | TTE_SOFT_ACCESSED | TTE_SOFT_MODIFIED
+				| TTE_CACHEABLE_PHYSICAL | TTE_CACHEABLE_VIRTUAL
+				| TTE_SIDE_EFFECT);
 
 		sparc_write_physical(entry, preserved | flags);
 		InvalidateCaches(address);
