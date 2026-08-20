@@ -529,6 +529,17 @@ gated on running a binary: syscall entry, `arch_thread_enter_userspace`, signal 
 `runtime_loader`. Note those are also gated on the image build, which cannot yet produce SPARC media
 (§5.4) — so the exit criterion needs that gap closed too. See [PROGRESS §27](PROGRESS.md).
 
+**The design for the rest of it is written down separately**, in
+[USERSPACE_DESIGN.md](USERSPACE_DESIGN.md), because it is the one subsystem where the reasoning is
+most of the work and the pieces cannot be ordered by guesswork. Two findings there change what this
+phase involves. The first is that §4.3's Global-bit model is sound but incomplete: the Global bit
+governs TLB hit detection, which is hardware, while the TSB tag comparison is *software* and compares
+the current context against the stored one — so a non-zero context makes every kernel address miss the
+TSB fast path until the handler masks the context off kernel tag targets. The second is that user
+window spills cannot store to the user stack from a spill handler at all, because that store can fault
+at TL>0 and §2.6's watchdog reset is what follows; they have to land in a per-thread kernel save area
+and be copied out at TL=0.
+
 ### Phase 7 — Device stack  **[IN PROGRESS]**
 
 PCI bus manager over sabre and simba, with Open Firmware providing config-space access and the

@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="946" viewBox="0 0 1120 946" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1120" height="946" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1119" height="945" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Crossing into userspace on sun4u — what the privilege boundary costs</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">One address space, two taggings. The hard parts are not the entry instruction; they are the TSB tag comparison and the register windows.</text>
+
+  <!-- ============ A. address space ============ -->
+  <text x="56" y="106" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">ONE ADDRESS SPACE, TWO TAGGINGS — PORTING PLAN §4.3</text>
+
+  <rect x="56" y="118" width="492" height="112" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="144" font-size="14" font-weight="600" fill="#1a1d24">User pages — low half, context-tagged</text>
+  <text x="76" y="168" font-size="12" font-family="monospace" fill="#404752">TTE: G = 0, P = 0, context = the team's 13-bit id</text>
+  <text x="76" y="188" font-size="12" fill="#404752">Matched against the primary context register, so a page</text>
+  <text x="76" y="206" font-size="12" fill="#404752">belongs to exactly one team. 8192 ids, so they recycle.</text>
+
+  <rect x="572" y="118" width="492" height="112" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="592" y="144" font-size="14" font-weight="600" fill="#1a1d24">Kernel pages — high half, Global</text>
+  <text x="592" y="168" font-size="12" font-family="monospace" fill="#404752">TTE: G = 1, P = 1, context ignored on TLB hit</text>
+  <text x="592" y="188" font-size="12" fill="#404752">Visible in every context, so the primary context register</text>
+  <text x="592" y="206" font-size="12" fill="#404752">can hold the team's id at all times — even inside the kernel.</text>
+
+  <rect x="56" y="242" width="1008" height="42" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="76" y="268" font-size="12.5" fill="#146638">Which is the whole point: the kernel reads user memory with ordinary loads, so <tspan font-family="monospace">IS_USER_ADDRESS</tspan> keeps working and <tspan font-family="monospace">user_memcpy</tspan> needs no ASI tricks. Ticket #19597 avoided.</text>
+
+  <!-- ============ B. TSB tag comparison ============ -->
+  <text x="56" y="326" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">BUT THE TSB COMPARISON IS SOFTWARE — AND IT BREAKS THE MOMENT A CONTEXT IS NON-ZERO</text>
+
+  <rect x="56" y="338" width="1008" height="176" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+
+  <text x="76" y="364" font-size="12.5" fill="#404752">The hardware forms a tag target from the <tspan font-style="italic">access</tspan>. The TSB holds a tag written by software. The miss handler compares them with one <tspan font-family="monospace">xor</tspan>.</text>
+
+  <!-- tag target bar -->
+  <text x="76" y="396" font-size="11.5" font-weight="600" fill="#5b6472">HARDWARE TAG TARGET</text>
+  <rect x="290" y="382" width="180" height="24" rx="3" fill="#fdf3e3" stroke="#b26a00"/>
+  <text x="380" y="399" font-size="11.5" font-family="monospace" fill="#8a5200" text-anchor="middle">context = N</text>
+  <rect x="470" y="382" width="300" height="24" rx="3" fill="#f2f4f8" stroke="#c3c9d4"/>
+  <text x="620" y="399" font-size="11.5" font-family="monospace" fill="#404752" text-anchor="middle">VA&lt;63:22&gt;</text>
+  <text x="786" y="399" font-size="11.5" fill="#8a93a3">bits 60:48, then 41:0</text>
+
+  <!-- stored tag bar -->
+  <text x="76" y="436" font-size="11.5" font-weight="600" fill="#5b6472">STORED TAG, KERNEL PAGE</text>
+  <rect x="290" y="422" width="180" height="24" rx="3" fill="#fdecec" stroke="#b02a2a"/>
+  <text x="380" y="439" font-size="11.5" font-family="monospace" fill="#8f2020" text-anchor="middle">context = 0</text>
+  <rect x="470" y="422" width="300" height="24" rx="3" fill="#f2f4f8" stroke="#c3c9d4"/>
+  <text x="620" y="439" font-size="11.5" font-family="monospace" fill="#404752" text-anchor="middle">VA&lt;63:22&gt;</text>
+  <text x="786" y="439" font-size="11.5" fill="#8f2020">mismatch → every kernel</text>
+  <text x="786" y="455" font-size="11.5" fill="#8f2020">access misses the fast path</text>
+
+  <line x1="76" y1="472" x2="1044" y2="472" stroke="#e4e7ec"/>
+
+  <text x="76" y="496" font-size="12.5" fill="#146638"><tspan font-weight="600">The fix, and it is cheap:</tspan> the tag target carries VA&lt;63&gt; at bit 41, so the handler can tell a kernel address from a user one without touching memory. If it is a kernel address, mask bits 60:48 off the target before the xor. Two instructions.</text>
+
+  <!-- ============ C. register windows ============ -->
+  <text x="56" y="556" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">REGISTER WINDOWS — THE 32 <tspan font-family="monospace">_OTHER</tspan> VECTORS, AND WHY THEY CANNOT DO THE OBVIOUS THING</text>
+
+  <rect x="56" y="568" width="492" height="160" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="594" font-size="14" font-weight="600" fill="#1a1d24">What the hardware asks for</text>
+  <text x="76" y="618" font-size="12" fill="#404752">A trap from userspace leaves user windows live. The kernel</text>
+  <text x="76" y="636" font-size="12" fill="#404752">needs windows of its own, so it spills them — and the</text>
+  <text x="76" y="654" font-size="12" fill="#404752">hardware routes that through <tspan font-family="monospace">spill_*_other</tspan> rather than</text>
+  <text x="76" y="672" font-size="12" fill="#404752">the normal vector, precisely so the handler knows the</text>
+  <text x="76" y="690" font-size="12" fill="#404752">window belongs to the other privilege level.</text>
+  <text x="76" y="714" font-size="12" font-family="monospace" fill="#8f2020">all 64 vectors → kernel handlers today</text>
+
+  <rect x="572" y="568" width="492" height="160" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="592" y="594" font-size="14" font-weight="600" fill="#1a1d24">Why it cannot store to the user stack</text>
+  <text x="592" y="618" font-size="12" fill="#404752">The user stack can be paged out, or not there at all. A</text>
+  <text x="592" y="636" font-size="12" fill="#404752">store to it may fault — and this runs at TL&gt;0, where a</text>
+  <text x="592" y="654" font-size="12" fill="#404752">fault nests one level deeper. Four levels in the CPU takes</text>
+  <text x="592" y="672" font-size="12" fill="#404752">a watchdog reset and says nothing at all.</text>
+  <text x="592" y="700" font-size="12" fill="#146638">So spill into a per-thread save area, which is kernel memory</text>
+  <text x="592" y="718" font-size="12" fill="#146638">and always mapped; copy it out later at TL=0, where a fault</text>
+
+  <rect x="572" y="736" width="492" height="26" rx="4" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="592" y="754" font-size="12" fill="#146638">is an ordinary page fault. Linux and OpenBSD both do this.</text>
+
+  <!-- ============ D. the crossings ============ -->
+  <text x="56" y="800" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">THE CROSSINGS</text>
+
+  <rect x="56" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="836" font-size="13" font-weight="600" fill="#1a1d24">user → kernel</text>
+  <text x="76" y="858" font-size="12" font-family="monospace" fill="#404752">ta — trap 0x100 + n</text>
+  <text x="76" y="876" font-size="11.5" fill="#8f2020">no number chosen yet</text>
+
+  <rect x="312" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="332" y="836" font-size="13" font-weight="600" fill="#1a1d24">user → kernel</text>
+  <text x="332" y="858" font-size="12" font-family="monospace" fill="#404752">trap 0x60, interrupt</text>
+  <text x="332" y="876" font-size="11.5" fill="#146638">works — needs a user iframe</text>
+
+  <rect x="568" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="588" y="836" font-size="13" font-weight="600" fill="#1a1d24">user → kernel</text>
+  <text x="588" y="858" font-size="12" font-family="monospace" fill="#404752">MMU miss / fault</text>
+  <text x="588" y="876" font-size="11.5" fill="#146638">works — needs the mask above</text>
+
+  <rect x="826" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="846" y="836" font-size="13" font-weight="600" fill="#1a1d24">kernel → user</text>
+  <text x="846" y="858" font-size="12" font-family="monospace" fill="#404752">done, PSTATE.PRIV = 0</text>
+  <text x="846" y="876" font-size="11.5" fill="#8f2020">enter_userspace is a stub</text>
+
+  <text x="56" y="922" font-size="11.5" fill="#8a93a3">Register field positions from the UltraSPARC-IIi User's Manual, FIGURE 15-1 and TABLE 14-12. Window handling shape from OpenBSD <tspan font-family="monospace">sparc64/locore.s</tspan> — see THIRD_PARTY.md.</text>
+</svg>
