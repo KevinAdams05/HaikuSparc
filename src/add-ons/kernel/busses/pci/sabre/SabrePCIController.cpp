@@ -175,7 +175,11 @@ SabrePCIController::RegisterDevice(device_node* parent)
 
 		status_t status = gDeviceManager->register_node(parent,
 			SABRE_PCI_DRIVER_MODULE_NAME, attrs, NULL, NULL);
-		if (status == B_OK)
+
+		// B_NAME_IN_USE means the node is already there, which is a success from
+		// here: the device manager rescans the root node, and a bridge that was
+		// registered the first time round does not need registering again.
+		if (status == B_OK || status == B_NAME_IN_USE)
 			registered++;
 		else {
 			dprintf("sabre: could not register a node for %s: %s\n", path,
