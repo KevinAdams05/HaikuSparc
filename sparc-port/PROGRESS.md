@@ -1869,3 +1869,218 @@ Not hardware work. Plumbing and packaging:
 
 Item 2 is the same packaging gap that blocks Phase 6's hello-world, approached from the other side.
 Closing it once serves both.
+
+---
+
+## 29. The disk stack, and seven bugs between the device manager and a spinning disk
+
+All three items from section 28 are done, and closing them uncovered a chain of failures that had
+been latent for most of the port. The boot now reaches ATA device identification: both QEMU disks
+are found, named and sized over PIO. It stops just after that, on a corrupted register window, which
+is the one thing in this section still open.
+
+Each bug below was found by the one after it being reachable. That is worth saying plainly, because
+the order they appear in is the order they *had* to be fixed in, and none of them was visible until
+its predecessor was gone.
+
+### The add-ons, and where they go
+
+`make-bfs-image.sh` now installs the twelve kernel add-ons the boot needs, at their canonical paths
+under `system/add-ons/kernel/`, with symlinks in `add-ons/kernel/boot/`.
+
+Symlinks rather than copies, and that is not tidiness. The loader skips a file whose inode it has
+already loaded (`src/system/boot/loader/elf.cpp`), which is how `bfs` and `intel` avoid being loaded
+twice when `load_modules()` finishes by scanning `file_systems/` and `partitioning_systems/`
+unconditionally. Copies have their own inodes and would be loaded twice.
+
+Both halves of that work: BFS stores `..` as a real b+tree entry (`Inode.cpp`), and the loader's
+`Directory::Lookup` traverses links. The `boot/` directory is what has to work, because the fallback
+list the loader uses when no `boot/` directory exists is stale — it still names `busses/ide`, where
+the ATA controller drivers have lived under `busses/ata` for years.
+
+`dpc` and `scsi_periph` had to be built as well; they are in Haiku's own boot module list and
+nothing in the port had needed them before.
+
+### `kernel_args_malloc` aligns to a byte
+
+The first boot with add-ons died in the *firmware*: `mem_address_not_aligned` inside OpenBIOS's IDE
+read loop, on a `sth` to an odd address. The loop reads the data register with halfword PIO and
+stores halfwords into the buffer it was handed, so an odd buffer faults inside code that has nothing
+to do with Haiku.
+
+`kernel_args_malloc()` aligns to one byte unless told otherwise, and `elf.cpp` never told it. Three
+allocations needed eight: the `preloaded_elf64_image` structure, the symbol table, and the string
+table. The first two are structures of 64-bit fields that are also read into directly from disk; the
+third needs it only for the read.
+
+Nothing had noticed because the kernel is the only image in a boot without add-ons, and it is the
+first allocation out of a fresh page-aligned block — aligned by accident. The image after it inherits
+whatever offset the previous image's string table ended at, which is an arbitrary number of bytes.
+The same bug in its other form put the kernel's own `elf_init()` on an odd `preloaded_image`.
+
+### HI22 and LO10 are not what the psABI says
+
+With the add-ons loading, the `scsi` bus manager ran and faulted on a string literal at
+`0x10263e000`. Its GOT pointer was `0x102740000` for a GOT that belonged at `0x8139e1c0`.
+
+Position-independent code finds its GOT with a three-instruction idiom:
+
+```
+	sethi	%hi(_GLOBAL_OFFSET_TABLE_-4), %l7
+	call	__sparc_get_pc_thunk.l7		! %o7 = this address
+	 add	%l7, %lo(_GLOBAL_OFFSET_TABLE_+4), %l7
+	! thunk:  add %o7, %l7, %l7
+```
+
+The thunk adds the address of the call, so what the two immediates encode between them is the
+distance from the call to the GOT — which is why the addends are the GOT minus four and the GOT plus
+four rather than the GOT twice. The `sethi` sits four bytes before the call and the `add` four bytes
+after it, so those offsets cancel the instructions' own positions.
+
+The psABI defines these relocations as `(S + A) >> 10` and `(S + A) & 0x3ff`, and that is what they
+mean in an object file, where the symbol is `_GLOBAL_OFFSET_TABLE_` itself. The link editor rewrites
+them against the `.got` section symbol while leaving the addend as the whole object-relative
+address, so adding the symbol's value counts the GOT twice. The correct computation is `(B + A) - P`.
+
+What makes that reading certain rather than plausible is that **both halves of every pair agree under
+it**. Thirteen distinct addend pairs in the kernel image, each pair four bytes apart, matching two
+instructions four bytes either side of a call. All 57 of the kernel's own sites are in libsupc++ —
+the demangler and the exception machinery — which is why the kernel had booted for six phases with
+them wrong.
+
+### The firmware owns %g7 while a client call is running
+
+Next: a data alignment trap in `smp_get_current_cpu()`, reading `thread->cpu` through a `%g7` of
+`0xffec73a1` — an address inside OpenBIOS's own image. The caller was `timer_interrupt()`.
+
+SPARC V9 reserves `%g6` and `%g7` for the operating system and this kernel keeps the current thread
+pointer in `%g7`. The firmware is not the operating system: it uses those registers for its own state
+while a client call runs. It puts them back before returning — the check now in
+`call_open_firmware()` says so in every boot log — so the call looks harmless from outside. What is
+not harmless is an interrupt arriving in the middle, because the handler is ordinary kernel code that
+reads `%g7` to find out which thread and which CPU it is on.
+
+The window was every `dprintf()`, since kernel serial output goes through `of_write()`. So client
+calls now run with interrupts disabled. Nothing about them needs to be interruptible, and the timer
+interrupt they delay is posted in SOFTINT and delivered as soon as interrupts come back.
+
+Two things this cost time on. The first theory — that the firmware *returned* with the registers
+clobbered — was wrong, and the one-shot report written to prove it printed nothing, because
+`dprintf()` reaches the serial port through the function being instrumented and its re-entrancy guard
+drops anything printed from inside itself. Hence
+`openfirmware_report_reserved_globals()`, which says it from somewhere that can.
+
+The second: the report of the original fault was itself lost. `panic()` needs the current thread, so
+it faulted in turn, and the cascade ran the trap level to MAXTL and printed eight window dumps of the
+recursion. `sparc_report_unresolved_miss()` now puts the trap type, pc, fault address, call site,
+return address and `%g7` in **one** `dprintf` before anything else, so that whatever else goes wrong,
+that line has already been written.
+
+### `map_physical_memory` failed for every caller
+
+The sabre driver then came up and read its ranges, and the ATA driver reported four devices present,
+all with the same impossible signature.
+
+`vm_map_physical_memory()` asks for `B_UNCACHED_MEMORY` when the caller expresses no preference, and
+sparc's `arch_vm_set_memory_type()` returned `B_ERROR` for every type other than zero — so the
+`type == 0` case it was written for never arrived. The PCI bus manager's sixteen megabytes of I/O
+ports failed to map, `pci_read_io_8()` added the port number to a null base, and the ATA driver read
+the loader's low identity-mapped memory, which answered every probe with plausible-looking rubbish
+rather than with an error. The bus manager now says so when the mapping fails.
+
+sun4u has two memory types, not five: a page is cacheable, or it is uncached with side effects. The
+hook accepts all of them and reports what they became.
+
+Which raised the matching question of where that gets expressed, since sun4u carries the type in each
+page's TTE rather than in a separate register file. `SPARCVMTranslationMap::Map()` had been setting
+both cacheability bits unconditionally and ignoring `memoryType` — so the I/O window would have been
+mapped write-back even once it mapped at all, and the first status register read would have filled a
+cache line from sixty-four bytes of device registers with every read after it answered from the
+cache. It now honours the type, and where the caller has no opinion the physical address decides:
+above the top of RAM there is no memory on this machine, only device registers and firmware ROM.
+`Protect()` preserves the bits, because losing them would turn a device page into cacheable memory
+the first time anything reprotected it.
+
+### The frame buffer's address is not a physical address
+
+With `map_physical_memory()` working, the kernel took a bus error the first time it drew the boot
+splash. The loader was passing the display node's `address` property straight into
+`gKernelArgs.frame_buffer.physical_buffer.start`, under a comment that said "the memory will be
+identity-mapped already" — true of Open Firmware on PowerPC Macs and not of sun4u's, where the
+firmware maps the frame buffer wherever it likes.
+
+`arch_mmu_translate()` is new: physical address behind an address the firmware uses. The sparc
+implementation looks it up in the `/virtual-memory` node's `translations` property, which the loader
+already parses to build the ranges it hands the kernel; the PowerPC one returns its argument and says
+in a comment that this is the assumption the old code was making. If there is no translation, the
+frame buffer stays disabled rather than being handed over as something the kernel cannot address.
+
+### PCI I/O space is little endian
+
+The disks now answered, as `EQUMH RADDSI K`. That is `QEMU HARDDISK` with every pair of bytes
+swapped.
+
+Three separate things needed saying, and they are genuinely different:
+
+**Register access.** These ports are reached through a mapping of the host bridge's I/O window rather
+than through an instruction that knows what bus it is talking to, so a multi-byte load returns the
+bytes in the host's order and the value is byte-reversed. `pci_io.cpp`'s 16- and 32-bit accessors now
+convert. That is what the specification already says about the bus, and it compiles away on a
+little-endian host — which is every platform that took this path before.
+
+**The data port.** A PIO transfer is the other case: the sixteen bits of each access are two
+consecutive bytes of a sector, so what has to be preserved is the order they arrive in, and
+converting them would swap every pair of bytes on the disk. `ata_adapter_read_pio()` converts back.
+
+**The identify block.** Those words *are* numbers, little endian on the wire, and reading them on a
+big-endian host without conversion puts the capability bits in the wrong half of each word — which is
+why a perfectly ordinary disk reported itself as having no LBA support. `ata_info_block_to_host()`
+converts each word, and then the three fields wider than a word, because swapping words individually
+does not reorder the words themselves. The strings are deliberately left alone: ATA puts the first
+character of a string in the *high* byte of its word, so swapping the word puts the pair in reading
+order, which is the state `swap_words()` expects to be handed and leaves untouched on a big-endian
+host.
+
+### DMA needs the IOMMU, so DMA is off
+
+With the identify block readable the driver chose DMA, the first transfer aborted, and the next
+reschedule took a bus error on a pointer that had been written over.
+
+PCI masters on sun4u address host memory through the host bridge's IOMMU. What goes in a PRD entry is
+a DVMA address from a mapping somebody has to make, and nothing in this port makes one — so the
+addresses handed to the controller were truncated physical ones, which the IOMMU translated through
+whatever the firmware left behind, and the transfer landed somewhere else in memory. `ata_adapter`
+reports the controller as unable to DMA on sparc until that is written. PIO is slow and correct,
+which is the right order to do this in.
+
+### Where it stops
+
+```
+ata 0: identified ATA device 0
+ata 0-0: model number: QEMU HARDDISK
+ata 0-0: serial number: QM00001
+ata 0: identified ATA device 1
+ata 0-1: serial number: QM00002
+ata 0 error: command failed, error bit is set. status 0x41, error 0x04
+sparc: trap 0x34 at pc 0x80117214, ... returns to 0x800000000225ee37, %g7 0x820bce40
+```
+
+`0x80117214` is the `return %i7 + 8` at the end of `device_node::InitDriver()`, and `%i7` is not an
+address. So a register window came back wrong, and the trap is the alignment check on the return
+target rather than anything about the window itself.
+
+What is known:
+
+- It is **bit-for-bit reproducible**, including `0x800000000225ee37`. So it is a fixed value, not a
+  timestamp or a race.
+- `%g7` is a valid thread pointer, so this is not the firmware-globals bug again.
+- The frames the debugger can still walk sit between `0x80290c00` and `0x80291200`, and the trapped
+  locals hold `0x80291b88` and `0x80291b84`. That is one contiguous region well inside a 32 KB
+  kernel stack, so it is not a stack overflow — and a guard page would have faulted visibly anyway.
+- It happens immediately after a failed ATA command with `ABRT` set, which is almost certainly the
+  `SET FEATURES` in `DisableCommandQueueing()` that QEMU does not implement. The failure itself is
+  survivable; something on the path out of it is not.
+
+The next step is the kernel debugger rather than more reading: the panic drops to a live `kdebug>`
+prompt over serial, and `threads` plus a dump around the corrupted slot will say whether the value
+was written into the stack or read from the wrong place.

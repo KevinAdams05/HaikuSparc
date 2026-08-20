@@ -537,10 +537,22 @@ datasheets, which RefDocs covers well.
 **Exit:** mount BFS from a real disk; answer a ping.
 **Risk: medium.** The IOMMU is the interesting part; the rest is conventional.
 
-**Status: started.** The kernel reads the Open Firmware device tree, and it shows exactly the
-topology the hardware matrix predicted — sabre, simba, ebus, CMD646 and sunhme, with their
-configuration values already probed by the firmware. That is the input a bus manager needs; the bus
-manager itself is next. See [PROGRESS §27](PROGRESS.md).
+**Status: the stack is assembled and reaches the disks.** A `busses/pci/sabre` driver publishes the
+host bridge to the device manager, so Haiku's own PCI bus manager attaches beneath it and enumerates
+sabre, both simba bridges, sunhme, the framebuffer and the CMD646. `generic_ide_pci` binds the CMD646
+through `ata_adapter`, and both QEMU disks identify by model, serial and geometry over PIO.
+
+Two pieces of this phase are deliberately not done yet, and both are named in the code:
+
+- **The IOMMU.** Bus-master DMA needs a DVMA address from a mapping nothing makes yet, so
+  `ata_adapter` reports the controller as unable to DMA on sparc. PIO is slow and correct.
+- **Interrupt routing.** `SabrePCIController::ReadIrq()` returns `B_UNSUPPORTED` rather than a
+  plausible wrong number, because a wrong interrupt is a driver that waits forever. It needs the
+  `interrupt-map` walk that `ECAMPCIControllerFDT::Finalize()` does for the flattened-device-tree
+  platforms.
+
+See [PROGRESS §29](PROGRESS.md) for the seven bugs between the device manager and a spinning disk,
+and for the register-window corruption that currently stops the boot just after identification.
 
 ### Phase 8 — Desktop
 
