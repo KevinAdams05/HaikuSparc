@@ -189,6 +189,109 @@ map_range(void *virtualAddress, void *physicalAddress, size_t size, int64 mode)
 }
 
 
+/*	One entry of the /virtual-memory node's "translations" property: the
+	firmware's own page table, in the form it publishes it.
+
+	At file scope rather than inside find_allocated_ranges(), because
+	arch_mmu_translate() needs the same parsing and a second copy of it would be
+	a second opinion about the TTE layout.
+*/
+struct translation_map {
+	void *PhysicalAddress() {
+		int64_t p = data;
+#if 0
+		// The openboot own "map?" word does not do this, so it must not
+		// be needed
+		// Sign extend
+		p <<= 23;
+		p >>= 23;
+#endif
+
+		// Keep only PA[40:13]
+		// FIXME later CPUs have some more bits here
+		p &= 0x000001FFFFFFE000ll;
+
+		return (void*)p;
+	}
+
+	// Bit 1 of the TTE data is Writable (UltraSPARC-IIi User's Manual,
+	// FIGURE 15-1). Only used for tracing.
+	bool IsWritable() { return (data & 2) != 0; }
+
+	void	*virtual_address;
+	intptr_t length;
+	intptr_t data;
+};
+
+
+// Sixty-four entries is what the loader has always assumed and is comfortably
+// more than any sun4u machine publishes. Static rather than a local, because
+// that is 1536 bytes and the loader is built with -Wstack-usage=1023.
+#define MAX_FIRMWARE_TRANSLATIONS	64
+
+static struct translation_map sTranslations[MAX_FIRMWARE_TRANSLATIONS];
+
+
+/*!	Reads the firmware's translations into sTranslations. Returns how many, or
+	-1. A machine publishing more than fit is reported rather than silently
+	truncated.
+*/
+static int
+read_firmware_translations()
+{
+	intptr_t mmu = of_instance_to_package(sMmuInstance);
+
+	intptr_t bytes = of_getprop(mmu, "translations", sTranslations,
+		sizeof(sTranslations));
+	if (bytes == OF_FAILED) {
+		dprintf("Error: no OF translations.\n");
+		return -1;
+	}
+
+	if (of_getproplen(mmu, "translations") > (intptr_t)sizeof(sTranslations)) {
+		dprintf("Warning: the firmware publishes more than %d translations; "
+			"the rest are ignored.\n", MAX_FIRMWARE_TRANSLATIONS);
+	}
+
+	return bytes / sizeof(struct translation_map);
+}
+
+
+/*!	Physical address behind an address the firmware uses.
+
+	The firmware describes what it has mapped, and that description is the only
+	way to get from one of its addresses to a physical one. Needed because some
+	of what it hands over is expressed in its own address space -- a display
+	node's "address" property is a firmware virtual address, not a physical one,
+	and treating it as physical works only on a machine whose firmware happens to
+	identity-map. sun4u's does not.
+
+	Note that the returned address is the start of the containing page plus the
+	offset within it; the property describes ranges, not individual pages.
+*/
+extern "C" status_t
+arch_mmu_translate(addr_t virtualAddress, phys_addr_t *_physicalAddress)
+{
+	int count = read_firmware_translations();
+	if (count < 0)
+		return B_ERROR;
+
+	for (int i = 0; i < count; i++) {
+		addr_t base = (addr_t)sTranslations[i].virtual_address;
+		if (virtualAddress < base
+			|| virtualAddress >= base + (addr_t)sTranslations[i].length) {
+			continue;
+		}
+
+		*_physicalAddress = (phys_addr_t)sTranslations[i].PhysicalAddress()
+			+ (virtualAddress - base);
+		return B_OK;
+	}
+
+	return B_ERROR;
+}
+
+
 static status_t
 find_allocated_ranges(void **_exceptionHandlers)
 {
@@ -196,47 +299,14 @@ find_allocated_ranges(void **_exceptionHandlers)
 	// if we want to continue to use its service after we've
 	// taken over (we will probably need less translations once
 	// we have proper driver support for the target hardware).
-	intptr_t mmu = of_instance_to_package(sMmuInstance);
-
-	static struct translation_map {
-		void *PhysicalAddress() {
-			int64_t p = data;
-#if 0
-			// The openboot own "map?" word does not do this, so it must not
-			// be needed
-			// Sign extend
-			p <<= 23;
-			p >>= 23;
-#endif
-
-			// Keep only PA[40:13]
-			// FIXME later CPUs have some more bits here
-			p &= 0x000001FFFFFFE000ll;
-
-			return (void*)p;
-		}
-
-		// Bit 1 of the TTE data is Writable (UltraSPARC-IIi User's Manual,
-		// FIGURE 15-1). Only used for tracing.
-		bool IsWritable() { return (data & 2) != 0; }
-
-		void	*virtual_address;
-		intptr_t length;
-		intptr_t data;
-	} translations[64];
-
-	int length = of_getprop(mmu, "translations", &translations,
-		sizeof(translations));
-	if (length == OF_FAILED) {
-		dprintf("Error: no OF translations.\n");
+	int length = read_firmware_translations();
+	if (length < 0)
 		return B_ERROR;
-	}
-	length = length / sizeof(struct translation_map);
 	uint32 total = 0;
 	TRACE("found %d translations\n", length);
 
 	for (int i = 0; i < length; i++) {
-		struct translation_map *map = &translations[i];
+		struct translation_map *map = &sTranslations[i];
 		bool keepRange = true;
 		TRACE("%i: map: %p, length %ld -> phy %p writable %d: ", i,
 			map->virtual_address, map->length,

@@ -728,6 +728,23 @@ arch_set_callback(void)
 }
 
 
+/*!	Physical address behind an address the firmware uses.
+
+	The identity, which is what this platform's code has always assumed: the
+	comment in video.cpp's platform_switch_to_logo() -- "the memory will be
+	identity-mapped already" -- is about exactly this, and it holds on the
+	machines Open Firmware runs on here. Stated as a function so that callers do
+	not have to assume it, because it is not true everywhere: SPARC's firmware
+	maps the frame buffer somewhere of its own choosing and needs a real lookup.
+*/
+extern "C" status_t
+arch_mmu_translate(addr_t virtualAddress, phys_addr_t *_physicalAddress)
+{
+	*_physicalAddress = virtualAddress;
+	return B_OK;
+}
+
+
 extern "C" status_t
 arch_mmu_init(void)
 {

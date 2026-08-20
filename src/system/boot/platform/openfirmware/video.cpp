@@ -11,6 +11,7 @@
 #include <boot/platform/generic/video.h>
 #include <edid.h>
 #include <platform/openfirmware/openfirmware.h>
+#include <boot/platform/openfirmware/platform_arch.h>
 
 
 //#define TRACE_VIDEO
@@ -81,7 +82,24 @@ platform_switch_to_logo(void)
 		// address is always 32 bit
 	if (of_getprop(package, "address", &address, sizeof(uint32)) == OF_FAILED)
 		return;
-	gKernelArgs.frame_buffer.physical_buffer.start = address;
+
+	// "address" is where the *firmware* has the frame buffer mapped, which is
+	// not necessarily where it is in physical memory -- and the kernel builds
+	// its own mappings, so a physical address is what it needs. This used to
+	// pass the firmware's address straight through, on the assumption noted
+	// below that the memory is identity-mapped. That is true of the Open
+	// Firmware implementations on PowerPC Macs and not of SPARC's, where the
+	// kernel then took a data access error the first time the boot splash was
+	// drawn -- a bus error on an address that belongs to nothing.
+	phys_addr_t physicalAddress;
+	if (arch_mmu_translate(address, &physicalAddress) != B_OK) {
+		dprintf("frame buffer: the firmware's address %#" B_PRIx32 " has no "
+			"physical translation; leaving the frame buffer disabled\n",
+			address);
+		return;
+	}
+
+	gKernelArgs.frame_buffer.physical_buffer.start = physicalAddress;
 	gKernelArgs.frame_buffer.physical_buffer.size = lineBytes * height;
 	gKernelArgs.frame_buffer.width = width;
 	gKernelArgs.frame_buffer.height = height;
@@ -97,8 +115,11 @@ platform_switch_to_logo(void)
 
 	gKernelArgs.frame_buffer.enabled = true;
 
-	// the memory will be identity-mapped already
-	video_display_splash(gKernelArgs.frame_buffer.physical_buffer.start);
+	// Drawn through the firmware's address, not the physical one: the loader is
+	// still running under the firmware's mappings, and that is the address those
+	// mappings answer to. (This used to pass the physical address, which was the
+	// same number on every machine this code had run on.)
+	video_display_splash(address);
 }
 
 

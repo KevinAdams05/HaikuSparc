@@ -175,7 +175,19 @@ template<typename Class>
 /*static*/ status_t
 ELFLoader<Class>::Create(int fd, preloaded_image** _image)
 {
-	ImageType* image = (ImageType*)kernel_args_malloc(sizeof(ImageType));
+	// kernel_args_malloc() aligns to a byte unless told otherwise, and this is a
+	// structure of 64-bit fields that is also read into directly from disk. Both
+	// halves of that need eight: an unaligned load of image->elf_header traps on
+	// an architecture that does not fix up misaligned accesses, and Open
+	// Firmware's block read stores into the buffer it is handed with the width it
+	// finds convenient -- OpenBIOS's IDE path uses halfword PIO stores, so an odd
+	// buffer faults inside the firmware.
+	//
+	// Nothing noticed while the kernel was the only image: it is the first
+	// allocation out of a fresh page-aligned block, so it lands aligned by
+	// accident. The image after it inherits whatever offset the previous image's
+	// string table ended at, which is an arbitrary number of bytes.
+	ImageType* image = (ImageType*)kernel_args_malloc(sizeof(ImageType), 8);
 	if (image == NULL)
 		return B_NO_MEMORY;
 
@@ -521,7 +533,9 @@ ELFLoader<Class>::_LoadSymbolTable(int fd, ImageType* image)
 
 			// read in symbol table
 			size = sectionHeaders[i].sh_size;
-			symbolTable = (SymType*)kernel_args_malloc(size);
+			// Eight for the same two reasons as the image structure above: an
+			// array of structures with 64-bit fields, read into from disk.
+			symbolTable = (SymType*)kernel_args_malloc(size, 8);
 			if (symbolTable == NULL) {
 				status = B_NO_MEMORY;
 				goto error1;
@@ -549,7 +563,9 @@ ELFLoader<Class>::_LoadSymbolTable(int fd, ImageType* image)
 	// read in string table
 
 	size = stringHeader->sh_size;
-	stringTable = (char*)kernel_args_malloc(size);
+	// A string table needs no alignment to be read from, but it is still read
+	// into directly, and the firmware does not store a byte at a time.
+	stringTable = (char*)kernel_args_malloc(size, 8);
 	if (stringTable == NULL) {
 		status = B_NO_MEMORY;
 		goto error2;

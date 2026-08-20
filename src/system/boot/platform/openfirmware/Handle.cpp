@@ -45,6 +45,20 @@ Handle::SetHandle(intptr_t handle, bool takeOwnership)
 }
 
 
+/*!	Reads through the firmware, into the caller's buffer.
+
+	"Buffer" is meant literally: the firmware stores into the memory it is handed
+	rather than copying from anything of its own, and it chooses the access width
+	itself. OpenBIOS's IDE path reads the data register with halfword PIO and
+	stores halfwords, so a buffer at an odd address takes a
+	mem_address_not_aligned trap inside the firmware, where no amount of looking
+	at Haiku's code explains it.
+
+	There is nothing to be done about that here -- the alignment has to come from
+	the caller -- but it is worth knowing that a caller can hand this an odd
+	address and be blamed for it three frames away. src/system/boot/loader/elf.cpp
+	is where that happened.
+*/
 ssize_t
 Handle::ReadAt(void *cookie, off_t pos, void *buffer, size_t bufferSize)
 {
