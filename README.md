@@ -61,10 +61,15 @@ changes to shared Haiku code. What remains of that phase — syscalls, `enter_us
 `runtime_loader` — is gated on being able to run a binary, which needs an image build that can
 produce SPARC media.
 
-Phase 7 has started. The kernel reads the firmware's device tree and finds exactly the topology the
-hardware matrix predicted from datasheets: sabre, simba, ebus, the CMD646 IDE controller and the
-sunhme network adapter. A PCI bus manager over that, then ATA, is what the boot is actually blocked
-on.
+Phase 7 has started, and the surprise is how little needed porting. The kernel reads PCI
+configuration space over sabre — verified against the device tree, which the firmware had already
+filled in — and every add-on on the path to a disk builds for sparc unchanged: `ata`, `scsi`,
+`generic_ide_pci`, `scsi_disk`, `intel`, `bfs`. Only the PCI bus manager failed to link, for three
+missing MSI symbols that sabre does not have anyway.
+
+What is left before the boot is plumbing rather than hardware: publish the sabre controller to the
+device manager, put the built add-ons into the BFS image so the loader preloads them, then bind ATA
+to the CMD646.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

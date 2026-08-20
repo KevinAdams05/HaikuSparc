@@ -29,7 +29,7 @@ Exit criteria met, each by a deliberate test rather than by inference:
 | 3 | `wait_for_thread()` waits and reports | `returned 0x0, thread exited 0x1234` (§23, §26) |
 | 6 | *the model holds, and no shared code changed* | ranges disjoint; `user_memcpy` faults caught (§27) |
 | 6 | A static hello-world runs | **not met** — needs syscalls and an image build that can make SPARC media |
-| 7 | Mount BFS from a real disk; answer a ping | **not met** — the device tree reads; no drivers yet |
+| 7 | Mount BFS from a real disk; answer a ping | **not met** — config space reads and the stack builds; no driver bound yet (§28) |
 
 What exists:
 
@@ -45,10 +45,15 @@ What exists:
 | `setjmp` / `longjmp` | implemented — they were a bare `ret` (§26) |
 | Page faults | access exceptions, the protection trap, and unresolved misses, all to `vm_page_fault()` (§27) |
 | Device tree | read from Open Firmware, matching the hardware matrix (§27) |
+| PCI configuration space | sabre, verified against the device tree (§28) |
 
-**Next, in the order that pays:** a PCI bus manager over the device tree, then ATA on the CMD646 —
-that is what the boot is actually blocked on. Userspace needs the image build to produce SPARC media
-before its exit criterion can even be attempted.
+**Next, in the order that pays** (§28 has the detail): register the sabre controller with the device
+manager, get the add-ons into the BFS image so the loader preloads them, then ATA on the CMD646.
+Configuration space already works and the whole stack already builds; what is left is plumbing and
+packaging rather than hardware.
+
+Userspace needs the image build to produce SPARC media before its exit criterion can even be
+attempted, which is the same packaging gap from the other direction.
 
 **Nothing is open.** The one item that was — `wait_for_thread()` tripping `could acquire exit_sem
 for thread 5` — was retested and is fixed: it was the `setjmp` bug (§26), which makes semaphore
@@ -1790,3 +1795,77 @@ mean writing it untested, which on this architecture is how the expensive bugs g
 
 The device stack is the better next move regardless, because the absence of a disk driver is where
 the boot actually stops.
+
+
+## 28. PCI configuration space, and what is actually left before a boot
+
+The boot stops because `KDiskDeviceManager::InitialDeviceScan()` finds nothing, so the question is
+what stands between here and a disk.
+
+### Less than expected: the stack already builds
+
+Every add-on the path needs compiles for sparc unchanged — `ata`, `scsi`, `generic_ide_pci`,
+`ata_adapter`, `scsi_disk`, `scsi_cd`, `intel` and `bfs`. Only `pci` failed, and only at the link
+step, for three missing symbols: `msi_supported`, `msi_allocate_vectors`, `msi_free_vectors`. The
+kernel now links `arch/generic/generic_msi.cpp`, whose implementations answer "not supported" —
+which is the truth, since sabre predates MSI and routes interrupts the old way.
+
+That is worth stating plainly because it was the open question: none of this needed porting.
+
+### Configuration space
+
+```
+arch_platform: pci configuration space at 0x1fe01000000, 16 MB
+arch_platform: pci 0:0:0 108e:a000 class 060000
+arch_platform: pci 0:1:0 108e:5000 class 060400
+arch_platform: pci 0:1:1 108e:5000 class 060400
+arch_platform: pci 1:1:0 108e:1000 class 068000
+arch_platform: pci 1:1:1 108e:1001 class 020000
+arch_platform: pci 1:2:0 1234:1111 class 030000
+arch_platform: pci 1:3:0 1095:0646 class 01018f
+```
+
+Three things had to be right simultaneously, and the class codes are what prove they are. An
+address formation wrong by a shift and a byte order wrong both yield plausible-looking numbers;
+`0604` for a PCI-to-PCI bridge and `0101` for an IDE controller do not happen by accident.
+
+**The address.** sabre maps configuration space linearly, so a register sits at the base plus bus,
+device and function packed the way the specification packs them. Sixteen megabytes is exactly eight
+bits of bus.
+
+**The access.** ASI `0x1d` — physical, non-cacheable, little endian. All three matter: configuration
+space is a device register block rather than memory, so it must not be cached, and PCI is little
+endian on a machine that is not.
+
+**The base.** Read from the host bridge's `ranges` property, not hardcoded. That property is the
+machine describing itself in the PCI Open Firmware binding: seven cells per entry — a three-cell PCI
+address, a two-cell physical address, a two-cell size — with the top two bits of the PCI address
+saying which space it is. It reports configuration at `0x1fe.01000000`, I/O at `0x1fe.02000000` and
+memory at `0x1ff.00000000`, buses 0 to 2.
+
+That agrees with sabre's documentation, and reading it from the tree anyway is deliberate: the Blade
+150 is a different machine with the same bridge, and a base address is exactly the sort of constant
+that turns out to differ.
+
+Two things the scan showed that the device tree did not: simba appears as **two** PCI-to-PCI bridges
+at `0:1:0` and `0:1:1`, which is what the part actually is, and the CMD646's programming interface
+byte is `8f` — both channels in native mode, which the ATA driver will need to know.
+
+### What is left
+
+Not hardware work. Plumbing and packaging:
+
+1. **Register the controller with the device manager.** Haiku's PCI bus manager takes a
+   `pci_controller_module_info` from its *parent* device node, so something has to publish a host
+   bridge node for `pci_root` to attach beneath. The ECAM controllers do this from an FDT or ACPI
+   node; sparc has neither, so this needs a small driver that attaches to the device manager's root
+   and hands over the accessor above.
+2. **Get the add-ons into the BFS image.** The loader preloads from `system/add-ons/kernel/...` on
+   the boot volume — `bus_managers`, `busses/ide`, `partitioning_systems`, `file_systems` — and
+   `make-bfs-image.sh` currently writes only the kernel. Everything needed is built; it has to be
+   placed.
+3. **Then ATA on the CMD646**, which `generic_ide_pci` may well already handle: it is a conventional
+   PCI IDE part, and the class code says both channels are in native mode.
+
+Item 2 is the same packaging gap that blocks Phase 6's hello-world, approached from the other side.
+Closing it once serves both.
