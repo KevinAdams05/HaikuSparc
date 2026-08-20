@@ -194,6 +194,14 @@ struct sparc_trap_data {
 struct kernel_args;
 
 extern status_t sparc_mmu_init_tsb(struct kernel_args *args);
+
+/*	Claims the TSB's virtual range from the VM, once there is a VM to claim it
+	from. Must be called from arch_vm_translation_map_init_post_area(), while the
+	boot loader's ranges are still reserved -- vm_init() drops those immediately
+	afterwards, and anything the architecture has not turned into an area of its
+	own becomes free address space at that moment.
+*/
+extern status_t sparc_mmu_create_tsb_area();
 extern void sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 	uint64 flags);
 extern status_t sparc_verify_trap_globals();

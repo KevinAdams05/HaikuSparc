@@ -14,6 +14,7 @@
 #include <platform/openfirmware/openfirmware.h>
 #include <thread.h>
 #include <vm/vm.h>
+#include <vm/VMAddressSpace.h>
 
 
 // Address space identifiers for the MMUs
@@ -378,6 +379,55 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	sparc_lock_trap_pages();
 	sparc_dump_tlb();
 	sparc_install_trap_table(args);
+
+	return B_OK;
+}
+
+
+/*!	Turns the TSB's virtual range into an area, so the VM stops handing it out.
+
+	The range was taken with vm_allocate_early(), which records it in
+	kernel_args -- and vm_init() reserves every one of those ranges, calls this
+	architecture's init_post_area hook, and then *unreserves* them all. Anything
+	the architecture still needs has to have become an area of its own by then.
+	This one had not, and the consequence was as bad as it sounds: create_area()
+	handed thread stacks out of the middle of the TSB.
+
+	Which is a very quiet kind of wrong. A TSB entry is sixteen bytes, a tag and
+	a TTE, and the miss handler writes one whenever it resolves a miss -- so an
+	ordinary memory access by any thread would drop sixteen bytes on top of
+	another thread's stack, at whichever offset the faulting address happened to
+	index to. What that looked like was a register window coming back from a fill
+	with %i6 and %i7 replaced: the tag of a virtual address in one, its
+	translation in the other, and a return to an address that was never code.
+	Everything else in the window was intact, because a spill writes 128 bytes
+	and only two of its slots had been landed on.
+
+	A null area rather than create_area(): as far as the VM is concerned nothing
+	is mapped here. The TSB is reachable only through four locked entries in the
+	data TLB and has no page table entries and no vm_page structures, because the
+	miss handler reads it with an atomic quad load that exists in no
+	physical-address form on this processor -- see section 4.4 of the design note.
+	All that is wanted from the VM is that it never offer these addresses to
+	anybody else.
+*/
+status_t
+sparc_mmu_create_tsb_area()
+{
+	if (sKernelTsb == NULL)
+		return B_NO_INIT;
+
+	void* address = sKernelTsb;
+	area_id area = vm_create_null_area(VMAddressSpace::KernelID(), "kernel TSB",
+		&address, B_EXACT_ADDRESS, KERNEL_TSB_BYTES * 2, 0);
+	if (area < B_OK) {
+		panic("sparc_mmu: could not claim the TSB at %p: %s", sKernelTsb,
+			strerror(area));
+		return area;
+	}
+
+	dprintf("sparc_mmu: TSB range %p-%p claimed as area %" B_PRId32 "\n",
+		sKernelTsb, (char*)sKernelTsb + KERNEL_TSB_BYTES * 2, area);
 
 	return B_OK;
 }

@@ -175,11 +175,24 @@ arch_vm_translation_map_init_post_sem(kernel_args *args)
 }
 
 
+/*!	Claims the address ranges the kernel allocated before the VM existed.
+
+	vm_init() reserves every range the boot loader recorded, calls this, and then
+	unreserves them all again -- so this is the one moment at which an
+	architecture can turn an early allocation into something permanent. Anything
+	it does not claim here becomes free address space, and create_area() will
+	hand it to whoever asks next.
+
+	The TSB is the only such range on sun4u. The trap table, the trap handlers
+	and the trap data block are all objects inside the kernel image, which
+	already has an area.
+*/
 status_t
 arch_vm_translation_map_init_post_area(kernel_args *args)
 {
 	TRACE("vm_translation_map_init_post_area: entry\n");
-	return B_OK;
+
+	return sparc_mmu_create_tsb_area();
 }
 
 
