@@ -2081,6 +2081,39 @@ What is known:
   `SET FEATURES` in `DisableCommandQueueing()` that QEMU does not implement. The failure itself is
   survivable; something on the path out of it is not.
 
-The next step is the kernel debugger rather than more reading: the panic drops to a live `kdebug>`
-prompt over serial, and `threads` plus a dump around the corrupted slot will say whether the value
-was written into the stack or read from the wrong place.
+### What the kernel debugger says about it
+
+The panic drops to a live `kdebug>` prompt over serial, which `tools/boot.sh`-style scripting can
+drive through `serial-driver.py --expect/--send`. Four things came out of it, and together they move
+the suspicion off ATA entirely.
+
+**It is not only `%i7`.** The trapped window's save area holds `%i6 = 0x208` as well — 520, not a
+stack pointer. Two adjacent registers wrong is a window that came back wrong, not a slot that was
+written over.
+
+**The same shape of value terminates a perfectly healthy stack.** Running `sc` from the debugger
+prompt — a completely different call chain, KDL command dispatch, nothing to do with disks — ends at
+`kernel_debugger_internal` with a return address of `0x8000000002724e37`. Compare
+`0x800000000225ee37`. Bit 63 set with a small value under it is what an unmasked `%TICK` read looks
+like (bit 63 is NPT), but only one place in the port reads `%TICK` and it masks; the resemblance may
+be a coincidence and is recorded here so the next session does not have to notice it again.
+
+**The stack around it is intact and in the right place.** `threads` puts main2's stack at
+`0x8028a000`; every frame the walker can follow lies between `0x80290600` and `0x80291200`, and the
+values just above the corrupted save area are `0x41` and `0x04` — the status and error from the ATA
+command that had just failed, sitting in the enclosing frame's locals exactly where locals belong.
+So this is not an overflowing buffer walking up the stack.
+
+**And the value is in the register file, not just in memory.** The trap is the alignment check on
+`return %i7 + 8`, which reads the current window's register — and `sparc_report_unresolved_miss()`
+records `%o7` and `%i7` before the handler's own `save`, so the sane `%o7` next to the garbage `%i7`
+is that window's own pair.
+
+That points at window management — a spill or fill or trap return putting back the wrong thing —
+rather than at anything the ATA driver did. The device manager is the first code in this port to
+recurse deeply while taking interrupts, which is exactly the workload that would find such a bug and
+exactly why nothing before Phase 7 did.
+
+The next step is QEMU's `-d int` trace, which logs every trap with the complete register file and
+window state (see section 14). That will say which trap left the window wrong, which is the one thing
+none of the evidence above can.
