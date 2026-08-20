@@ -25,6 +25,24 @@
 #define TTE_TAG_CONTEXT_SHIFT		48
 #define TTE_TAG_CONTEXT_MASK		0x1fffULL
 
+// A tag holds VA<63:22> at bits 41:0, so virtual address bit n sits at tag bit
+// n - TSB_TAG_VA_SHIFT.
+#define TSB_TAG_VA_SHIFT			22
+
+// Which bit of a tag decides whether the context field means anything.
+//
+// The kernel occupies everything from KERNEL_BASE upwards and KERNEL_BASE is a
+// power of two, so one bit separates the halves: set means a kernel address,
+// whose mappings are Global and whose tag is stored with context zero; clear
+// means a user address, whose tag carries its team's context. That lets the TLB
+// miss handler decide whether to compare the context without touching memory --
+// see TLB_MISS_HANDLER in arch_traps.S.
+//
+// KERNEL_BASE is 0x80000000 on this port, so this is bit 31 of the address and
+// bit 9 of the tag. Spelled as a literal because arch_kernel.h is not available
+// here, and checked against KERNEL_BASE at init by sparc_verify_mmu_defines().
+#define TSB_TAG_KERNEL_BIT			9
+
 // TTE data
 #define TTE_VALID					(1ULL << 63)
 #define TTE_SIZE_SHIFT				61

@@ -125,6 +125,18 @@
 // TTE_SOFT_ACCESSED, from arch_mmu.h.
 #define TTE_SOFT_ACCESSED_BIT		0x200
 
+/*	TSB tag geometry, also from arch_mmu.h. The context field starts at bit 48,
+ *	and the VA_tag field holds VA<63:22> at bits 41:0 -- so tag bit 9 is VA<31>,
+ *	which is the one bit that separates a kernel address from a user one, because
+ *	KERNEL_BASE is 0x80000000 and the kernel owns everything above it.
+ *
+ *	Repeated here rather than included because arch_mmu.h is a C++ header. Both
+ *	values are checked against it at init by sparc_verify_mmu_defines(), which
+ *	derives the second from KERNEL_BASE rather than trusting either copy.
+ */
+#define TTE_TAG_CONTEXT_SHIFT		48
+#define TSB_TAG_KERNEL_BIT		9
+
 // The Tag Access register's offset in the MMU register block.
 #define MMU_TLB_TAG_ACCESS		0x30
 
@@ -172,6 +184,40 @@
 	ldxa	[%g0] \pointer_asi, %g2
 	ldxa	[%g0] \mmu_asi, %g1
 
+	/* Mask the context off a kernel address, because a kernel page's tag is
+	 * stored with context zero while the tag target carries whatever context is
+	 * loaded -- and once a user team is running, that is not zero.
+	 *
+	 * The Global bit in the TTE makes the *hardware* ignore the context when it
+	 * matches a TLB entry. It buys nothing here: this comparison is software,
+	 * and the tag target reads its own G bit as zero because the hardware cannot
+	 * know whether a page is global before finding it. So without this, every
+	 * kernel address would miss the fast path for as long as a user context is
+	 * loaded -- correct, and slow enough to be the whole system's cost.
+	 *
+	 * Which kind of address it is comes out of %g1 itself, with no memory
+	 * access and no branch. The tag target holds VA<63:22> at bits 41:0, and the
+	 * kernel owns everything from KERNEL_BASE upwards with KERNEL_BASE a power
+	 * of two, so a single bit decides: VA<31>, which is tag bit 9. Shift it to
+	 * the top, take the arithmetic shift's sign extension as an all-ones or
+	 * all-zeroes mask, and clear bits 63:48. Everything above the context field
+	 * there is either the G bit or reserved, and the tag target reads all of
+	 * them as zero, so clearing a few extra costs nothing.
+	 *
+	 * Note which way round this is. It masks for a *kernel* address and keeps
+	 * the context for everything else, so an address below KERNEL_BASE that no
+	 * team owns -- a wild pointer, a leftover firmware mapping -- compares with
+	 * the context included and misses, which is the outcome it deserves.
+	 *
+	 * %g1 is masked rather than a copy of it, so that the slow path -- which
+	 * stores %g1 as the new tag -- writes context zero for a kernel page
+	 * without needing to know any of this.
+	 */
+	sllx	%g1, 63 - TSB_TAG_KERNEL_BIT, %g6
+	srax	%g6, 63, %g6
+	sllx	%g6, TTE_TAG_CONTEXT_SHIFT, %g6
+	andn	%g1, %g6, %g1
+
 	/* The TSB line, tag and data together. A quad load is atomic against a
 	 * writer updating the pair, which a tag load followed by a separate data
 	 * load is not -- and the window between them is exactly where a stale
@@ -184,11 +230,12 @@
 	 * has a zero tag, which would otherwise match a faulting access to a low
 	 * address and load a null translation.
 	 *
-	 * The comparison itself is a plain xor because sparc_tsb_insert() stores
-	 * tags in exactly the form the hardware builds its tag target, and the
-	 * kernel runs in context zero. The difference goes to %g6 rather than over
-	 * the top of %g4, so that the slow path can report the tag it really found
-	 * instead of a value that has already been folded against the one wanted.
+	 * The comparison itself is a plain xor because the tag is stored in exactly
+	 * the form the hardware builds its tag target -- including the context,
+	 * after the masking above has reduced a kernel address's to zero. The
+	 * difference goes to %g6 rather than over the top of %g4, so that the slow
+	 * path can report the tag it really found instead of a value that has
+	 * already been folded against the one wanted.
 	 */
 	brgez,pn %g5, 1f
 	 xor	%g1, %g4, %g6
@@ -835,6 +882,36 @@ FUNCTION(sparc_iframe_offsets):
 	stx	%o1, [%o0 + (15 * 8)]
 	mov	IFRAME_SIZEOF, %o1
 	stx	%o1, [%o0 + (16 * 8)]
+	retl
+	 nop
+
+
+/*	Report this file's copies of the MMU constants, for C++ to check.
+ *
+ *	Every one of these is duplicated from a header this file cannot include,
+ *	because arch_mmu.h and arch_vm_translation_map.h are C++. Two copies of a
+ *	number is the arrangement that drifts, and the failures here are the quiet
+ *	kind: a page table shift that disagrees walks to a plausible wrong entry, and
+ *	a context shift that disagrees masks the wrong bits out of a tag target and
+ *	simply misses forever.
+ *
+ *	void sparc_mmu_defines(uint64 *out);   // seven entries
+ */
+FUNCTION(sparc_mmu_defines):
+	mov	PT_SEGMENT_SHIFT, %o1
+	stx	%o1, [%o0 + (0 * 8)]
+	mov	PT_DIRECTORY_SHIFT, %o1
+	stx	%o1, [%o0 + (1 * 8)]
+	mov	PT_TABLE_SHIFT, %o1
+	stx	%o1, [%o0 + (2 * 8)]
+	mov	PT_INDEX_MASK, %o1
+	stx	%o1, [%o0 + (3 * 8)]
+	mov	PT_VA_HOLE_SHIFT, %o1
+	stx	%o1, [%o0 + (4 * 8)]
+	mov	TTE_TAG_CONTEXT_SHIFT, %o1
+	stx	%o1, [%o0 + (5 * 8)]
+	mov	TSB_TAG_KERNEL_BIT, %o1
+	stx	%o1, [%o0 + (6 * 8)]
 	retl
 	 nop
 

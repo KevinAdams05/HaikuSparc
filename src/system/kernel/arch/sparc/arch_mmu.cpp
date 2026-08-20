@@ -252,6 +252,9 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 static void sparc_verify_tlb_load(struct kernel_args *args);
 static void sparc_verify_tsb_lookup();
 static void sparc_verify_trap_handlers(struct kernel_args *args);
+static void sparc_verify_mmu_defines();
+
+extern "C" void sparc_mmu_defines(uint64 *out);
 
 
 /*!	Allocates the kernel TSB and warms it with Open Firmware's translations.
@@ -371,6 +374,7 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 		" collisions (%" B_PRIu32 " distinct entries live)\n", inserted,
 		sKernelTsbCollisions, inserted - sKernelTsbCollisions);
 
+	sparc_verify_mmu_defines();
 	sparc_verify_tsb_indexing();
 	sparc_verify_tlb_load(args);
 	sparc_verify_tsb_lookup();
@@ -451,6 +455,70 @@ sparc_mmu_create_tsb_area()
 	mechanism -- so programming them disturbs nothing. Tag Access is rewritten
 	by the hardware on every MMU trap anyway. Both are restored regardless.
 */
+/*	Checks that the assembly and this file agree about the MMU constants.
+
+	Every one of them is duplicated into arch_traps.S, which cannot include a C++
+	header, and the numbers are the kind that fail quietly. A page table shift
+	that disagrees walks to a plausible wrong entry and returns a translation for
+	some other page. A context shift that disagrees masks the wrong bits out of a
+	tag target, so the comparison never matches, every access takes the slow path,
+	and nothing says why -- the system would simply be slow forever.
+
+	The same arrangement sparc_verify_context_layout() uses for arch_context, and
+	for the same reason: the assembler's own view of each number, reported back
+	and compared, rather than a comment asking the next reader to check.
+*/
+static void
+sparc_verify_mmu_defines()
+{
+	uint64 assembler[7];
+	sparc_mmu_defines(assembler);
+
+	const uint64 declared[7] = {
+		SPARC_SEGMENT_TABLE_SHIFT,
+		SPARC_PAGE_DIRECTORY_SHIFT,
+		SPARC_PAGE_TABLE_SHIFT,
+		SPARC_PAGE_TABLE_MASK,
+		SPARC_VA_HOLE_SHIFT,
+		TTE_TAG_CONTEXT_SHIFT,
+		TSB_TAG_KERNEL_BIT,
+	};
+
+	static const char* const kNames[7] = {
+		"PT_SEGMENT_SHIFT", "PT_DIRECTORY_SHIFT", "PT_TABLE_SHIFT",
+		"PT_INDEX_MASK", "PT_VA_HOLE_SHIFT", "TTE_TAG_CONTEXT_SHIFT",
+		"TSB_TAG_KERNEL_BIT",
+	};
+
+	for (int i = 0; i < 7; i++) {
+		if (assembler[i] != declared[i]) {
+			panic("sparc mmu define %s: arch_traps.S says %" B_PRIu64
+				", the headers say %" B_PRIu64, kNames[i], assembler[i],
+				declared[i]);
+		}
+	}
+
+	// And the one number that is derived rather than chosen. Both copies above
+	// could agree with each other and still be wrong about the address space,
+	// which is the failure this catches: the miss handler would mask the context
+	// off the wrong half and every access in it would miss forever.
+	//
+	// The single-bit test is only valid if the kernel is exactly the top half of
+	// the addresses the tag can represent -- a power-of-two base, and nothing
+	// mapped for the kernel above it that the bit would not cover.
+	if ((KERNEL_BASE & (KERNEL_BASE - 1)) != 0) {
+		panic("sparc mmu: KERNEL_BASE %#lx is not a power of two, so one bit "
+			"cannot separate kernel addresses from user ones", (addr_t)KERNEL_BASE);
+	}
+
+	uint32 kernelBit = __builtin_ctzll(KERNEL_BASE) - TSB_TAG_VA_SHIFT;
+	if (kernelBit != TSB_TAG_KERNEL_BIT) {
+		panic("sparc mmu: TSB_TAG_KERNEL_BIT is %d but KERNEL_BASE %#lx makes "
+			"it %" B_PRIu32, TSB_TAG_KERNEL_BIT, (addr_t)KERNEL_BASE, kernelBit);
+	}
+}
+
+
 void
 sparc_verify_tsb_indexing()
 {
