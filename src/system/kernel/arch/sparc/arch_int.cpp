@@ -186,6 +186,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	// arch_platform_init_post_thread(), where this was first put -- can create
 	// threads and resume them and watch them never run.
 	sparc_test_context_switch();
+	sparc_test_thread_wait();
 	sparc_test_preemption();
 	sparc_test_backtrace();
 	sparc_test_user_memory();

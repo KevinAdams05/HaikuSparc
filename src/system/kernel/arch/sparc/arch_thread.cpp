@@ -328,3 +328,67 @@ sparc_test_context_switch()
 			B_PRId32, count, expected);
 	}
 }
+
+
+/*!	A thread that exists only to finish and be waited for.
+
+	Exits with exit_thread() rather than by returning the value.
+	common_thread_entry() discards whatever a kernel thread's entry function
+	returns and then calls thread_exit(), so a returned status never reaches the
+	waiter -- the exit status is only what exit_thread() was given.
+*/
+static status_t
+sparc_short_lived_thread(void *data)
+{
+	exit_thread((status_t)(addr_t)data);
+	return B_OK;
+}
+
+
+/*!	Re-tests wait_for_thread(), which failed before setjmp() worked.
+
+	The Phase 3 context switch test originally used wait_for_thread() and tripped
+	"could acquire exit_sem for thread 5" -- acquire_sem_etc() returning B_OK on a
+	semaphore created with a count of zero, which should have been impossible. The
+	test was changed to poll instead, and the failure recorded as an open item
+	rather than chased, since it was not a context switch problem.
+
+	It is worth asking again rather than assumed fixed, because setjmp() and
+	longjmp() were a bare `ret` at the time and that turned out to be behind two
+	other things that had been written off -- the debug allocation pool's
+	complaints and every kernel debugger command. A wild control transfer through
+	the middle of semaphore bookkeeping would explain this one too.
+
+	Checks the exit status as well as the return, because a wait that returned
+	success without actually having waited would otherwise look identical -- and
+	the status has to travel from the dying thread to the waiter, which is the
+	bookkeeping the original failure was in.
+*/
+void
+sparc_test_thread_wait()
+{
+	const status_t kExpected = 0x1234;
+
+	thread_id thread = spawn_kernel_thread(sparc_short_lived_thread,
+		"sparc short lived", B_NORMAL_PRIORITY, (void*)(addr_t)kExpected);
+	if (thread < 0) {
+		dprintf("sparc_thread: could not spawn the wait test\n");
+		return;
+	}
+
+	resume_thread(thread);
+
+	status_t exitStatus = 0;
+	status_t waited = wait_for_thread(thread, &exitStatus);
+
+	bool ok = waited == B_OK && exitStatus == kExpected;
+
+	dprintf("sparc_thread: wait_for_thread returned %#x, thread exited %#x "
+		"(wanted %#x) -- %s\n", waited, exitStatus, kExpected,
+		ok ? "waited cleanly" : "WRONG");
+
+	if (!ok) {
+		panic("sparc: wait_for_thread returned %#x with exit status %#x, "
+			"expected B_OK and %#x", waited, exitStatus, kExpected);
+	}
+}

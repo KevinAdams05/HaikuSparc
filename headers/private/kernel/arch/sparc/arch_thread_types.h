@@ -97,6 +97,7 @@ struct arch_fork_arg {
 
 // In arch_thread.cpp. Called once, from arch_platform_init_post_thread().
 extern void sparc_test_context_switch();
+extern void sparc_test_thread_wait();
 
 
 #endif	/* KERNEL_ARCH_SPARC_THREAD_TYPES_H */
