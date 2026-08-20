@@ -282,10 +282,14 @@ ata_adapter_prepare_dma(ata_adapter_channel_info *channel,
 			prd->address, prd->count, prd->EOT);
 	}
 
+	// Note that write_io_32() converts to little endian itself, so the address
+	// must be passed in host byte order - converting it here as well would
+	// swap it back on a big endian host and hand the controller a table
+	// address that points nowhere.
 	pci->write_io_32(device, channel->bus_master_base + ATA_BM_PRDT_ADDRESS,
-		(pci->read_io_32(device, channel->bus_master_base + ATA_BM_PRDT_ADDRESS) & 3)
-		| (B_HOST_TO_LENDIAN_INT32((uint32)pci->ram_address(device,
-			channel->prdt_phys)) & ~3));
+		(pci->read_io_32(device, channel->bus_master_base + ATA_BM_PRDT_ADDRESS)
+				& 3)
+		| ((uint32)pci->ram_address(device, channel->prdt_phys) & ~3));
 
 	// reset interrupt and error signal
 	status = pci->read_io_8(device, channel->bus_master_base
@@ -353,11 +357,15 @@ ata_adapter_finish_dma(ata_adapter_channel_info *channel)
 	pci->write_io_8(device, channel->bus_master_base + ATA_BM_STATUS_REG,
 		status | ATA_BM_STATUS_ERROR);
 
-	if ((status & ATA_BM_STATUS_ACTIVE) != 0)
+	if ((status & ATA_BM_STATUS_ACTIVE) != 0) {
+		TRACE_DMA("ata_adapter: DMA transfer is not complete\n");
 		return B_DEV_DATA_OVERRUN;
+	}
 
-	if ((status & ATA_BM_STATUS_ERROR) != 0)
+	if ((status & ATA_BM_STATUS_ERROR) != 0) {
+		TRACE_DMA("ata_adapter: DMA transfer failed\n");
 		return B_ERROR;
+	}
 
 	return B_OK;
 }
@@ -632,25 +640,6 @@ ata_adapter_detect_channel(pci_device_module_info *pci, pci_device *pci_device,
 			}
 		}
 	}
-
-#ifdef __sparc__
-	// Bus-master DMA needs an address the controller can reach, and on sun4u
-	// that is not a physical address: PCI masters address host memory through
-	// the host bridge's IOMMU, and what goes in a PRD entry is a DVMA address
-	// from a mapping somebody has to make. Nothing in this port makes one yet --
-	// see sparc-port/PROGRESS.md -- so the addresses handed to the controller are
-	// truncated physical ones that the IOMMU translates through whatever the
-	// firmware left behind, and the transfer lands somewhere else in memory.
-	//
-	// That is worse than not working. It corrupted the kernel: the disks
-	// identified correctly, the first DMA read aborted, and the next reschedule
-	// took a bus error on a pointer that had been written over. PIO is slow and
-	// correct, which is the right order to do this in.
-	if (controller_can_dma) {
-		TRACE("PCI-ATA: no IOMMU support on this platform yet, using PIO\n");
-		controller_can_dma = false;
-	}
-#endif
 
 	{
 		io_resource resources[3] = {
