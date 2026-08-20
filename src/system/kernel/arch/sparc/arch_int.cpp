@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 
+#include <arch_debug.h>
 #include <arch_thread_types.h>
 #include <debug.h>
 #include <interrupts.h>
@@ -182,6 +183,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	// threads and resume them and watch them never run.
 	sparc_test_context_switch();
 	sparc_test_preemption();
+	sparc_test_backtrace();
 
 	return B_OK;
 }
