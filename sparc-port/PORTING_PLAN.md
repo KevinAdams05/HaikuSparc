@@ -551,8 +551,14 @@ Two pieces of this phase are deliberately not done yet, and both are named in th
   `interrupt-map` walk that `ECAMPCIControllerFDT::Finalize()` does for the flattened-device-tree
   platforms.
 
-See [PROGRESS §29](PROGRESS.md) for the seven bugs between the device manager and a spinning disk,
-and for the register-window corruption that currently stops the boot just after identification.
+`scsi_disk` binds to both disks and publishes `disk/ata/0/master/raw` and
+`disk/ata/0/slave/raw`; the CD-ROM identifies through the ATAPI path. The boot then hangs in
+`dprintf()` on a `%s` argument that is not NUL-terminated, which is the next thing to chase and is
+not an MMU or a bus problem.
+
+See [PROGRESS §29](PROGRESS.md) for the eight bugs between the device manager and a published disk —
+including the TSB that was sitting on top of every thread stack, which is the one that had been
+corrupting register windows.
 
 ### Phase 8 — Desktop
 

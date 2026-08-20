@@ -2114,6 +2114,87 @@ rather than at anything the ATA driver did. The device manager is the first code
 recurse deeply while taking interrupts, which is exactly the workload that would find such a bug and
 exactly why nothing before Phase 7 did.
 
-The next step is QEMU's `-d int` trace, which logs every trap with the complete register file and
-window state (see section 14). That will say which trap left the window wrong, which is the one thing
-none of the evidence above can.
+### It was the TSB, sitting on top of the stacks
+
+`0x800000000225ee37` reads as nonsense and is not: bit 63 is `TTE_VALID`, bits 40:13 are a physical
+address, and the low bits are exactly the flags this port sets — `G|W|P|CV|CP|ACCESSED|
+REAL_WRITABLE|MODIFIED`. It is a **TTE**. And `0x208`, alongside it, is a **TSB tag**: VA<63:22> of
+`0x82000000`.
+
+A TSB entry is a tag and a TTE, sixteen bytes, and the two corrupted slots were sixteen bytes. So a
+TLB miss had written a TSB entry into main2's stack.
+
+Which it could, because:
+
+```
+sparc_mmu: TSB at 0x80280000 ... 256 KB total
+thread 0x820bce40  15  running  ...  stack 0x000000008028a000  main2
+```
+
+The TSB spans `0x80280000`–`0x802c0000`. Every thread stack the VM handed out — main2's at
+`0x8028a000`, the media checker's at `0x80294000`, `scsi_bus_service`'s at `0x8029e000` — is inside
+it.
+
+The TSB's virtual range came from `vm_allocate_early()`, which records it in `kernel_args`. `vm_init()`
+reserves every range recorded there, calls `arch_vm_translation_map_init_post_area()`, and then
+**unreserves them all**. That hook is the one moment at which an architecture can turn an early
+allocation into something permanent, and ours returned `B_OK` and did nothing. So the TSB became free
+address space, and `create_area()` gave it away.
+
+QEMU's `-d int` trace confirmed the mechanism from the other end: the window arrived corrupt from a
+*fill*, at the right address, with the fourteen slots the sixteen-byte entry did not cover still
+correct.
+
+The fix is a null area over the TSB's range — null rather than `create_area()` because as far as the
+VM is concerned nothing is mapped there. The TSB is reachable only through four locked entries in the
+data TLB, with no page table entries and no `vm_page` structures, because the miss handler reads it
+with an atomic quad load that exists in no physical-address form on this processor. All that is
+wanted from the VM is that it never offer those addresses to anybody else.
+
+What that bought is the whole disk stack:
+
+```
+ata 0: identified ATA device 0
+ata 0-0: model number: QEMU HARDDISK
+publish device: node 0x821e0d20, path disk/ata/0/master/raw, module drivers/disk/scsi/scsi_disk/device_v1
+publish device: node 0x821e1180, path disk/ata/0/slave/raw, module drivers/disk/scsi/scsi_disk/device_v1
+atapi 1-0: model number: QEMU DVD-ROM
+```
+
+Both disks and the CD-ROM, identified and published, with `scsi_disk` bound to them.
+
+### Where it stops now
+
+Immediately after, and it is a hang rather than a fault: QEMU sits at 100% CPU and the serial console
+goes quiet after
+
+```
+ata 1 error: failed to read pio block
+```
+
+which is the probe of the device that is not there — channel 1, device 1.
+
+The QEMU monitor says exactly what it is doing:
+
+```
+pc: 00000000801d91e4          <- memchr
+%o0-3: 0000000080b167a8 0000000000000000 ffffffffffffffff ...
+%o7:   00000000801dc130       <- strnlen
+```
+
+`strnlen(0x80b167a8, SIZE_MAX)`, from `vsnprintf`. A `%s` argument that is not NUL-terminated, so
+`memchr` is walking four gigabytes a word at a time and will be for some while.
+
+The prime suspect is the ATA driver's debug context. `TRACE_ERROR` expands to a `dprintf` whose
+first argument is `_DebugContext()`, a pointer into the device or channel object; the identify that
+just failed ends with the device being deleted, and the next message printed through that context
+would be reading freed memory. Worth confirming before fixing, because the same shape of bug could
+equally be an uninitialised context on a channel that never got a device.
+
+Two things are worth doing regardless of which it is, and neither is speculative:
+
+- `dprintf()` walking four gigabytes for a missing terminator is a poor failure mode for a kernel
+  log function. A bound would turn this hang into a truncated line.
+- The ATA driver is polling because `SabrePCIController::ReadIrq()` has nothing to report yet.
+  Interrupt routing is the other half of Phase 7 and would make this whole path faster and less
+  strange.
