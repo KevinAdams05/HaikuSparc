@@ -45,6 +45,7 @@ public:
 
 private:
 			status_t		_ReadRanges(intptr_t node);
+			status_t		_SetUpDma();
 			void			_FinalizeInterrupt(uint8 bus, uint8 device,
 								uint8 function);
 			phys_addr_t		_ConfigAddress(uint8 bus, uint8 device,
@@ -53,6 +54,7 @@ private:
 			device_node*	fNode;
 			intptr_t		fOpenFirmwareNode;
 
+			phys_addr_t		fRegisterBase;
 			phys_addr_t		fConfigurationBase;
 			uint64			fConfigurationSize;
 			uint8			fFirstBus;

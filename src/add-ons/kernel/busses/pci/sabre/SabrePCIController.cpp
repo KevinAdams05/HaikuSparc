@@ -76,6 +76,44 @@
 // spare. Reported rather than silently truncated if it ever does not.
 #define PCI_MAX_INTERRUPT_MAP_CELLS		128
 
+/*	How a PCI master reaches host memory, which on this machine is a decision
+	rather than a given.
+ *
+ *	TABLE 10-3 lists three modes. With the IOMMU enabled a 32-bit DMA address is
+ *	a *virtual* one, translated through a table in memory. With it disabled, an
+ *	address that hits the target address space register is used directly as a
+ *	physical DRAM address -- "pass-through", section 10.3.3, with the high bits
+ *	padded with zero. The third, bypass, needs a 64-bit dual-cycle address and is
+ *	therefore unavailable to anything whose descriptors are 32-bit, which
+ *	includes ATA's.
+ *
+ *	Pass-through is what Haiku's DMA model already assumes: drivers are handed
+ *	physical addresses and expect a device to reach them. And it is sufficient on
+ *	this generation rather than merely convenient -- UltraSPARC-IIi supports at
+ *	most a gigabyte of physical memory (the TSB base register documents bits
+ *	33:30 as "always zero, since only 1-Gbyte of physical memory is supported"),
+ *	so every byte of DRAM is reachable in 32 bits and there is nothing an aperture
+ *	would have to be rationed for.
+ *
+ *	What it does not give is protection: a device can write anywhere in DRAM. That
+ *	is the same guarantee x86 offers without an IOMMU, so it costs Haiku nothing
+ *	it was relying on -- but it is a reason a real translation table is still
+ *	worth building later, along with the machines that have more memory than this.
+ *
+ *	Register addresses from section 19.3, printed pages 298 and 308.
+ */
+#define SABRE_IOMMU_CONTROL			0x0200
+#define SABRE_IOMMU_TSB_BASE			0x0208
+#define SABRE_IOMMU_FLUSH			0x0210
+#define SABRE_TARGET_ADDRESS_SPACE		0x2028
+
+#define IOMMU_CONTROL_ENABLE			(1ULL << 0)
+#define IOMMU_CONTROL_DIAGNOSTIC		(1ULL << 1)
+
+// Each bit of the target address space register enables one 512 MB region as a
+// PCI target, bit 0 being 0x0000.0000-0x1fff.ffff. TABLE 19-6.
+#define TARGET_ADDRESS_SPACE_GRANULE		(512 * 1024 * 1024)
+
 /*	Physical, non-cacheable, little endian.
  *
  *	All three parts matter. Physical because configuration space is never mapped
@@ -87,6 +125,29 @@
  *	UltraSPARC-IIi User's Manual TABLE 6-2, printed page 78.
  */
 #define ASI_PHYS_NON_CACHED_LITTLE	0x1d
+
+
+/*	The bridge's own registers, which are neither configuration space nor a PCI
+ *	address: they are host-side control registers at a fixed physical address, so
+ *	they are read big-endian and non-cacheable. Note the ASI is 0x15 and not the
+ *	0x1d used for configuration space -- there is no byte swap here.
+ */
+static inline uint64
+read_bridge_register(phys_addr_t address)
+{
+	uint64 value;
+	asm volatile("ldxa [%[address]] 0x15, %[value]"
+		: [value] "=r"(value) : [address] "r"(address));
+	return value;
+}
+
+
+static inline void
+write_bridge_register(phys_addr_t address, uint64 value)
+{
+	asm volatile("stxa %[value], [%[address]] 0x15"
+		: : [value] "r"(value), [address] "r"(address) : "memory");
+}
 
 
 // #pragma mark - device tree
@@ -222,6 +283,11 @@ SabrePCIController::InitDriver(device_node* node, SabrePCIController*& _driver)
 
 	CHECK_RET(driver->_ReadRanges(driver->fOpenFirmwareNode));
 
+	// Not fatal. A bridge that will not go into pass-through is a bridge whose
+	// devices have to use programmed I/O, which is slower and works; refusing to
+	// initialise would mean no disk at all.
+	driver->_SetUpDma();
+
 	_driver = driver.Detach();
 	return B_OK;
 }
@@ -247,6 +313,13 @@ SabrePCIController::UninitDriver()
 status_t
 SabrePCIController::_ReadRanges(intptr_t node)
 {
+	// The bridge's own control registers, which the "reg" property points at --
+	// two cells of address, because the root node's #address-cells is 2 on a
+	// machine with more physical address space than one cell holds.
+	uint32 reg[2];
+	if (of_getprop(node, "reg", reg, sizeof(reg)) != OF_FAILED)
+		fRegisterBase = ((phys_addr_t)reg[0] << 32) | reg[1];
+
 	uint32 ranges[PCI_RANGE_CELLS * PCI_MAX_RANGES];
 	intptr_t length = of_getprop(node, "ranges", ranges, sizeof(ranges));
 	if (length == OF_FAILED) {
@@ -616,6 +689,96 @@ SabrePCIController::GetRange(uint32 index, pci_resource_range* range)
 		return B_BAD_INDEX;
 
 	*range = fResourceRanges[index];
+	return B_OK;
+}
+
+
+/*!	Puts the bridge into pass-through mode, so a physical address is a DMA address.
+
+	Haiku hands drivers physical addresses and expects a device to reach them,
+	which on this machine is true only in pass-through mode. Two things have to
+	hold for that: the address must hit the target address space register, and
+	translation must be off.
+
+	Neither is inherited rather than asserted. What the firmware actually leaves
+	behind here is translation already disabled -- so the second condition comes
+	free -- but a target address space register of 0x40, which enables region 6
+	and *not* the low gigabyte where DRAM lives. That half matters: an address
+	that misses the register is not translated and not passed through, it is
+	treated as a peer-to-peer transfer and ignored by the bridge entirely. So a
+	DMA to DRAM would have gone nowhere.
+
+	Hence the order below -- enable the regions first, then disable translation.
+	Doing it the other way round would open a window in which a transfer already
+	in flight is neither translated nor claimed.
+
+	The low gigabyte, unconditionally, because that is every address DRAM can have
+	on this processor: the IOMMU TSB base register documents physical address bits
+	33:30 as "always zero, since only 1-Gbyte of physical memory is supported".
+	Enabling more would have the bridge claim PCI addresses no DRAM answers to,
+	which the manual warns against -- "no other PCI device should be enabled to
+	respond to the UltraSPARC-IIi target address space".
+
+	Writing the control register at all, when the bit it clears is already clear,
+	is deliberate: it makes the mode this driver requires a statement rather than
+	an assumption about what ran before us, and the read-back below turns a wrong
+	assumption into a diagnostic instead of silent memory corruption. Doing so is
+	safe by this point because nothing the kernel asks Open Firmware for uses DMA.
+	Console output is programmed I/O to a 16550 and property reads are interpreter
+	work; the disk driver the firmware used has long since stopped being the one
+	in charge.
+
+	Note that QEMU does not model the target address space register -- its sun4u
+	IOMMU passes any address straight through once translation is off -- so the
+	half of this that silicon needs is the half QEMU cannot confirm.
+*/
+status_t
+SabrePCIController::_SetUpDma()
+{
+	if (fRegisterBase == 0) {
+		dprintf("sabre: no register block, so DMA cannot be set up\n");
+		return B_ERROR;
+	}
+
+	phys_addr_t control = fRegisterBase + SABRE_IOMMU_CONTROL;
+	phys_addr_t target = fRegisterBase + SABRE_TARGET_ADDRESS_SPACE;
+
+	uint64 wasControl = read_bridge_register(control);
+	uint64 wasTarget = read_bridge_register(target);
+
+	// One bit per 512 MB region, and DRAM occupies at most the low two.
+	uint32 regions = 1024 * 1024 * 1024 / TARGET_ADDRESS_SPACE_GRANULE;
+	uint64 enable = (1ULL << regions) - 1;
+
+	write_bridge_register(target, wasTarget | enable);
+	write_bridge_register(control, wasControl
+		& ~(IOMMU_CONTROL_ENABLE | IOMMU_CONTROL_DIAGNOSTIC));
+
+	uint64 nowControl = read_bridge_register(control);
+	uint64 nowTarget = read_bridge_register(target);
+
+	dprintf("sabre: iommu control %#" B_PRIx64 " -> %#" B_PRIx64 ", target "
+		"address space %#" B_PRIx64 " -> %#" B_PRIx64 "\n", wasControl,
+		nowControl, wasTarget, nowTarget);
+
+	// Said plainly rather than left to be inferred from two hex numbers, because
+	// this is the difference between a DMA that lands where the driver said and
+	// one that lands somewhere else.
+	if ((nowControl & IOMMU_CONTROL_ENABLE) != 0) {
+		dprintf("sabre: iommu translation is still on; DMA addresses are not "
+			"physical addresses and DMA must stay disabled\n");
+		return B_ERROR;
+	}
+
+	if ((nowTarget & enable) != enable) {
+		dprintf("sabre: target address space register did not take the low "
+			"gigabyte; DMA would be ignored rather than translated\n");
+		return B_ERROR;
+	}
+
+	dprintf("sabre: DMA is pass-through -- a physical address is a bus "
+		"address\n");
+
 	return B_OK;
 }
 
