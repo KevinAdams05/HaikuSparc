@@ -552,9 +552,9 @@ Two pieces of this phase are deliberately not done yet, and both are named in th
   platforms.
 
 `scsi_disk` binds to both disks and publishes `disk/ata/0/master/raw` and
-`disk/ata/0/slave/raw`; the CD-ROM identifies through the ATAPI path. The boot then hangs in
-`dprintf()` on a `%s` argument that is not NUL-terminated, which is the next thing to chase and is
-not an MMU or a bus problem.
+`disk/ata/0/slave/raw`; the CD-ROM identifies through the ATAPI path. The boot then grinds, polling a
+device that is not there — which is what the missing interrupt routing costs, and puts that piece of
+this phase on the critical path rather than in the "later" pile.
 
 See [PROGRESS §29](PROGRESS.md) for the eight bugs between the device manager and a published disk —
 including the TSB that was sitting on top of every thread stack, which is the one that had been

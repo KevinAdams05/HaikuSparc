@@ -2165,36 +2165,50 @@ Both disks and the CD-ROM, identified and published, with `scsi_disk` bound to t
 
 ### Where it stops now
 
-Immediately after, and it is a hang rather than a fault: QEMU sits at 100% CPU and the serial console
-goes quiet after
+Immediately after, and it is not a fault: the serial console goes quiet after
 
 ```
 ata 1 error: failed to read pio block
 ```
 
-which is the probe of the device that is not there — channel 1, device 1.
+— the probe of the device that is not there, channel 1 device 1 — and QEMU sits at 100% CPU. Twenty
+five minutes of that produced no further output.
 
-The QEMU monitor says exactly what it is doing:
+The QEMU monitor is the right tool here, because it can sample a running guest without needing the
+guest to cooperate. Two samples two seconds apart show two different places:
 
 ```
-pc: 00000000801d91e4          <- memchr
-%o0-3: 0000000080b167a8 0000000000000000 ffffffffffffffff ...
-%o7:   00000000801dc130       <- strnlen
+pc: 00000000801d91e4   <- memchr, %o7 = 801dc130 = strnlen, from vsnprintf
+                          strnlen(0x80b167a8, SIZE_MAX)
+pc: 000000008108c198   <- an add-on, %g2 = 0xce008182
 ```
 
-`strnlen(0x80b167a8, SIZE_MAX)`, from `vsnprintf`. A `%s` argument that is not NUL-terminated, so
-`memchr` is walking four gigabytes a word at a time and will be for some while.
+So it is **not** hung. It is grinding, and both samples say what on:
 
-The prime suspect is the ATA driver's debug context. `TRACE_ERROR` expands to a `dprintf` whose
-first argument is `_DebugContext()`, a pointer into the device or channel object; the identify that
-just failed ends with the device being deleted, and the next message printed through that context
-would be reading freed memory. Worth confirming before fixing, because the same shape of bug could
-equally be an uninitialised context on a channel that never got a device.
+`0x80b167a8` is not a source string — dumping it gives `ata 1 error: failed to r...`, the log line
+that had just been printed. That is the debug output path working on its own buffer, which is what
+the "Last message repeated 12 times." filter in `dprintf()` does. So the first sample is a *symptom*
+of a message being printed over and over, not a bug in its own right.
 
-Two things are worth doing regardless of which it is, and neither is speculative:
+The second sample says what is printing it. `0xce000000` is where the PCI bus manager mapped the I/O
+window, and `0xce008182` is I/O port `0x8182` — channel 1's alternate status register. The driver is
+polling a device that will never answer.
 
-- `dprintf()` walking four gigabytes for a missing terminator is a poor failure mode for a kernel
-  log function. A bound would turn this hang into a truncated line.
-- The ATA driver is polling because `SabrePCIController::ReadIrq()` has nothing to report yet.
-  Interrupt routing is the other half of Phase 7 and would make this whole path faster and less
-  strange.
+Which is exactly what the absence of interrupt routing costs. `SabrePCIController::ReadIrq()` returns
+`B_UNSUPPORTED`, so every ATA operation runs on timeouts, and a probe of a device that is not there
+runs on the *longest* ones. The SCSI stack then asks about seven LUNs that do not exist and eight
+targets that do not exist, and each of those is another round.
+
+So the next step is not a hunt. It is the interrupt-map walk that
+`ECAMPCIControllerFDT::Finalize()` already does for the flattened-device-tree platforms, applied to
+the `interrupt-map` property on the sabre node — the piece of Phase 7 that was left deliberately
+undone, now on the critical path.
+
+Two smaller things are worth doing alongside it, and neither is speculative:
+
+- Bound the `%s` scan in the kernel's `dprintf()`. Walking four gigabytes for a missing terminator is
+  a poor failure mode for a log function, and the only reason it showed up here is that it was being
+  asked to do it constantly.
+- Give the ATA probe of an absent device a shorter path. Haiku's driver was written for machines where
+  the controller raises an interrupt; every timeout it takes here is a wall-clock second that a
+  working IRQ would not cost.
