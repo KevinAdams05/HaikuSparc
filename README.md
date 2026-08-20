@@ -16,8 +16,8 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 ## Status
 
 **The kernel runs its own MMU, page table and VM, schedules and preempts threads, keeps time, and
-reaches the disk device manager.** Phases 0–4 are complete, including Phase 2 — the MMU and trap
-table, the gate this port has always turned on.
+can print a backtrace of its own stack.** Phases 0–5 are complete, including Phase 2 — the MMU and
+trap table, the gate this port has always turned on.
 
 On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
 enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
@@ -45,8 +45,14 @@ Along the way the firmware's own clock turned out to be the unreliable one — O
 `milliseconds` runs about eleven times fast under QEMU, which took timestamping the serial output
 on the host to establish.
 
-Next is Phase 5, window-aware backtraces, which the plan said to start during Phase 2 and which is
-now four phases overdue.
+Phase 5, window-aware backtraces, is done — four phases later than the plan said to do it. A trace
+walks across spilled register windows and terminates at `sparc_thread_entry`, the fabricated frame
+Phase 3 built for a thread that had never run.
+
+Next is a usable kernel debugger. The stack walker works and the prompt now accepts a keypress — it
+never had, for the same `int` versus `intptr_t` reason as a Phase 1 bug — but the debugger's own
+command-evaluation path still faults, which is one bug away from this port having a real
+debugger.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

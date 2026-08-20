@@ -5,15 +5,14 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0–4 complete. The kernel keeps time, takes interrupts, and preempts.**
+**State: Phases 0–5 complete. The kernel keeps time, preempts, and can print a backtrace.**
 
-The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The
-kernel takes the MMU and trap table over from Open Firmware, builds its own three-level page
-table, runs the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler,
-switches between kernel threads, keeps time from `%TICK`, takes the level-14 timer interrupt, and
-**preempts a thread that never yields**. It gets as far as
-`KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk drivers
-yet.
+The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The kernel
+takes the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
+the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler, switches
+between and preempts kernel threads, keeps time from `%TICK`, and walks its own stack across spilled
+register windows. It gets as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing,
+because there are no disk drivers yet.
 
 Exit criteria met, each by a deliberate test rather than by inference:
 
@@ -25,6 +24,7 @@ Exit criteria met, each by a deliberate test rather than by inference:
 | 3 | Two threads hand control back and forth | `counter 128 of 128 after 124 yields` (§23) |
 | 4 | `system_time()` is right | monotonic, and agreeing with the raw `%TICK` delta (§24) |
 | 4 | A tick preempts a busy loop | `spinner reached 402130 after 8720 us without either thread yielding` (§24) |
+| 5 | A correct backtrace across a spilled window | 24 identical call sites, and a printed trace ending at `sparc_thread_entry` (§25) |
 
 What exists:
 
@@ -37,15 +37,19 @@ What exists:
 | Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 | Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
-| Clock | `system_time()` from `%TICK` and the firmware's clock-frequency (§24) |
-| Timer interrupt | entry path, C handler, `%TICK_CMPR` arming, preemption (§24) |
+| Clock and timer | `system_time()` from `%TICK`, level-14 interrupt, preemption (§24) |
+| Backtraces | window-aware stack walk, `sc`/`bt`/`where` registered (§25) |
 
-**Next: Phase 5, KDL and backtraces** — which the plan said to start during Phase 2 and which is
-now four phases overdue. Everything since has been diagnosed with one frame of context rather than
-a stack walk.
+**Next: a usable KDL.** The stack walker works but `sc` cannot be run interactively, because the
+debugger's own command-evaluation path faults — `kernel_debugger_loop` on a four-byte load through a
+pointer of 7, after `create_debug_alloc_pool`, and `DebugAllocPool::Free: bad address` in every boot
+since Phase 2. That is one bug away from the port having a real debugger, which makes it the highest
+-value thing left.
 
-**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), and the boot ends
-at `did not find any boot partitions!`, which is the absence of disk drivers rather than a defect.
+**Then Phase 6, userspace.**
+
+**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), and the boot ends at
+`did not find any boot partitions!`, which is the absence of disk drivers rather than a defect.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1485,3 +1489,107 @@ sparc_int: spinner reached 402130 after 8720 us without either thread yielding -
 
 Three consecutive boots, spinner counts within 2% of each other. The deadline uses `system_time()`,
 so a failure of either half of this phase surfaces in the same place.
+
+
+## 25. Backtraces, four phases late
+
+The plan said to do this during Phase 2 and it was done after Phase 4. Everything in between was
+diagnosed with one frame of context — the trapped window's `%o7` and `%i7` — which was enough every
+time but took a bracket-and-bisect hunt more than once.
+
+### The walk
+
+Short, because a SPARC frame already holds what a backtrace needs. The register save area at
+`%sp + 2047` has the sixteen registers a spill writes, and two of them are the whole thing: `%i6` is
+the caller's stack pointer, `%i7` the call site.
+
+And `%i7` is **the call instruction's address, not the return address** — `call` records its own
+address and the return goes to `%i7 + 8`. That is better than the usual arrangement rather than
+worse: the value already points inside the calling function, so it symbolises correctly even when
+the call is the last instruction in it, which is exactly the case where a return address lands in
+the next function and names the wrong one.
+
+### Two things about register windows
+
+**`flushw` first.** A frame's save area holds nothing until that window has been spilled, and the
+most recent windows are usually still in the register file — that being the point of register
+windows. Walking without flushing reads whatever those save areas held before, which is to say a
+plausible-looking backtrace of an older call chain. A thread that is not running needs no flush; the
+context switch already did one.
+
+**`flushw` does not flush the current window.** It writes every window *except* the one executing
+it. So the innermost frame's save area is still stale afterwards, and its `%i6` and `%i7` have to
+come from the registers instead.
+
+Getting that wrong is not subtle in its effect but is very subtle in its cause: **the walk finds
+exactly one frame and stops**, because the stale save area's "caller stack pointer" leads nowhere.
+That is exactly what the first version did, and the one-frame result is what pointed at it.
+
+### Proving it, and two false starts
+
+The test recurses twenty-four deep against eight windows, so most of the chain is in memory rather
+than registers by the time the trace is taken. What makes it checkable without a symbol table is
+that the probe calls itself from exactly one place, so **every recursive frame records the same call
+site**:
+
+```
+arch_debug: backtrace found 30 frames, 24 of them the same call site 0x801c85c4, 0x40 past the probe
+```
+
+Twenty-four identical addresses in a row is not something a wrong walk produces by accident.
+
+**Symbolising them was the obvious check and is not available.**
+`elf_debug_lookup_symbol_address()` asserts the image mutex is held — true inside the debugger,
+where locking is suspended, and not true of ordinary kernel code. The first version of the test
+tripped that assertion, so `lookup_symbol()` now checks `debug_debugger_running()` and prints bare
+addresses otherwise.
+
+**The probe is compiled `-O0`, and that is not laziness.** At `-O2` the compiler applied the
+accumulator transformation to `f(depth - 1) + 1` and turned the whole recursion into a loop — one
+frame instead of twenty-four, and a test that cheerfully reported five frames and proved nothing.
+`noinline` does not prevent that; only turning the optimisation off does.
+
+### The printed trace
+
+```
+stack trace for thread 15 "main2"
+ 0 0000000080291421 (+  208) 00000000801c9208   arch_int_init_post_device_manager
+ 1 00000000802914f1 (+  176) 00000000800a4088   main2
+ 2 00000000802915a1 (+  224) 00000000800cc954   common_thread_entry
+ 3 0000000080291681 (+  176) 00000000801b005c   sparc_thread_entry
+```
+
+(Symbols resolved by hand, since this was printed outside the debugger.)
+
+It ends at `sparc_thread_entry` — the fabricated first frame from Phase 3, whose `%i6` and `%i7`
+were deliberately zeroed so that a walk would terminate at the bottom of the thread rather than
+wander into whatever the memory used to hold. Two phases later, it does exactly that.
+
+`kprintf()` had to be given a sibling for this. It is the debugger's output and goes nowhere when
+the debugger is not running, which makes it exactly wrong for a backtrace printed from ordinary
+kernel code: the call succeeds and nothing appears.
+
+### The debugger now takes a keypress
+
+Trying to run `sc` at the prompt found a separate bug, and a familiar one.
+`SerialDebugGetChar()` passed `&key` to `of_interpret()` where `key` was an `int`, and
+`of_interpret()` returns values by writing through the caller's pointer as a `void**` — an
+eight-byte store. That writes four bytes past the variable and, on a strict-alignment architecture,
+raises `mem_address_not_aligned` whenever the `int` is not eight-byte aligned.
+
+So the debugger had never accepted a keypress on this port: typing anything faulted inside
+`of_interpret()`, which panicked, which re-entered the debugger, which prompted again — a loop that
+looked like the prompt ignoring input.
+
+**Exactly the mistake as the `of_open()` handle truncation from Phase 1**, in the same interface and
+for the same reason: Open Firmware deals in pointer-width values and `int` is not one. PowerPC's
+copy has it too, and is harmless there only because `int` and `intptr_t` coincide.
+
+### What still stands between this and a usable KDL
+
+`sc` still cannot be run interactively. With input working, the command reaches the debugger's own
+evaluation path and faults there: `kernel_debugger_loop` on a four-byte load through a pointer of 7,
+called after `create_debug_alloc_pool`. `DebugAllocPool::Free: bad address` has appeared in every
+boot since Phase 2 and was ignored as cosmetic; it is probably the same thing.
+
+That is one bug away from this port having a real debugger, and it is not the stack walker.

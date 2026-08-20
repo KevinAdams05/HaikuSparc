@@ -480,7 +480,7 @@ stubbed deliberately.
 **Status: done.** `system_time()` from `%TICK`, the level-14 entry path, `%TICK_CMPR` arming, and
 preemption — a spinner that never yields is taken off the CPU. See [PROGRESS §24](PROGRESS.md).
 
-### Phase 5 — KDL and backtraces (starts during Phase 2, not after)
+### Phase 5 — KDL and backtraces (starts during Phase 2, not after)  **[DONE]**
 
 Window-aware stack unwinding and debug-variable support. This is listed fifth but should be
 started as soon as Phase 2 is underway: `arch_debug.cpp` currently returns zero stack frames,
@@ -491,7 +491,13 @@ Fixing it early pays for itself immediately.
 **Exit:** KDL prints a correct backtrace across a spilled window boundary.
 **Risk: medium.**
 
-**This advice was not taken, and the cost is now measurable.** Phases 2 and 3 were done without
+**Status: done**, four phases later than this said to do it. The stack walk works and prints, and
+the debugger will now accept a keypress — that had never worked, for the same `int` versus
+`intptr_t` reason as a Phase 1 bug. What remains between this and a usable KDL is a fault in the
+debugger's own command-evaluation path, which is not the stack walker; see
+[PROGRESS §25](PROGRESS.md).
+
+**The advice above was not taken, and the cost is now measurable.** Phases 2 and 3 were done without
 backtraces. What replaced them was a trap handler that returns to TL=0 and reports the trapped
 window's `%o7` and `%i7`, which turned out to identify a call site well enough to find every bug
 that came up — see [PROGRESS §22 and §23](PROGRESS.md). That is one frame, not a backtrace, and
