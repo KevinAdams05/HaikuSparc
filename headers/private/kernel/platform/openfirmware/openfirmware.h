@@ -42,6 +42,11 @@ extern "C" {
 
 extern status_t of_init(intptr_t (*openFirmwareEntry)(void *));
 
+/* Reports what client calls do to the registers SPARC V9 reserves for the
+   operating system. Call once the kernel's debug output works; a no-op
+   elsewhere. */
+extern void openfirmware_report_reserved_globals(void);
+
 /* device tree functions */
 extern intptr_t of_finddevice(const char *device);
 extern intptr_t of_child(intptr_t node);

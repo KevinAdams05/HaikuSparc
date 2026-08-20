@@ -8,10 +8,139 @@
 
 #include <stdarg.h>
 
+#ifndef _BOOT_PLATFORM_OPENFIRMWARE
+#	include <debug.h>
+#	include <interrupts.h>
+#endif
+
 
 // OpenFirmware entry function
 static intptr_t (*gCallOpenFirmware)(void *) = 0;
 intptr_t gChosen;
+
+
+#if defined(__sparc__) && !defined(_BOOT_PLATFORM_OPENFIRMWARE)
+// What the first client call did to the reserved globals, and whether any call
+// has ever changed them. See call_open_firmware() below.
+static bool sObservedReservedGlobals = false;
+static bool sReservedGlobalsClobbered = false;
+static uint64 sReservedGlobalsBefore[2];
+static uint64 sReservedGlobalsAfter[2];
+#endif
+
+
+/*!	Calls the firmware, with interrupts off on SPARC.
+
+	SPARC V9 reserves %g6 and %g7 for the operating system, and Haiku's SPARC
+	kernel keeps the current thread pointer in %g7 -- every
+	thread_get_current_thread() is a read of it. The firmware is not the
+	operating system and uses those registers for its own state while a client
+	call is running; OpenBIOS puts its Forth engine's working values there.
+
+	It puts them back before returning, so the call looks harmless from the
+	outside -- the check below confirms that, and says so through
+	openfirmware_report_reserved_globals(). What is not harmless is an interrupt
+	arriving in the middle. The handler is ordinary kernel code and reads %g7 to
+	find out which thread and which CPU it is on, and during a client call %g7
+	belongs to the firmware. The observed failure was a timer interrupt landing
+	inside the of_write() behind a dprintf(): timer_interrupt() called
+	smp_get_current_cpu(), which read %g7 as 0xffec73a1 -- an address inside
+	OpenBIOS's own image -- and took a data alignment trap on thread->cpu. It
+	then faulted again trying to report that, because panic() needs the thread
+	too, and the cascade ran the trap level to MAXTL.
+
+	So the window has to not exist. Nothing about a client call needs to be
+	interruptible: they are short, they are already serialised by being the only
+	way to reach the firmware, and the timer interrupt they delay is posted in
+	SOFTINT and delivered as soon as interrupts come back.
+
+	The save and restore stays as well, for a different reason: OpenBIOS putting
+	the registers back is OpenBIOS's behaviour, and this port is aimed at real
+	Sun OBP, which nobody has run it on. Two moves either side of a Forth call
+	cost nothing measurable, and the alternative is finding out the hard way.
+
+	Other architectures have no such reserved registers to lose, so this is a
+	plain call for them.
+*/
+static intptr_t
+call_open_firmware(void *args)
+{
+#ifdef __sparc__
+#ifndef _BOOT_PLATFORM_OPENFIRMWARE
+	// The loader has no interrupts to disable, and no threads to lose.
+	cpu_status interruptState = disable_interrupts();
+#endif
+
+	uint64 savedG6;
+	uint64 savedG7;
+	asm volatile("mov %%g6, %0" : "=r"(savedG6));
+	asm volatile("mov %%g7, %0" : "=r"(savedG7));
+
+	intptr_t result = gCallOpenFirmware(args);
+
+#ifndef _BOOT_PLATFORM_OPENFIRMWARE
+	// Recorded rather than printed: the kernel's dprintf() reaches the serial
+	// port through of_write(), which arrives here, so anything printed from
+	// inside this function is dropped by dprintf()'s re-entrancy guard.
+	uint64 firmwareG6;
+	uint64 firmwareG7;
+	asm volatile("mov %%g6, %0" : "=r"(firmwareG6));
+	asm volatile("mov %%g7, %0" : "=r"(firmwareG7));
+
+	if (!sObservedReservedGlobals) {
+		sObservedReservedGlobals = true;
+		sReservedGlobalsBefore[0] = savedG6;
+		sReservedGlobalsBefore[1] = savedG7;
+		sReservedGlobalsAfter[0] = firmwareG6;
+		sReservedGlobalsAfter[1] = firmwareG7;
+	}
+	if (firmwareG6 != savedG6 || firmwareG7 != savedG7)
+		sReservedGlobalsClobbered = true;
+#endif
+
+	asm volatile("mov %0, %%g6" : : "r"(savedG6));
+	asm volatile("mov %0, %%g7" : : "r"(savedG7));
+
+#ifndef _BOOT_PLATFORM_OPENFIRMWARE
+	restore_interrupts(interruptState);
+#endif
+
+	return result;
+#else
+	return gCallOpenFirmware(args);
+#endif
+}
+
+
+/*!	Says what the firmware does to %g6 and %g7, from somewhere that can print.
+
+	Call once the kernel's debug output works and a few client calls have been
+	made. Costs nothing and answers a question that is otherwise unanswerable
+	from a log: whether the save and restore in call_open_firmware() is doing
+	anything.
+*/
+void
+openfirmware_report_reserved_globals()
+{
+#if defined(__sparc__) && !defined(_BOOT_PLATFORM_OPENFIRMWARE)
+	if (!sObservedReservedGlobals) {
+		dprintf("openfirmware: no client call has been made yet\n");
+		return;
+	}
+
+	if (sReservedGlobalsClobbered) {
+		dprintf("openfirmware: client calls return with the reserved globals "
+			"changed; the first left %%g6 %#lx -> %#lx and %%g7 %#lx -> %#lx, "
+			"and both are restored after every call\n",
+			sReservedGlobalsBefore[0], sReservedGlobalsAfter[0],
+			sReservedGlobalsBefore[1], sReservedGlobalsAfter[1]);
+	} else {
+		// Which says nothing about what they hold *during* a call -- see
+		// call_open_firmware(). This reports the net effect only.
+		dprintf("openfirmware: client calls return %%g6 and %%g7 unchanged\n");
+	}
+#endif
+}
 
 
 status_t
@@ -53,7 +182,7 @@ of_call_client_function(const char *method, intptr_t numArgs,
 		args.args[i] = NULL;
 	}
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	if (numReturns > 0) {
@@ -103,7 +232,7 @@ of_interpret(const char *command, intptr_t numArgs, intptr_t numReturns, ...)
 	}
 
 	// args.args[numArgs] is the "catch-result" return value
-	if (gCallOpenFirmware(&args) == OF_FAILED || args.args[numArgs])
+	if (call_open_firmware(&args) == OF_FAILED || args.args[numArgs])
 		return OF_FAILED;
 
 	if (numReturns > 0) {
@@ -155,7 +284,7 @@ of_call_method(uint32_t handle, const char *method, intptr_t numArgs,
 	}
 
 	// args.args[numArgs] is the "catch-result" return value
-	if (gCallOpenFirmware(&args) == OF_FAILED || args.args[numArgs])
+	if (call_open_firmware(&args) == OF_FAILED || args.args[numArgs])
 		return OF_FAILED;
 
 	if (numReturns > 0) {
@@ -184,7 +313,7 @@ of_finddevice(const char *device)
 		intptr_t	handle;
 	} args = {"finddevice", 1, 1, device, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.handle;
@@ -205,7 +334,7 @@ of_child(intptr_t node)
 		intptr_t	child;
 	} args = {"child", 1, 1, node, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.child;
@@ -226,7 +355,7 @@ of_peer(intptr_t node)
 		intptr_t	next_sibling;
 	} args = {"peer", 1, 1, node, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.next_sibling;
@@ -247,7 +376,7 @@ of_parent(intptr_t node)
 		intptr_t	parent;
 	} args = {"parent", 1, 1, node, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.parent;
@@ -267,7 +396,7 @@ of_instance_to_path(uint32_t instance, char *pathBuffer, intptr_t bufferSize)
 		intptr_t	size;
 	} args = {"instance-to-path", 3, 1, instance, pathBuffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -285,7 +414,7 @@ of_instance_to_package(uint32_t instance)
 		intptr_t	package;
 	} args = {"instance-to-package", 1, 1, instance, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.package;
@@ -306,7 +435,7 @@ of_getprop(intptr_t package, const char *property, void *buffer, intptr_t buffer
 		intptr_t	size;
 	} args = {"getprop", 4, 1, package, property, buffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -328,7 +457,7 @@ of_setprop(intptr_t package, const char *property, const void *buffer,
 		intptr_t	size;
 	} args = {"setprop", 4, 1, package, property, buffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -347,7 +476,7 @@ of_getproplen(intptr_t package, const char *property)
 		intptr_t	size;
 	} args = {"getproplen", 2, 1, package, property, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -367,7 +496,7 @@ of_nextprop(intptr_t package, const char *previousProperty, char *nextProperty)
 		intptr_t	flag;
 	} args = {"nextprop", 3, 1, package, previousProperty, nextProperty, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.flag;
@@ -387,7 +516,7 @@ of_package_to_path(intptr_t package, char *pathBuffer, intptr_t bufferSize)
 		intptr_t	size;
 	} args = {"package-to-path", 3, 1, package, pathBuffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -408,7 +537,7 @@ of_open(const char *nodeName)
 		intptr_t	handle;
 	} args = {"open", 1, 1, nodeName, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED || args.handle == 0)
+	if (call_open_firmware(&args) == OF_FAILED || args.handle == 0)
 		return OF_FAILED;
 
 	return args.handle;
@@ -425,7 +554,7 @@ of_close(intptr_t handle)
 		intptr_t	handle;
 	} args = {"close", 1, 0, handle};
 
-	gCallOpenFirmware(&args);
+	call_open_firmware(&args);
 }
 
 
@@ -442,7 +571,7 @@ of_read(intptr_t handle, void *buffer, intptr_t bufferSize)
 		intptr_t	size;
 	} args = {"read", 3, 1, handle, buffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -462,7 +591,7 @@ of_write(intptr_t handle, const void *buffer, intptr_t bufferSize)
 		intptr_t	size;
 	} args = {"write", 3, 1, handle, buffer, bufferSize, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.size;
@@ -486,7 +615,7 @@ of_seek(intptr_t handle, off_t pos)
 		intptr_t	status;
 	} args = {"seek", 3, 1, handle, pos_hi, pos, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.status;
@@ -505,7 +634,7 @@ of_blocks(intptr_t handle)
 		intptr_t        blocks;
 	} args = {"#blocks", 2, 1, handle, 0, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 	return args.blocks;
 }
@@ -523,7 +652,7 @@ of_block_size(intptr_t handle)
 		intptr_t        size;
 	} args = {"block-size", 2, 1, handle, 0, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 	return args.size;
 }
@@ -543,7 +672,7 @@ of_release(void *virtualAddress, intptr_t size)
 		intptr_t	size;
 	} args = {"release", 2, 0, virtualAddress, size};
 
-	return gCallOpenFirmware(&args);
+	return call_open_firmware(&args);
 }
 
 
@@ -560,7 +689,7 @@ of_claim(void *virtualAddress, intptr_t size, intptr_t align)
 		void		*address;
 	} args = {"claim", 3, 1, virtualAddress, size, align};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return NULL;
 
 	return args.address;
@@ -584,7 +713,7 @@ of_test(const char *service)
 		intptr_t	missing;
 	} args = {"test", 1, 1, service, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.missing;
@@ -604,7 +733,7 @@ of_milliseconds(void)
 		intptr_t	milliseconds;
 	} args = {"milliseconds", 0, 1, 0};
 
-	if (gCallOpenFirmware(&args) == OF_FAILED)
+	if (call_open_firmware(&args) == OF_FAILED)
 		return OF_FAILED;
 
 	return args.milliseconds;
@@ -620,6 +749,6 @@ of_exit(void)
 		intptr_t	num_returns;
 	} args = {"exit", 0, 0};
 
-	gCallOpenFirmware(&args);
+	call_open_firmware(&args);
 }
 
