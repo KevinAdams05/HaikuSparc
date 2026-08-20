@@ -190,7 +190,23 @@ SparcOpenFirmware::InitRTC(struct kernel_args *kernelArgs,
 char
 SparcOpenFirmware::SerialDebugGetChar()
 {
-	int key;
+	// intptr_t, not int. of_interpret() returns values by writing through the
+	// caller's pointer as a void**, which is an eight-byte store: passing the
+	// address of an int both writes four bytes past it and, on a strict-alignment
+	// architecture, raises mem_address_not_aligned whenever that int does not
+	// happen to be eight-byte aligned.
+	//
+	// This is why the kernel debugger has never accepted a keypress on this
+	// port. Typing anything at the "kdebug>" prompt faulted inside
+	// of_interpret(), which panicked, which re-entered the debugger, which
+	// prompted again.
+	//
+	// The same mistake as the of_open() handle truncation found in Phase 1, in
+	// the same interface and for the same reason: Open Firmware deals in
+	// pointer-width values, and int is not one on a 64-bit machine. PowerPC's
+	// copy of this function has it too, and is harmless there only because int
+	// and intptr_t coincide.
+	intptr_t key = 0;
 	if (of_interpret("key", 0, 1, &key) == OF_FAILED)
 		return 0;
 	return (char)key;
