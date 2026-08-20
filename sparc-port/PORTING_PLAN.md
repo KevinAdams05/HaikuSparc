@@ -156,8 +156,10 @@ trap table" cannot be sequenced. They ship together or neither works.
 
 There is a second, easily-missed translation structure. Chapter 10 of the IIi manual describes
 the **IOMMU's own software-managed TSB** for DVMA — a completely separate table with a
-different TTE format from the CPU MMU's in Chapter 15. That one is not needed until PCI DMA in
-Phase 7, but it should not come as a surprise when it arrives.
+different TTE format from the CPU MMU's in Chapter 15. It turned out not to be needed on this
+generation: pass-through mode makes a physical address a DMA address, and a processor limited to a
+gigabyte of memory has nothing a 32-bit DMA address cannot reach. It becomes necessary on a machine
+with more memory than that, or the day DMA needs to be constrained rather than merely to work.
 
 #### The failure mode that ends the machine
 
@@ -553,22 +555,26 @@ volume. The kernel then replaces every preloaded add-on with the file behind it,
 Everything after the mount is the kernel looking for a userland that is not on the volume yet, which
 is Phase 6's packaging gap seen from the other side.
 
-**Interrupt routing is implemented** — the sabre interrupt controller in the kernel, trap 0x60 and all
-fifteen interrupt levels in the table, and the firmware's `interrupt-map` resolving each device to its
-Interrupt Number Offset. It is verified up to the hardware boundary: the mapping register accepts the
-valid bit and reads it back, and the ATA driver is told interrupt 32 rather than the pin the firmware
-left behind.
+**Interrupts are routed and delivered, and the disk runs over DMA.** The sabre interrupt controller
+lives in the kernel, trap 0x60 and all fifteen interrupt levels are in the table, and the firmware's
+`interrupt-map` resolves each device to its Interrupt Number Offset. Delivery is proven rather than
+inferred — a real device interrupt arrives as a mondo packet on vector 32 — and all four ATA devices
+negotiate DMA mode 0x15 and transfer without a fallback to PIO.
 
-**Delivery is not yet proven, and cannot be until DMA exists.** `ATAChannel::WaitForInterrupt()` is
-called only when `request->UseDMA()`, so with DMA off nothing on this machine generates a device
-interrupt; a whole boot takes trap 0x4e, the timer, and nothing else. Faking a packet is foreclosed by
-the hardware — UltraSPARC-IIi cannot dispatch an interrupt vector, not even to itself.
+The IOMMU turned out not to need programming. UltraSPARC-IIi supports at most a gigabyte of physical
+memory, so pass-through mode (TABLE 10-3: an address that hits the target address space register, with
+translation off) reaches every byte of DRAM in 32 bits and *is* Haiku's physical-address DMA model. What
+the bridge needs is four register writes, not a second software-managed TSB. The table in §4.1 remains
+the right answer for a machine with more memory than this one can have.
 
-So one piece of this phase remains, and it is now also what will exercise the other:
+What actually stood between DMA and working was a byte swap applied twice — see
+[PROGRESS §31](PROGRESS.md), which also corrects the mechanism this plan previously attributed the
+first DMA attempt's memory corruption to.
 
-- **The IOMMU.** PCI masters address host memory through the host bridge's IOMMU and nothing programs
-  it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is correct and slower, but
-  not by as much as was assumed — see the correction in PROGRESS §30.
+So what remains of this phase is the other half of its exit criterion, `hme`, plus one deliberate
+omission: the CMD646's own interrupt latch at configuration offset 0x50 is never cleared, costing one
+unhandled interrupt per transfer. That is a chip-specific register and belongs in a chip-specific bus
+driver next to `silicon_image_3112`, not in shared code — PROGRESS §31 records what it wants.
 
 See [PROGRESS §29](PROGRESS.md) for the twelve bugs between the device manager and a mounted volume,
 and for the QEMU invocation that reproduces it.

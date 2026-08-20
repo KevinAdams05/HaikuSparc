@@ -2416,3 +2416,155 @@ mappings. That is the thing to measure next if boot time matters — not the int
 None of which makes this work wrong or wasted: nothing that needs an interrupt could have worked without
 it, and DMA, `hme` and USB all need one. It was simply not the reason the boot was slow, and the
 reasoning that put it first did not survive being measured.
+
+
+## 31. DMA, and the same byte swap applied twice
+
+Section 30 ended with interrupt routing implemented and nothing on the machine that needed an
+interrupt. DMA was the obvious thing to point it at: it is the last named item in the bus-manager
+phase, and the ATA stack only ever calls `WaitForInterrupt()` when `request->UseDMA()` is true, so
+turning DMA on is also the only way to prove the interrupt path end to end.
+
+### What the bridge actually leaves behind
+
+TABLE 10-3 of the UltraSPARC-IIi manual gives three ways a PCI master can reach host memory. With the
+IOMMU enabled, a 32-bit DMA address is a *virtual* one translated through a table in memory. With it
+disabled, an address that hits the target address space register is used directly as a physical DRAM
+address — pass-through, section 10.3.3, "higher bits of physical address are padded with 0". The third,
+bypass, needs a 64-bit dual-cycle address and so is unavailable to anything whose descriptors are 32
+bits wide, which includes every PRD entry ATA has.
+
+Pass-through is exactly Haiku's DMA model: drivers are handed physical addresses and expect a device to
+reach them. And it is sufficient here rather than merely convenient — the IOMMU TSB base register
+documents physical address bits 33:30 as "always zero, since only 1-Gbyte of physical memory is
+supported", so every byte of DRAM on this processor is reachable in 32 bits and there is no aperture to
+ration.
+
+So `_SetUpDma()` asserts both halves of that mode and reads them back:
+
+```
+sabre: iommu control 0x0 -> 0x0, target address space 0x40 -> 0x43
+sabre: DMA is pass-through -- a physical address is a bus address
+```
+
+Which was informative in a way I had not predicted. Translation was **already off** — I had assumed
+Open Firmware would leave its own DVMA mappings enabled, and it does not. But the target address space
+register read `0x40`: region 6 enabled, and *not* the low gigabyte where DRAM lives. That half matters
+just as much, because an address that misses the register is neither translated nor passed through — the
+manual has the bridge treat it as a peer-to-peer transfer and ignore it. A DMA to DRAM would have gone
+nowhere at all.
+
+Worth recording that QEMU does not model this register; its sun4u IOMMU passes any address straight
+through once translation is off. So the half of `_SetUpDma()` that silicon needs is precisely the half
+QEMU cannot confirm.
+
+### Interrupts arrive
+
+With DMA enabled, the thing this was all for:
+
+```
+sparc_int: first interrupt packet on vector 32
+```
+
+A real device interrupt, delivered as a mondo packet on trap 0x60, vector read from `ASI_INTR_DATA`,
+BUSY cleared, dispatched through `io_interrupt_handler()`, and the sabre clear register written back to
+IDLE. Every layer built in section 30, working.
+
+### And DMA still failed
+
+```
+check_sense: Hardware error
+ata 0-0: disabling DMA after 3 failures
+```
+
+Three attempts per device, then a fall back to PIO — which is why the boot still mounted, and why this
+was a bug to find rather than a broken machine.
+
+`ata_adapter_finish_dma()` reads the bus master status and returns `B_DEV_DATA_OVERRUN` if the Active
+bit is still set. Instrumenting it said Active was indeed still set, so I read the bus master status
+in the interrupt handler too, and found there were **two** interrupts per transfer:
+
+```
+ata_adapter: interrupt, bus master status 0x0, dmaing 0, cfr 0x4, mrdmode 0x4
+ata_adapter: interrupt, bus master status 0x5, dmaing 1, cfr 0x4, mrdmode 0x4
+```
+
+`0x5` is Interrupt plus Active — the device had signalled completion while the engine still had work
+outstanding. That is a specific condition, and QEMU says what it means in one line of `ide_dma_cb()`:
+*"The PRDs were longer than needed for this request. The Active bit must remain set after the request
+completes."*
+
+Longer than needed. The first PRD was correct — `host 0x15fd3b0 -> bus 0x15fd3b0, 512 bytes`, the
+identity that pass-through promises, the right length for a one-sector read. The end-of-table bit was
+correct too: `B_LBITFIELD8_2` reverses its declaration order on a big-endian host, so `EOT` lands in bit
+7 of the last byte either way. The table was right. The controller was not reading the table.
+
+```c
+pci->write_io_32(device, channel->bus_master_base + ATA_BM_PRDT_ADDRESS,
+    (pci->read_io_32(...) & 3)
+    | (B_HOST_TO_LENDIAN_INT32((uint32)pci->ram_address(device,
+        channel->prdt_phys)) & ~3));
+```
+
+`write_io_32()` takes a host integer and puts it on a little-endian bus, converting on the way — that is
+what section 29 made it do, and what the accessor has always meant on x86, where the conversion is
+`outl` and the macro is a no-op. Doing it here as well converts twice. The controller was handed
+`0x011fa000` byte-reversed, walked whatever bytes happened to live at that address as descriptors, and
+transferred against them.
+
+Deleting the macro is the whole fix:
+
+```
+ata_adapter: interrupt, bus master status 0x4, dmaing 1
+ata 0-0: using DMA mode 0x15
+ata 0-1: using DMA mode 0x15
+ata 1-0: using DMA mode 0x15
+ata 1-1: using DMA mode 0x15
+bfs: mounted "Haiku" (root node at 2051, device = /dev/disk/ata/0/slave/raw)
+```
+
+Status `0x4` — Interrupt set, Active clear. All four devices on DMA, no failures, no sense errors.
+
+### A correction, and what it was hiding
+
+The `#ifdef __sparc__` guard this replaces carried a confident explanation. It said DMA had corrupted
+the kernel because PRD entries "held truncated physical addresses" that the sabre IOMMU translated
+through whatever the firmware left behind, so the transfer "landed somewhere else in memory".
+
+The symptom was real — a completed transfer, memory belonging to something else overwritten, a bus error
+on a clobbered pointer at the next reschedule. The mechanism was not. The IOMMU was never on. What
+actually happened is that the controller read its descriptor table from a byte-reversed address, and
+wrote data to whatever addresses it found in the bytes there. Random destinations, for a much more
+ordinary reason.
+
+That guard was written when only the symptom was known, and the note in `UPSTREAM_DELTA.md` said the
+right thing about it — "should become an IOMMU implementation rather than an upstream patch". It is
+worth being clear that it should not: the fix belongs upstream, in shared code, as a latent big-endian
+bug in the same family as the four already found in section 29. The IOMMU work the guard called for
+turned out to be four register writes that were not the problem.
+
+### One thing left, deliberately
+
+`cfr 0x4` never clears. CFR is a CMD646 register at configuration offset 0x50, and bit 2 is that
+chip's own interrupt latch — a different register from the bus master status bit that
+`ata_adapter_inthand()` checks and clears. Nothing clears CFR, so the PCI line stays asserted, the
+sabre re-delivers once after we write IDLE, and every transfer costs one extra interrupt that returns
+`B_UNHANDLED_INTERRUPT`. Linux's `pata_cmd64x` is the reference for what it wants: CFR bit 2 for
+channel 0 and `ARTTIM23` bit 4 for channel 1, or `MRDMODE` bits 2 and 3 at BAR4+1, written back to
+clear.
+
+Harmless as it stands. The kernel only disables a vector for being unhandled at over 99% of 10,000
+triggers, and only under `DEBUG_INTERRUPTS`; alternating handled and unhandled sits at half that. So
+this is left alone on purpose, because the fix does not belong in `generic_ide_pci` — a chip-specific
+interrupt register is what a chip-specific bus driver is for, alongside `silicon_image_3112` and the
+others in `busses/ata/`. Noted as its own piece of work rather than smuggled into shared code.
+
+### Where the phase stands
+
+The bus-manager phase is done. PCI configuration space, resource ranges, interrupt routing, mondo
+delivery, and DMA all work, and the disk they were built for mounts over DMA in three seconds. What is
+left before Haiku runs anything of its own is the userspace entry the kernel does not have yet:
+`arch_thread_enter_userspace()` is a stub, software traps 0x100-0x1ff are all unhandled so there is no
+syscall path, and all 64 spill and fill vectors point at the kernel handlers — including the 32
+`_other` ones that fire precisely when the window being spilled belongs to userspace and must be able
+to fault.
