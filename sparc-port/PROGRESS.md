@@ -2194,15 +2194,26 @@ The second sample says what is printing it. `0xce000000` is where the PCI bus ma
 window, and `0xce008182` is I/O port `0x8182` — channel 1's alternate status register. The driver is
 polling a device that will never answer.
 
-Which is exactly what the absence of interrupt routing costs. `SabrePCIController::ReadIrq()` returns
-`B_UNSUPPORTED`, so every ATA operation runs on timeouts, and a probe of a device that is not there
-runs on the *longest* ones. The SCSI stack then asks about seven LUNs that do not exist and eight
-targets that do not exist, and each of those is another round.
+The first guess about *why* was that the probe of the absent device was the problem — channel 1 has
+only a CD-ROM on it, so its slave slot answers nothing. That guess was wrong, and cheaply so: filling
+all four IDE slots (`index=3` as a fourth disk) makes every device identify —
 
-So the next step is not a hunt. It is the interrupt-map walk that
+```
+ata 1: identified ATAPI device 0     atapi 1-0: QEMU DVD-ROM
+ata 1: identified ATA device 1       ata 1-1: QEMU HARDDISK, QM00004
+```
+
+— and the boot still ends on the same line. So `failed to read pio block` is a real transfer failing
+against a device that *is* there, and something above it is retrying without giving up. Two candidates,
+both in upstream driver logic rather than in anything this port wrote: the SCSI bus manager's retry of
+a failed command, and `scsi_periph`'s error handling. The filler CD-ROM being a megabyte of zeros
+rather than a real ISO 9660 image is also worth ruling out first, since a read of it cannot succeed.
+
+Underneath all of it is the missing interrupt routing. `SabrePCIController::ReadIrq()` returns
+`B_UNSUPPORTED`, so every ATA operation runs on timeouts and every retry costs wall-clock seconds
+that a working IRQ would not. That makes the interrupt-map walk — the thing
 `ECAMPCIControllerFDT::Finalize()` already does for the flattened-device-tree platforms, applied to
-the `interrupt-map` property on the sabre node — the piece of Phase 7 that was left deliberately
-undone, now on the critical path.
+the `interrupt-map` property on the sabre node — the next piece of Phase 7 rather than a later one.
 
 Two smaller things are worth doing alongside it, and neither is speculative:
 
