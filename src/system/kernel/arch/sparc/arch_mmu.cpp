@@ -730,6 +730,21 @@ sparc_report_unresolved_miss()
 			sTrapData.missTrapType, sTrapData.missTpc, sTrapData.missTl,
 			sTrapData.missEntry, sTrapData.missCount);
 	} else {
+		uint64 windows = sTrapData.trapWindowState;
+		dprintf("sparc: trap %#" B_PRIx64 " window cwp %" B_PRIu64 " cansave %"
+			B_PRIu64 " canrestore %" B_PRIu64 " cleanwin %" B_PRIu64
+			" otherwin %" B_PRIu64 "\n", sTrapData.missTrapType,
+			windows & 0xff, (windows >> 8) & 0xff, (windows >> 16) & 0xff,
+			(windows >> 24) & 0xff, (windows >> 32) & 0xff);
+		dprintf("sparc: trapped locals %#" B_PRIx64 " %#" B_PRIx64 " %#"
+			B_PRIx64 " %#" B_PRIx64 "\n", sTrapData.trapLocals[0],
+			sTrapData.trapLocals[1], sTrapData.trapLocals[2],
+			sTrapData.trapLocals[3]);
+		dprintf("sparc:                %#" B_PRIx64 " %#" B_PRIx64 " %#"
+			B_PRIx64 " %#" B_PRIx64 "\n", sTrapData.trapLocals[4],
+			sTrapData.trapLocals[5], sTrapData.trapLocals[6],
+			sTrapData.trapLocals[7]);
+
 		panic("sparc: unhandled trap %#" B_PRIx64 " at pc %#" B_PRIx64
 			" (tl %" B_PRIu64 ", tstate %#" B_PRIx64 ", fault address %#"
 			B_PRIx64 ", called from %#" B_PRIx64 ", frame returns to %#"
@@ -786,6 +801,8 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, trapKind),
 		offsetof(sparc_trap_data, trapCallSite),
 		offsetof(sparc_trap_data, trapReturnAddress),
+		offsetof(sparc_trap_data, trapWindowState),
+		offsetof(sparc_trap_data, trapLocals),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {

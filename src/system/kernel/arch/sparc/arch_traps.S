@@ -72,7 +72,9 @@
 #define TRAP_DATA_TRAP_KIND		0x60
 #define TRAP_DATA_TRAP_CALL_SITE	0x68
 #define TRAP_DATA_TRAP_RETURN		0x70
-#define TRAP_DATA_OFFSET_COUNT		15
+#define TRAP_DATA_WINDOW_STATE		0x78
+#define TRAP_DATA_LOCALS		0x80
+#define TRAP_DATA_OFFSET_COUNT		17
 
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
@@ -579,6 +581,38 @@ sparc_unhandled_trap:
 	stx	%o7, [%g7 + TRAP_DATA_TRAP_CALL_SITE]
 	stx	%i7, [%g7 + TRAP_DATA_TRAP_RETURN]
 
+	/* The trapped window's own locals. A trap does not rotate CWP, so these are
+	 * the interrupted code's %l registers, and a corrupted one is otherwise
+	 * invisible: the report can name the faulting instruction but not the
+	 * register it read through.
+	 */
+	stx	%l0, [%g7 + TRAP_DATA_LOCALS + (0 * 8)]
+	stx	%l1, [%g7 + TRAP_DATA_LOCALS + (1 * 8)]
+	stx	%l2, [%g7 + TRAP_DATA_LOCALS + (2 * 8)]
+	stx	%l3, [%g7 + TRAP_DATA_LOCALS + (3 * 8)]
+	stx	%l4, [%g7 + TRAP_DATA_LOCALS + (4 * 8)]
+	stx	%l5, [%g7 + TRAP_DATA_LOCALS + (5 * 8)]
+	stx	%l6, [%g7 + TRAP_DATA_LOCALS + (6 * 8)]
+	stx	%l7, [%g7 + TRAP_DATA_LOCALS + (7 * 8)]
+
+	/* And the window-state registers, packed one byte each: a spill or fill
+	 * handler that miscounts shows up here and nowhere else.
+	 */
+	rdpr	%cwp, %g1
+	rdpr	%cansave, %g2
+	sllx	%g2, 8, %g2
+	or	%g1, %g2, %g1
+	rdpr	%canrestore, %g2
+	sllx	%g2, 16, %g2
+	or	%g1, %g2, %g1
+	rdpr	%cleanwin, %g2
+	sllx	%g2, 24, %g2
+	or	%g1, %g2, %g1
+	rdpr	%otherwin, %g2
+	sllx	%g2, 32, %g2
+	or	%g1, %g2, %g1
+	stx	%g1, [%g7 + TRAP_DATA_WINDOW_STATE]
+
 	mov	SPARC_TRAP_UNHANDLED, %g1
 	stx	%g1, [%g7 + TRAP_DATA_TRAP_KIND]
 
@@ -870,6 +904,10 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (13 * 8)]
 	mov	TRAP_DATA_TRAP_RETURN, %o1
 	stx	%o1, [%o0 + (14 * 8)]
+	mov	TRAP_DATA_WINDOW_STATE, %o1
+	stx	%o1, [%o0 + (15 * 8)]
+	mov	TRAP_DATA_LOCALS, %o1
+	stx	%o1, [%o0 + (16 * 8)]
 	retl
 	 nop
 

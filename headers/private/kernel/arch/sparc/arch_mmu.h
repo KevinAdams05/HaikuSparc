@@ -161,7 +161,9 @@ struct sparc_trap_data {
 	uint64	trapKind;			// 0x60  which failure filled the fields above
 	uint64	trapCallSite;		// 0x68  %o7 -- the trapped window's call site
 	uint64	trapReturnAddress;	// 0x70  %i7 -- and where that frame returns to
-	uint64	reserved[1];		// pad to 128 bytes
+	uint64	trapWindowState;	// 0x78  CWP, CANSAVE, CANRESTORE, CLEANWIN packed
+	uint64	trapLocals[8];		// 0x80  %l0-%l7 of the window that trapped
+	uint64	reserved[8];		// pad to 256 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -183,7 +185,7 @@ struct sparc_trap_data {
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
-#define TRAP_DATA_SIZE				0x80
+#define TRAP_DATA_SIZE				0x100
 
 // Which global bank sparc_read_trap_globals() should be asked about.
 #define SPARC_GLOBALS_MMU			0
@@ -203,7 +205,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		15
+#define TRAP_DATA_OFFSET_COUNT		17
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */
