@@ -136,6 +136,20 @@ ata_adapter_write_device_control(ata_adapter_channel_info *channel, uint8 val)
 }
 
 
+/*	The data port carries a byte stream, not numbers.
+
+	The PCI accessors below convert between the bus's little-endian order and the
+	host's, which is what a caller reading a device register wants. A PIO
+	transfer is the other case: the sixteen bits of each access are two
+	consecutive bytes of a sector, so what has to be preserved is the order they
+	arrive in, and converting them would swap every pair of bytes on the disk.
+	Hence the conversion back. Both directions compile away on a little-endian
+	host, which is where this has run until now.
+
+	The device's identify block arrives through the same path, and its words are
+	numbers rather than a byte stream -- that conversion belongs to whoever knows
+	the block's shape, and is done in ATADevice::Identify().
+*/
 static status_t
 ata_adapter_write_pio(ata_adapter_channel_info *channel, uint16 *data,
 	int count, bool force_16bit)
@@ -152,12 +166,14 @@ ata_adapter_write_pio(ata_adapter_channel_info *channel, uint16 *data,
 
 	if ((count & 1) != 0 || force_16bit) {
 		for (; count > 0; --count)
-			pci->write_io_16(device, ioaddr, *(data++));
+			pci->write_io_16(device, ioaddr, B_LENDIAN_TO_HOST_INT16(*(data++)));
 	} else {
 		uint32 *cur_data = (uint32 *)data;
 
-		for (; count > 0; count -= 2)
-			pci->write_io_32(device, ioaddr, *(cur_data++));
+		for (; count > 0; count -= 2) {
+			pci->write_io_32(device, ioaddr,
+				B_LENDIAN_TO_HOST_INT32(*(cur_data++)));
+		}
 	}
 
 	return B_OK;
@@ -180,12 +196,14 @@ ata_adapter_read_pio(ata_adapter_channel_info *channel, uint16 *data,
 
 	if ((count & 1) != 0 || force_16bit) {
 		for (; count > 0; --count)
-			*(data++) = pci->read_io_16(device, ioaddr );
+			*(data++) = B_HOST_TO_LENDIAN_INT16(pci->read_io_16(device, ioaddr));
 	} else {
 		uint32 *cur_data = (uint32 *)data;
 
-		for (; count > 0; count -= 2)
-			*(cur_data++) = pci->read_io_32(device, ioaddr);
+		for (; count > 0; count -= 2) {
+			*(cur_data++)
+				= B_HOST_TO_LENDIAN_INT32(pci->read_io_32(device, ioaddr));
+		}
 	}
 
 	return B_OK;
@@ -614,6 +632,25 @@ ata_adapter_detect_channel(pci_device_module_info *pci, pci_device *pci_device,
 			}
 		}
 	}
+
+#ifdef __sparc__
+	// Bus-master DMA needs an address the controller can reach, and on sun4u
+	// that is not a physical address: PCI masters address host memory through
+	// the host bridge's IOMMU, and what goes in a PRD entry is a DVMA address
+	// from a mapping somebody has to make. Nothing in this port makes one yet --
+	// see sparc-port/PROGRESS.md -- so the addresses handed to the controller are
+	// truncated physical ones that the IOMMU translates through whatever the
+	// firmware left behind, and the transfer lands somewhere else in memory.
+	//
+	// That is worse than not working. It corrupted the kernel: the disks
+	// identified correctly, the first DMA read aborted, and the next reschedule
+	// took a bus error on a pointer that had been written over. PIO is slow and
+	// correct, which is the right order to do this in.
+	if (controller_can_dma) {
+		TRACE("PCI-ATA: no IOMMU support on this platform yet, using PIO\n");
+		controller_can_dma = false;
+	}
+#endif
 
 	{
 		io_resource resources[3] = {

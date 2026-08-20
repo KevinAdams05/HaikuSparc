@@ -606,6 +606,10 @@ ATADevice::Identify()
 	// get the infoblock
 	fChannel->ReadPIO((uint8 *)&fInfoBlock, sizeof(fInfoBlock));
 
+	// The transfer above preserved the byte order the device sent, which is
+	// right for sector data and wrong for this: the block is a list of numbers.
+	ata_info_block_to_host(&fInfoBlock);
+
 	if (fChannel->WaitDataRequest(false) != B_OK) {
 		TRACE_ERROR("device disagrees on info block length\n");
 		return B_ERROR;

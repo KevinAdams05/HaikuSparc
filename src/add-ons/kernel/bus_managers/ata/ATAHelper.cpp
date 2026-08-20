@@ -76,3 +76,50 @@ swap_words(void *data, size_t size)
 		word++;
 	}
 }
+
+
+/*!	Turns an identify block as the device sent it into one this host can read.
+
+	The transfer that fetched it preserved the byte order the device sent, which
+	is what a data transfer needs and what every field here is the wrong way
+	round for: the block is a list of 16-bit numbers, little endian on the wire,
+	and reading them on a big-endian host without conversion gives every value
+	byte-reversed. That is not a subtle failure -- the capability bits land in the
+	wrong half of each word, so a perfectly ordinary disk reports itself as
+	having no LBA support.
+
+	The strings are deliberately left alone. ATA puts the first character of a
+	string in the *high* byte of its word, so swapping the word puts the pair in
+	reading order, which is exactly the state swap_words() expects to be handed
+	and leaves untouched on a big-endian host.
+
+	Fields wider than a word need a second step, because swapping each word
+	individually does not reorder the words themselves. There are three of them,
+	all little endian across words as well as within them.
+
+	Every line of this compiles away on a little-endian host, where the wire order
+	is already the host's.
+*/
+void
+ata_info_block_to_host(ata_device_infoblock *infoBlock)
+{
+#if B_HOST_IS_BENDIAN
+	uint16 *word = (uint16 *)infoBlock;
+	for (size_t i = 0; i < sizeof(*infoBlock) / sizeof(uint16); i++)
+		word[i] = B_LENDIAN_TO_HOST_INT16(word[i]);
+
+	infoBlock->lba_sector_count
+		= (infoBlock->lba_sector_count << 16)
+			| (infoBlock->lba_sector_count >> 16);
+
+	infoBlock->logical_sector_size
+		= (infoBlock->logical_sector_size << 16)
+			| (infoBlock->logical_sector_size >> 16);
+
+	uint64 sectors = infoBlock->lba48_sector_count;
+	infoBlock->lba48_sector_count = ((sectors & 0x000000000000ffffULL) << 48)
+		| ((sectors & 0x00000000ffff0000ULL) << 16)
+		| ((sectors & 0x0000ffff00000000ULL) >> 16)
+		| ((sectors & 0xffff000000000000ULL) >> 48);
+#endif
+}

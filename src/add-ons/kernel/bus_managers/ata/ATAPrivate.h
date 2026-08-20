@@ -58,6 +58,7 @@ extern device_manager_info *gDeviceManager;
 bool copy_sg_data(scsi_ccb *ccb, uint offset, uint allocationLength,
 	void *buffer, int size, bool toBuffer);
 void swap_words(void *data, size_t size);
+void ata_info_block_to_host(ata_device_infoblock *infoBlock);
 
 
 class ATAChannel {
