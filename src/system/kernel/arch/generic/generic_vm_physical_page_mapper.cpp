@@ -186,8 +186,13 @@ dump_iospace(int argc, char** argv)
 			max = strtol(argv[2], NULL, 0);
 
 		for (i = 0; i < max; i++) {
-			kprintf("[%03lx %p %3ld %3ld] ", i, (void *)paddr_desc[i].va,
-				paddr_desc[i].ref_count, paddr_desc[i].last_ref);
+			// int32 is int on LP64, so the length modifiers have to come from
+			// the macros rather than be spelled "l" -- these are a -Werror
+			// failure on a 64-bit target, which is why this debugger command
+			// has never been compiled on one.
+			kprintf("[%03" B_PRIx32 " %p %3" B_PRId32 " %3" B_PRId32 "] ", i,
+				(void *)paddr_desc[i].va, paddr_desc[i].ref_count,
+				paddr_desc[i].last_ref);
 			if (i % 4 == 3)
 				kprintf("\n");
 		}
@@ -197,11 +202,12 @@ dump_iospace(int argc, char** argv)
 
 	if (strchr(argv[1], 'v')) {
 		// virtual mappings
-		kprintf("I/O space virtual chunk mappings (%p, first free: %d)\n",
-			virtual_pmappings, first_free_vmapping);
+		kprintf("I/O space virtual chunk mappings (%p, first free: %" B_PRId32
+			")\n", virtual_pmappings, first_free_vmapping);
 
 		for (i = 0; i < num_virtual_chunks; i++) {
-			kprintf("[%2ld. %03lx] ", i, virtual_pmappings[i] - paddr_desc);
+			kprintf("[%2" B_PRId32 ". %03lx] ", i,
+				(long)(virtual_pmappings[i] - paddr_desc));
 			if (i % 8 == 7)
 				kprintf("\n");
 		}
