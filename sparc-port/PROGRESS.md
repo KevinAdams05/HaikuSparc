@@ -5,48 +5,52 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0–5 complete, and the port has a working kernel debugger.**
+**State: Phases 0–5 complete with a working kernel debugger. Phase 6's foundation is in and
+verified; Phase 7 has started.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The kernel
 takes the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
 the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler, switches
-between and preempts kernel threads, keeps time from `%TICK`, and **drops into a usable KDL where
-`sc` prints a symbolised sixteen-frame backtrace and `threads` prints the thread table**. It gets as
-far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk
-drivers yet.
+between and preempts kernel threads, keeps time from `%TICK`, **handles page faults**, drops into a
+usable KDL, and **reads the firmware's device tree**. It stops at
+`KDiskDeviceManager::InitialDeviceScan()` — no disk drivers yet, which is Phase 7's job.
 
 Exit criteria met, each by a deliberate test rather than by inference:
 
 | Phase | | |
 | --- | --- | --- |
 | 2 | Maps a page it allocated itself | after the cutover `early_map` writes only the page table and TSB (§21) |
-| 2 | Survives a provoked TLB miss | translation demapped, read back correctly — no route but the fast path (§21) |
+| 2 | Survives a provoked TLB miss | translation demapped, read back correctly (§21) |
 | 2 | Survives a forced window overflow | 24 frames against 8 windows, sum exact (§21) |
 | 3 | Two threads hand control back and forth | `counter 128 of 128 after 124 yields` (§23) |
 | 4 | `system_time()` is right | monotonic, and agreeing with the raw `%TICK` delta (§24) |
-| 4 | A tick preempts a busy loop | `spinner reached 402130 after 8720 us without either thread yielding` (§24) |
-| 5 | KDL prints a correct backtrace across a spilled window | sixteen symbolised frames from `sc`, ending at `sparc_thread_entry` (§25, §26) |
+| 4 | A tick preempts a busy loop | `spinner reached 402130 ... without either thread yielding` (§24) |
+| 5 | KDL prints a correct backtrace across a spilled window | sixteen symbolised frames from `sc` (§25, §26) |
+| 6 | *the model holds, and no shared code changed* | ranges disjoint; `user_memcpy` faults caught (§27) |
+| 6 | A static hello-world runs | **not met** — needs syscalls and an image build that can make SPARC media |
+| 7 | Mount BFS from a real disk; answer a ping | **not met** — the device tree reads; no drivers yet |
 
 What exists:
 
 | | |
 | --- | --- |
-| Page table | three levels, 1024 entries each, physical interior pointers, TTE leaves (§22) |
-| TSB | 256 KB split pair, a cache in front of the page table |
-| TLB miss fast path | 10 instructions; slow path walks the page table in about 20 more (§22) |
+| Page table | three levels, physical interior pointers, TTE leaves (§22) |
+| TLB miss fast path | 10 instructions; slow path walks the page table, and an unresolved miss becomes a page fault (§22, §27) |
 | Trap table | 32 KB, geometry asserted at build time and re-checked every boot (§20) |
-| Failure reporting | unresolved misses and unhandled traps report the trapped window and panic (§22, §26) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 | Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
 | Clock and timer | `system_time()` from `%TICK`, level-14 interrupt, preemption (§24) |
-| Backtraces and KDL | window-aware stack walk; `sc`, `bt`, `where`, and every other command (§25, §26) |
+| Backtraces and KDL | window-aware stack walk; every command works (§25, §26) |
 | `setjmp` / `longjmp` | implemented — they were a bare `ret` (§26) |
+| Page faults | access exceptions, the protection trap, and unresolved misses, all to `vm_page_fault()` (§27) |
+| Device tree | read from Open Firmware, matching the hardware matrix (§27) |
 
-**Next: Phase 6, userspace.** Or Phase 7's device stack, since the boot's own stopping point is the
-absence of a disk driver.
+**Next, in the order that pays:** a PCI bus manager over the device tree, then ATA on the CMD646 —
+that is what the boot is actually blocked on. Userspace needs the image build to produce SPARC media
+before its exit criterion can even be attempted.
 
 **Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), which is worth
-another look now that `setjmp` works.
+re-testing now that `setjmp` works, since it may have been the same bug.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1695,3 +1699,88 @@ along.
 
 The lesson worth keeping is that one: a message that appears in every single boot and is dismissed as
 noise had been reporting a real fault in `setjmp` for five phases.
+
+
+## 27. Page faults, and the first look at the device tree
+
+### What Phase 6 said to check first
+
+The plan is explicit that one thing in Phase 6 matters before any of the rest: the shared address
+space chosen in §4.3 either holds or the scope of userspace support is completely different. It
+holds.
+
+```
+sparc_int: address space: user 0x100000-0x7ffeffff, kernel 0x80000000-0xffffffff -- disjoint
+sparc_int: user_memcpy good 0x0, unmapped 0x80001301, straddling 0x80001301 -- faults caught
+```
+
+Both ranges are simple comparisons, each recognises its own addresses, they do not overlap, and
+nothing in shared Haiku code had to change to make that true.
+
+### The machinery behind the second line
+
+`user_memcpy` on sparc uses Haiku's **generic** `user_access()`, which is built on `setjmp`/`longjmp`
+and a fault handler. Both halves were missing: `setjmp` was a bare `ret` until §26, and there was no
+page fault handler at all. So `user_memcpy` has never once worked on this port.
+
+Instruction and data access exceptions and the protection trap now reach C, which takes the address
+from wherever that particular trap left it — Tag Access for the fast traps, SFAR for the slow one,
+`%tpc` for an instruction fetch, which has no address register of its own — and calls
+`vm_page_fault()`.
+
+The interrupt and fault entries are now the same code with two arguments, differing only in which C
+function they call and whether they raise `%pil`. **The fault path deliberately does not raise it.**
+A fault handler has to be able to block, and a thread that blocks with interrupts blocked never gets
+the CPU back, because the timer that would preempt whoever it is waiting for cannot fire. Whether
+interrupts go back on is decided in C from the faulting context's own PSTATE — the only thing that
+knows whether blocking is allowed at all.
+
+### Two connections that were missing
+
+**An unresolved TLB miss is a page fault.** The miss slow path treated "no page table entry" as
+fatal and reported it, which was the right thing when there was nothing to escalate to. But an
+unmapped address raises a *miss*, not an access exception — so `user_memcpy` on a bad pointer went
+to the report-and-stop path and hung. It now branches to the fault entry, which is what the address
+deserves: the page may belong to an area not yet faulted in, to a copy-on-write page, or to nothing,
+and only the VM knows which.
+
+**The exit path has to reload the trap state from the frame.** It restored `%tpc` and `%tnpc` from
+the handler's own locals, so anything C wrote into the frame was discarded — and redirecting the
+return is exactly how a fault the VM cannot resolve becomes a jump to the thread's fault handler.
+The symptom was the same fault repeating forever, with `vm_page_fault` printing "Bad address" on
+every pass. Passing a frame to a handler is pointless if the handler cannot change it.
+
+### Phase 7's first step
+
+On sun4u the firmware has already probed the machine and describes it in a tree, with the PCI
+configuration values a bus manager would otherwise have to read itself. So the device stack starts by
+reading that, not by scanning.
+
+```
+pci (pci) 108e:a000 reg 000001fe
+  pci (pci) 108e:5000 reg 00000900
+    ebus 108e:1000 reg 00010800
+      eeprom / power / fdthree / su (serial) / 8042 -> kb_ps2
+    network (network) 108e:1001 reg 00010900
+    QEMU,VGA (display) 1234:1111 reg 00011000
+    ide (ide) 1095:0646 reg 00011800
+```
+
+That is exactly the topology [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md) describes: **sabre**
+(`108e:a000`) as the on-die host bridge, **simba** (`108e:5000`) beneath it, ebus carrying the serial
+port and keyboard controller, and both devices Phase 7 names for driver work — the **CMD646** IDE
+controller (`1095:0646`) and the **sunhme** network adapter (`108e:1001`).
+
+Worth noting for its own sake: that matrix was written from datasheets before any of this port ran,
+and it now agrees with a machine.
+
+### What Phase 6 still needs, and why it is not next
+
+Syscall entry, `arch_thread_enter_userspace`, signal frames, TLS and `runtime_loader` are all gated
+on being able to *run* a binary — and that is gated on something outside this phase entirely.
+[§5.4 of the plan](PORTING_PLAN.md) lists it: Haiku's image build cannot yet produce SPARC-bootable
+media, so there is nowhere to put a hello-world. Writing the syscall path before that exists would
+mean writing it untested, which on this architecture is how the expensive bugs get made.
+
+The device stack is the better next move regardless, because the absence of a disk driver is where
+the boot actually stops.

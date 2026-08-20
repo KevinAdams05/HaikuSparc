@@ -55,8 +55,16 @@ That took two fixes beyond the stack walker: the prompt had never accepted a key
 `retl`, transferred control two frames up while executing a stray instruction. That one bug is also
 why `DebugAllocPool::Free: bad address` had appeared in every boot since Phase 2.
 
-Next is Phase 6, userspace — or Phase 7's device stack, since the absence of a disk driver is where
-the boot actually stops.
+Phase 6's foundation is in and the thing it said to verify first is verified: page faults reach the
+VM, `user_memcpy` fails safely on a bad user address, and the shared address space holds with no
+changes to shared Haiku code. What remains of that phase — syscalls, `enter_userspace`,
+`runtime_loader` — is gated on being able to run a binary, which needs an image build that can
+produce SPARC media.
+
+Phase 7 has started. The kernel reads the firmware's device tree and finds exactly the topology the
+hardware matrix predicted from datasheets: sabre, simba, ebus, the CMD646 IDE controller and the
+sunhme network adapter. A PCI bus manager over that, then ATA, is what the boot is actually blocked
+on.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

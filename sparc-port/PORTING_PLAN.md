@@ -504,7 +504,7 @@ that came up — see [PROGRESS §22 and §23](PROGRESS.md). That is one frame, n
 several of those bugs took a bracket-and-bisect hunt that a real stack walk would have shortened.
 The recommendation stands for anyone reading this before starting: do it earlier than we did.
 
-### Phase 6 — Userspace
+### Phase 6 — Userspace  **[IN PROGRESS]**
 
 Syscall entry and return. `arch_thread_enter_userspace`. Signal frames. TLS. Fork frames. The
 real `user_memcpy`/`memset`/`strlcpy` in place of the `retl; nop` stubs. `runtime_loader`.
@@ -520,7 +520,14 @@ dynamically linked one.
 **Risk: high** — the largest surface area in the plan, and the phase most likely to surface
 big-endian assumptions elsewhere in Haiku.
 
-### Phase 7 — Device stack
+**Status: the foundation is done and the model is verified.** Page faults reach `vm_page_fault()`,
+`user_memcpy()` fails safely on a bad user address, and the shared address space of §4.3 holds with
+no shared-code changes — which is what this phase said to check first. What remains is everything
+gated on running a binary: syscall entry, `arch_thread_enter_userspace`, signal frames, TLS, and
+`runtime_loader`. Note those are also gated on the image build, which cannot yet produce SPARC media
+(§5.4) — so the exit criterion needs that gap closed too. See [PROGRESS §27](PROGRESS.md).
+
+### Phase 7 — Device stack  **[IN PROGRESS]**
 
 PCI bus manager over sabre and simba, with Open Firmware providing config-space access and the
 device tree. The sabre IOMMU for DVMA — the second software-managed TSB from §4.1. ATA on
@@ -529,6 +536,11 @@ datasheets, which RefDocs covers well.
 
 **Exit:** mount BFS from a real disk; answer a ping.
 **Risk: medium.** The IOMMU is the interesting part; the rest is conventional.
+
+**Status: started.** The kernel reads the Open Firmware device tree, and it shows exactly the
+topology the hardware matrix predicted — sabre, simba, ebus, CMD646 and sunhme, with their
+configuration values already probed by the firmware. That is the input a bus manager needs; the bus
+manager itself is next. See [PROGRESS §27](PROGRESS.md).
 
 ### Phase 8 — Desktop
 
