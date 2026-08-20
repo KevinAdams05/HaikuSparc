@@ -24,6 +24,8 @@
 
 #include "SPARCVMTranslationMap.h"
 
+#include "generic_vm_physical_page_mapper.h"
+
 
 #define TRACE_VM_TMAP
 #ifdef TRACE_VM_TMAP
@@ -127,6 +129,14 @@ arch_vm_translation_map_init(kernel_args *args,
 	if (status != B_OK)
 		return status;
 
+	// The window a physical page is handed out through, and the page tables that
+	// will cover it. After the page table root exists, because building those
+	// tables is a walk of it; before any area exists, because it takes its
+	// virtual range from the boot-time allocator.
+	status = sparc_iospace_init(args);
+	if (status != B_OK)
+		return status;
+
 	sPhysicalPageMapper
 		= new(sPhysicalPageMapperBuffer) SPARCVMPhysicalPageMapper;
 	*_physicalPageMapper = sPhysicalPageMapper;
@@ -171,7 +181,9 @@ sparc_page_table_early_map(kernel_args* args, addr_t virtualAddress,
 status_t
 arch_vm_translation_map_init_post_sem(kernel_args *args)
 {
-	return B_OK;
+	// The physical page window needs a semaphore to wait on when every chunk is
+	// in use, and this is the first point at which there is one to create.
+	return generic_vm_physical_page_mapper_init_post_sem(args);
 }
 
 
@@ -192,7 +204,14 @@ arch_vm_translation_map_init_post_area(kernel_args *args)
 {
 	TRACE("vm_translation_map_init_post_area: entry\n");
 
-	return sparc_mmu_create_tsb_area();
+	status_t status = sparc_mmu_create_tsb_area();
+	if (status != B_OK)
+		return status;
+
+	// The physical page window's descriptors and the null area over the window
+	// itself, for the same reason: vm_init() is about to stop reserving the
+	// ranges the boot loader recorded.
+	return generic_vm_physical_page_mapper_init_post_area(args);
 }
 
 

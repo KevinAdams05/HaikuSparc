@@ -58,6 +58,16 @@ phys_addr_t sparc_page_table_lookup(phys_addr_t root, addr_t virtualAddress,
 void sparc_record_physical_memory_top(kernel_args* args);
 
 
+/*!	Reserves the window through which a physical page can be handed out as a
+	pointer, and builds the page tables that will cover it.
+
+	Call from arch_vm_translation_map_init(), after the kernel page table exists:
+	it builds the leaf tables for the window while the boot-time allocator is
+	still available, because the code that fills them in later cannot allocate.
+*/
+status_t sparc_iospace_init(kernel_args* args);
+
+
 /*!	A sun4u address space's translation map.
 
 	The page table this wraps is the authoritative record; the TSB is a cache in
@@ -132,9 +142,10 @@ private:
 	by an ordinary access.
 
 	What that does not solve is handing a caller a usable virtual address for a
-	physical page, which is what GetPage() is for. That still wants either a
-	physical map covering all of RAM or the generic slot-pool mapper, and neither
-	exists yet -- see the note on those methods.
+	physical page, which is what GetPage() is for. There is no ASI that produces
+	one, so those go through a reserved window of kernel address space with page
+	table entries written into it on demand -- see SPARC_IOSPACE_SIZE and
+	sparc_iospace_init() in the implementation.
 */
 struct SPARCVMPhysicalPageMapper : public VMPhysicalPageMapper {
 								SPARCVMPhysicalPageMapper();

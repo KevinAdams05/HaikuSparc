@@ -19,6 +19,8 @@
 #include <arch/vm.h>
 #include <boot/elf.h>
 
+#include "generic_vm_physical_page_mapper.h"
+
 #include <stddef.h>
 
 
@@ -507,21 +509,26 @@ SPARCVMTranslationMap::UnmapPage(VMArea* area, addr_t address,
 	}
 
 	// Hand the page itself back to the VM, along with what the mapping recorded
-	// about it. Everything below wants the map unlocked, since it takes the
-	// page's cache and the page queues.
-	locker.Unlock();
+	// about it.
+	//
+	// Detach rather than Unlock, because PageUnmapped() releases fLock itself --
+	// on both of its paths, the device-cache early return and the ordinary one.
+	// Unlocking here as well released it twice, which is not the sort of thing
+	// that fails where it happens.
+	//
+	// And no DEBUG_PAGE_ACCESS_START around the call. It reads as though this
+	// were the code that touches the page, but the caller has already taken it:
+	// VMTranslationMap::UnmapPages() brackets every UnmapPage() with
+	// START/END when DEBUG_PAGE_ACCESS is on, and PageUnmapped() therefore only
+	// checks. Taking it again panicked with "Invalid concurrent access to page
+	// ... (start), currently accessed by: 15" -- the thread colliding with
+	// itself -- the first time a module image was unloaded, which is the first
+	// thing that happens after the boot volume is mounted.
+	locker.Detach();
 
-	if (area->cache_type == CACHE_TYPE_DEVICE)
-		return B_OK;
-
-	vm_page* page = vm_lookup_page((tte & TTE_PA_MASK) / B_PAGE_SIZE);
-	ASSERT(page != NULL);
-
-	DEBUG_PAGE_ACCESS_START(page);
 	PageUnmapped(area, (tte & TTE_PA_MASK) / B_PAGE_SIZE,
 		(tte & TTE_SOFT_ACCESSED) != 0, (tte & TTE_SOFT_MODIFIED) != 0,
 		updatePageQueue);
-	DEBUG_PAGE_ACCESS_END(page);
 
 	return B_OK;
 }
@@ -773,6 +780,126 @@ SPARCVMTranslationMap::DebugPrintMappingInfo(addr_t virtualAddress)
 // #pragma mark - SPARCVMPhysicalPageMapper
 
 
+/*	The window through which a physical page is reached by ordinary loads and
+	stores.
+
+	Most of what the kernel does to physical memory on this machine needs no
+	window at all: ASI_PHYS_USE_EC addresses physical memory directly, which is
+	what MemsetPhysical() and the two Memcpy methods below use, and it is both
+	faster and simpler than mapping anything. But a caller that wants to *hand a
+	physical page to somebody else as a pointer* -- ATAChannel's PIO transfer
+	does, because the SCSI stack gives it a scatter-gather list of physical
+	addresses -- needs a virtual address, and there is no ASI that provides one.
+
+	So a reserved range of kernel address space, and page table entries written
+	into it on demand. The bookkeeping is Haiku's own: the generic physical page
+	mapper keeps a pool of chunks with an LRU, hands out a virtual address for a
+	physical one, and asks the architecture only to make the mapping. PowerPC and
+	m68k use the same code.
+
+	A chunk of one page, unlike PowerPC's sixteen. The generic mapper's cost is
+	per chunk rather than per page, so a larger chunk means fewer descriptors --
+	but it also maps fifteen pages nobody asked for on every miss, and on a
+	machine whose page size is already 8 KB the descriptors are not the expensive
+	part.
+*/
+#define SPARC_IOSPACE_SIZE			(4 * 1024 * 1024)
+#define SPARC_IOSPACE_CHUNK_SIZE	B_PAGE_SIZE
+
+static addr_t sIOSpaceBase;
+
+
+/*!	Points one chunk of the window at a physical address.
+
+	Called by the generic mapper, which has already decided which chunk to reuse
+	and has invalidated whatever was there. Writes the entry, then drops the
+	address from the TSB and the TLB -- in that order, because a reader that sees
+	a stale cache and a fresh table refills harmlessly while the reverse hands
+	out a translation the table has already disowned.
+
+	It never allocates. The leaf page tables covering the window are made once,
+	in sparc_iospace_init(), from the boot-time allocator -- so this cannot fail
+	partway through, and cannot need a page reservation in a path that has no way
+	to ask for one.
+*/
+static status_t
+map_iospace_chunk(addr_t virtualAddress, phys_addr_t physicalAddress,
+	uint32 flags)
+{
+	virtualAddress = ROUNDDOWN(virtualAddress, B_PAGE_SIZE);
+	physicalAddress = ROUNDDOWN(physicalAddress, B_PAGE_SIZE);
+
+	if (virtualAddress < sIOSpaceBase
+		|| virtualAddress + SPARC_IOSPACE_CHUNK_SIZE
+			> sIOSpaceBase + SPARC_IOSPACE_SIZE) {
+		panic("map_iospace_chunk: %#" B_PRIxADDR " is outside the window at %#"
+			B_PRIxADDR, virtualAddress, sIOSpaceBase);
+		return B_BAD_VALUE;
+	}
+
+	for (size_t offset = 0; offset < SPARC_IOSPACE_CHUNK_SIZE;
+			offset += B_PAGE_SIZE) {
+		phys_addr_t entry = sparc_page_table_lookup(sparc_kernel_page_table(),
+			virtualAddress + offset, NULL);
+		if (entry == 0) {
+			panic("map_iospace_chunk: no page table entry for %#" B_PRIxADDR
+				"; sparc_iospace_init() should have made one",
+				virtualAddress + offset);
+			return B_ERROR;
+		}
+
+		uint64 tte = TTE_VALID | ((uint64)TTE_SIZE_8K << TTE_SIZE_SHIFT)
+			| ((physicalAddress + offset) & TTE_PA_MASK)
+			| tte_cache_flags_for_page(physicalAddress + offset, 0)
+			| tte_flags_for_attributes(B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+				true);
+
+		sparc_write_physical(entry, tte);
+		sparc_tsb_invalidate(virtualAddress + offset);
+		sparc_tlb_demap(virtualAddress + offset);
+	}
+
+	return B_OK;
+}
+
+
+/*!	Reserves the window and builds the page tables that will cover it.
+
+	The leaf tables are made now, while the boot-time allocator is still
+	available, because map_iospace_chunk() runs in contexts that cannot allocate.
+	Walking the range with a lookup is what builds them: the walk creates each
+	level it finds missing and leaves the leaf entries invalid, which is exactly
+	the state wanted -- addresses reserved, nothing mapped.
+*/
+status_t
+sparc_iospace_init(kernel_args* args)
+{
+	status_t status = generic_vm_physical_page_mapper_init(args,
+		map_iospace_chunk, &sIOSpaceBase, SPARC_IOSPACE_SIZE,
+		SPARC_IOSPACE_CHUNK_SIZE);
+	if (status != B_OK)
+		return status;
+
+	SPARCPageTableAllocator allocator = { args, NULL };
+	for (addr_t address = sIOSpaceBase;
+			address < sIOSpaceBase + SPARC_IOSPACE_SIZE;
+			address += B_PAGE_SIZE) {
+		if (sparc_page_table_lookup(sparc_kernel_page_table(), address,
+				&allocator) == 0) {
+			panic("sparc_iospace_init: no page table for %#" B_PRIxADDR,
+				address);
+			return B_NO_MEMORY;
+		}
+	}
+
+	dprintf("sparc_vm: physical page window at %#" B_PRIxADDR ", %d KB in %"
+		B_PRIuSIZE " KB chunks\n", sIOSpaceBase, SPARC_IOSPACE_SIZE / 1024,
+		(size_t)SPARC_IOSPACE_CHUNK_SIZE / 1024);
+
+	return B_OK;
+}
+
+
 SPARCVMPhysicalPageMapper::SPARCVMPhysicalPageMapper()
 {
 }
@@ -795,26 +922,44 @@ SPARCVMPhysicalPageMapper::~SPARCVMPhysicalPageMapper()
 	got a plausible-looking virtual address for the wrong page would corrupt
 	memory quietly.
 */
+/*!	Hands out a virtual address for a physical page, through the window.
+
+	See the comment on SPARC_IOSPACE_SIZE. This is the case ASI_PHYS_USE_EC
+	cannot serve, because what the caller wants is a pointer rather than an
+	access.
+*/
 status_t
 SPARCVMPhysicalPageMapper::GetPage(phys_addr_t physicalAddress,
 	addr_t* _virtualAddress, void** _handle)
 {
-	return B_NOT_SUPPORTED;
+	return generic_get_physical_page(physicalAddress, _virtualAddress, 0);
 }
 
 
 status_t
 SPARCVMPhysicalPageMapper::PutPage(addr_t virtualAddress, void* handle)
 {
-	return B_NOT_SUPPORTED;
+	return generic_put_physical_page(virtualAddress);
 }
 
 
+/*!	The same, for a caller pinned to the CPU it is running on.
+
+	On a machine with more than one processor these want per-CPU slots that can
+	be filled without a lock, which is what the x86 mapper provides and what the
+	generic one declines to. This port runs on one processor -- sun4u
+	workstations are uniprocessor, and arch_smp.cpp says so -- so the distinction
+	has nothing to express yet, and the honest implementation is the same window.
+
+	Pinning does not forbid blocking, only migration, so going through the pool
+	is allowed here. The day this port meets a second processor, these two are
+	where to look.
+*/
 status_t
 SPARCVMPhysicalPageMapper::GetPageCurrentCPU(phys_addr_t physicalAddress,
 	addr_t* _virtualAddress, void** _handle)
 {
-	return B_NOT_SUPPORTED;
+	return generic_get_physical_page(physicalAddress, _virtualAddress, 0);
 }
 
 
@@ -822,7 +967,7 @@ status_t
 SPARCVMPhysicalPageMapper::PutPageCurrentCPU(addr_t virtualAddress,
 	void* _handle)
 {
-	return B_NOT_SUPPORTED;
+	return generic_put_physical_page(virtualAddress);
 }
 
 
