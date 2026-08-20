@@ -1,6 +1,13 @@
 SubDir HAIKU_TOP src system kernel arch sparc ;
 
+SubDirHdrs $(SUBDIR) $(DOTDOT) generic ;
+
 UsePrivateKernelHeaders ;
+
+# The PCI bus manager references msi_supported() and friends unconditionally,
+# and the generic implementations answer "not supported" -- which is the truth
+# here: sabre predates MSI, and its interrupts are routed the old way.
+SEARCH_SOURCE += [ FDirName $(SUBDIR) $(DOTDOT) generic ] ;
 
 KernelMergeObject kernel_arch_sparc.o :
 	arch_asm.S
@@ -22,6 +29,8 @@ KernelMergeObject kernel_arch_sparc.o :
 	arch_vm.cpp
 	arch_vm_translation_map.cpp
 	SPARCVMTranslationMap.cpp
+
+	generic_msi.cpp
 	:
 	$(TARGET_KERNEL_PIC_CCFLAGS) -Wno-unused
 	:

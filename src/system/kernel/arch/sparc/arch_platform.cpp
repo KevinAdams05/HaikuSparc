@@ -363,9 +363,184 @@ sparc_dump_device_tree(intptr_t node, int depth)
 }
 
 
+/*	Where sabre puts the PCI address spaces.
+ *
+ *	Read from the host bridge's "ranges" property rather than hardcoded, because
+ *	that property is the machine describing itself. Each entry is seven cells: a
+ *	three-cell PCI address, a two-cell physical address, and a two-cell size. The
+ *	top two bits of the PCI address's first cell say which space it is -- 00
+ *	configuration, 01 I/O, 10 thirty-two-bit memory -- which is the PCI Open
+ *	Firmware binding, not something sabre invented.
+ *
+ *	On the machine this was written against those come out as configuration at
+ *	physical 0x1fe.01000000 for 16 MB, I/O at 0x1fe.02000000, and memory at
+ *	0x1ff.00000000, with buses 0 to 2. Which matches what the sabre documentation
+ *	says, and is worth reading from the tree anyway: the Blade 150 is a different
+ *	machine with the same bridge, and this is exactly the kind of constant that
+ *	turns out to differ.
+ */
+#define PCI_RANGE_CELLS			7
+#define PCI_SPACE_MASK			0x03000000
+#define PCI_SPACE_CONFIGURATION		0x00000000
+#define PCI_SPACE_IO			0x01000000
+#define PCI_SPACE_MEMORY32		0x02000000
+
+// Physical, non-cacheable, little endian. All three matter: configuration space
+// is a device register block rather than memory, so it must not be cached, and
+// PCI is little endian on a machine that is not.
+#define ASI_PHYS_NON_CACHED_LITTLE	0x1d
+
+static phys_addr_t sPciConfigurationBase;
+static uint8 sPciLastBus;
+
+
+static status_t
+sparc_pci_read_ranges()
+{
+	intptr_t node = of_finddevice("/pci@1fe,0");
+	if (node == OF_FAILED)
+		return B_ENTRY_NOT_FOUND;
+
+	uint32 ranges[PCI_RANGE_CELLS * 8];
+	intptr_t length = of_getprop(node, "ranges", ranges, sizeof(ranges));
+	if (length == OF_FAILED)
+		return B_ERROR;
+
+	uint32 cells = length / sizeof(uint32);
+	for (uint32 i = 0; i + PCI_RANGE_CELLS <= cells; i += PCI_RANGE_CELLS) {
+		uint32 space = ranges[i] & PCI_SPACE_MASK;
+		phys_addr_t physical = ((phys_addr_t)ranges[i + 3] << 32)
+			| ranges[i + 4];
+		uint64 size = ((uint64)ranges[i + 5] << 32) | ranges[i + 6];
+
+		const char *name = space == PCI_SPACE_CONFIGURATION ? "configuration"
+			: space == PCI_SPACE_IO ? "I/O"
+			: space == PCI_SPACE_MEMORY32 ? "memory" : "?";
+		dprintf("arch_platform: pci %s space at %#" B_PRIxPHYSADDR ", %"
+			B_PRIu64 " MB\n", name, physical, size / (1024 * 1024));
+
+		if (space == PCI_SPACE_CONFIGURATION)
+			sPciConfigurationBase = physical;
+	}
+
+	uint32 busRange[2];
+	if (of_getprop(node, "bus-range", busRange, sizeof(busRange)) != OF_FAILED)
+		sPciLastBus = (uint8)busRange[1];
+
+	return sPciConfigurationBase != 0 ? B_OK : B_ERROR;
+}
+
+
+/*!	Reads a PCI configuration register.
+
+	sabre maps configuration space linearly, so a register's physical address is
+	the base plus the bus, device and function packed into the address the way the
+	specification packs them. Sixteen megabytes is exactly enough for eight bits
+	of bus.
+*/
+uint32
+sparc_pci_read_config(uint8 bus, uint8 device, uint8 function, uint16 offset,
+	uint8 size)
+{
+	if (sPciConfigurationBase == 0)
+		return 0xffffffff;
+
+	phys_addr_t address = sPciConfigurationBase + ((phys_addr_t)bus << 16)
+		+ ((phys_addr_t)device << 11) + ((phys_addr_t)function << 8) + offset;
+
+	uint64 value;
+	switch (size) {
+		case 1:
+			asm volatile("lduba [%[a]] 0x1d, %[v]"
+				: [v] "=r"(value) : [a] "r"(address));
+			return (uint32)value;
+		case 2:
+			asm volatile("lduha [%[a]] 0x1d, %[v]"
+				: [v] "=r"(value) : [a] "r"(address));
+			return (uint32)value;
+		default:
+			asm volatile("lduwa [%[a]] 0x1d, %[v]"
+				: [v] "=r"(value) : [a] "r"(address));
+			return (uint32)value;
+	}
+}
+
+
+void
+sparc_pci_write_config(uint8 bus, uint8 device, uint8 function, uint16 offset,
+	uint8 size, uint32 value)
+{
+	if (sPciConfigurationBase == 0)
+		return;
+
+	phys_addr_t address = sPciConfigurationBase + ((phys_addr_t)bus << 16)
+		+ ((phys_addr_t)device << 11) + ((phys_addr_t)function << 8) + offset;
+
+	switch (size) {
+		case 1:
+			asm volatile("stba %[v], [%[a]] 0x1d"
+				: : [v] "r"(value), [a] "r"(address) : "memory");
+			break;
+		case 2:
+			asm volatile("stha %[v], [%[a]] 0x1d"
+				: : [v] "r"(value), [a] "r"(address) : "memory");
+			break;
+		default:
+			asm volatile("stwa %[v], [%[a]] 0x1d"
+				: : [v] "r"(value), [a] "r"(address) : "memory");
+			break;
+	}
+}
+
+
+/*!	Proves the configuration accessor against what the firmware already found.
+
+	The device tree lists every device with its vendor and device id, because the
+	firmware probed them itself. So there is a correct answer to compare against,
+	which is worth having: an address formation that is wrong by a shift, or a
+	byte order that is wrong, both produce plausible-looking numbers.
+*/
+static void
+sparc_pci_scan()
+{
+	int found = 0;
+
+	for (uint8 bus = 0; bus <= sPciLastBus; bus++) {
+		for (uint8 device = 0; device < 32; device++) {
+			for (uint8 function = 0; function < 8; function++) {
+				uint32 id = sparc_pci_read_config(bus, device, function, 0, 4);
+				if (id == 0xffffffff || id == 0)
+					continue;
+
+				uint32 classRevision = sparc_pci_read_config(bus, device,
+					function, 0x08, 4);
+
+				dprintf("arch_platform: pci %u:%u:%u %04x:%04x class %06x\n",
+					bus, device, function, id & 0xffff, id >> 16,
+					classRevision >> 8);
+				found++;
+
+				// A single-function device answers for function 0 only.
+				if (function == 0) {
+					uint32 header = sparc_pci_read_config(bus, device, 0, 0x0c,
+						4);
+					if ((header & 0x00800000) == 0)
+						break;
+				}
+			}
+		}
+	}
+
+	dprintf("arch_platform: %d pci functions found by configuration space\n",
+		found);
+}
+
+
 void
 sparc_dump_openfirmware_devices()
 {
+	if (sparc_pci_read_ranges() == B_OK)
+		sparc_pci_scan();
 	intptr_t root = of_finddevice("/");
 	if (root == OF_FAILED) {
 		dprintf("arch_platform: no Open Firmware root node\n");
