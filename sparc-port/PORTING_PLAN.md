@@ -553,14 +553,22 @@ volume. The kernel then replaces every preloaded add-on with the file behind it,
 Everything after the mount is the kernel looking for a userland that is not on the volume yet, which
 is Phase 6's packaging gap seen from the other side.
 
-Two pieces of this phase remain, both named in the code rather than left to be rediscovered:
+**Interrupt routing is implemented** — the sabre interrupt controller in the kernel, trap 0x60 and all
+fifteen interrupt levels in the table, and the firmware's `interrupt-map` resolving each device to its
+Interrupt Number Offset. It is verified up to the hardware boundary: the mapping register accepts the
+valid bit and reads it back, and the ATA driver is told interrupt 32 rather than the pin the firmware
+left behind.
 
-- **Interrupt routing.** `SabrePCIController::ReadIrq()` returns `B_UNSUPPORTED`, so the disk stack
-  runs entirely on timeouts. It needs the `interrupt-map` walk that
-  `ECAMPCIControllerFDT::Finalize()` already does for the flattened-device-tree platforms. This is
-  what makes the boot take minutes rather than seconds.
+**Delivery is not yet proven, and cannot be until DMA exists.** `ATAChannel::WaitForInterrupt()` is
+called only when `request->UseDMA()`, so with DMA off nothing on this machine generates a device
+interrupt; a whole boot takes trap 0x4e, the timer, and nothing else. Faking a packet is foreclosed by
+the hardware — UltraSPARC-IIi cannot dispatch an interrupt vector, not even to itself.
+
+So one piece of this phase remains, and it is now also what will exercise the other:
+
 - **The IOMMU.** PCI masters address host memory through the host bridge's IOMMU and nothing programs
-  it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is correct and slow.
+  it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is correct and slower, but
+  not by as much as was assumed — see the correction in PROGRESS §30.
 
 See [PROGRESS §29](PROGRESS.md) for the twelve bugs between the device manager and a mounted volume,
 and for the QEMU invocation that reproduces it.

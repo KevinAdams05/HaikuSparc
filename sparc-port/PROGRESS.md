@@ -2262,3 +2262,157 @@ it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is co
 
 And one thing outside it: **a userland on the volume**, which is Phase 6's packaging gap seen from the
 other side. The kernel is now waiting for one.
+
+
+---
+
+## 30. PCI interrupt routing — and a correction
+
+Interrupt routing is implemented. It is also the first piece of this port whose *delivery* cannot yet
+be demonstrated, and section 29's reasoning for prioritising it turns out to have been wrong. Both are
+recorded here because the second is the more useful of the two.
+
+### What the firmware supplies
+
+RefDocs settled the design before any code was written, which is worth saying because two of the
+things it settled would have been guessed wrong.
+
+The `UltraSPARC IIi User's Manual (805-0087)` has it in two places. Chapter 11 describes the delivery
+mechanism: a device interrupt is an interrupt **packet**, not an asserted level. The bridge sends a
+vector, the processor takes **trap 0x60** (`interrupt_vector`), and the handler reads the vector out of
+`ASI_INTR_DATA` (ASI 0x7f, VA 0x40) — of which only the low eleven bits, the INR, mean anything on this
+processor. `ASI_INTR_RECEIVE` (ASI 0x49) carries a BUSY bit that **must be cleared by writing zero**, or
+nothing further is delivered. Section 19.3.3 gives the bridge side, with the arithmetic spelled out:
+
+```
+PCI  mapping register:  0x1fe.0000.0c00 + ((ino & 0x3c) << 1)
+OBIO mapping register:  0x1fe.0000.1000 + ((ino & 0x1f) << 3)
+PCI  clear register:    0x1fe.0000.1400 + ((ino & 0x1f) << 3)
+OBIO clear register:    0x1fe.0000.1800 + ((ino & 0x1f) << 3)
+```
+
+Bit 31 of a mapping register is the valid bit, and *"when the valid bit is 0, the interrupt is prevented
+from being delivered"*. A clear register is write-only and its low two bits are a state machine —
+writing IDLE after servicing is not optional.
+
+And extending the early device-tree dump with each node's `interrupts` property, plus any
+`interrupt-map`, answered what the firmware actually provides:
+
+```
+ pci (pci) 108e:a000 reg 000001fe interrupts 0x7f0 0x7ee 0x7ef 0x7e5
+   pci (pci) 108e:5000 reg 00000900
+     interrupt-map-mask 0xfff800 0x0 0x0 0x7
+     interrupt-map, 12 cells
+       0x10800 0x0 0x0 0x1 0xffe2e480 0x21
+       0x11800 0x0 0x0 0x1 0xffe2e480 0x20
+```
+
+Three things fall out of that, and each of them is a thing not to guess:
+
+**The map is on the simba, not on sabre.** The wiring a map describes is the *parent's* wiring, so the
+lookup has to walk to the parent of the device's node rather than to the host bridge.
+
+**The mask drops the function number.** `0xfff800` keeps bus and device only, which is how a
+multifunction device shares one line: the ebus and the Ethernet controller are functions 0 and 1 of the
+same device and both resolve to INO 0x21.
+
+**The IDE controller's INO is 0x20, which is an *OBIO* number.** TABLE 19-28 assigns 0x20 to SCSI, and
+the onboard storage occupies that slot on an Ultra 5/10 — so a PCI device's interrupt is programmed
+through the on-board register file, not the PCI one. "PCI device therefore PCI register" would have
+programmed a register belonging to nothing.
+
+Sabre's own node carries `0x7f0 0x7ee 0x7ef 0x7e5`, which are PCI Bus Error, DMA UE, DMA CE and Power
+Fail with the group number already OR'd in — 0x7c0 | 0x30, 0x2e, 0x2f, 0x25. That confirms IGN = 0x7c0
+on this processor, and it matches both the manual's "fixed to 0x1F, not programmable" and OpenBSD's
+`sc->sc_ign = INTMAP_IGN`. Note the contrast: the map's entries are bare INOs, so the group has to be
+added when a mapping register is programmed and taken off again when a driver is told a number.
+
+OpenBSD's `sys/arch/sparc64/dev/psycho.c` was the reference throughout — it covers "UltraSPARC IIi and
+IIe `sabre`" explicitly, which is both of this port's targets — and it is where the read-modify-write of
+only the valid bit comes from.
+
+### What was built
+
+`arch_int.cpp` gained the controller, because on this machine the thing that gates a device interrupt is
+a register file inside the host bridge, which is inside the processor module. That makes it the kernel's,
+the way the openpic is the kernel's on PowerPC, and not the PCI bus driver's. The bus driver's job stops
+at saying which INO a device is wired to.
+
+The trap table gained 0x60 — and all fifteen interrupt levels, not just the one the timer uses. Two
+reasons: the SOFTINT register can post any of them, and the convention on this architecture is that a
+packet is re-dispatched as a SOFTINT at the priority the device deserves, so the levels are where
+servicing actually happens. Leaving them unhandled made a level nobody had arranged for stop the machine.
+
+`Finalize()` is what makes routing take effect, and finding that out took reading the bus manager:
+**nothing calls `read_pci_irq()`**. The interface has it, but the mechanism is that a controller walks
+its own devices and pushes the answer in with `update_interrupt_line()`. Before that, the interrupt line
+register held whatever the firmware left — the CMD646 read back 3 and the Ethernet 1, both of which are
+pins rather than anything a handler can be installed on.
+
+It works as far as the hardware boundary:
+
+```
+sparc_int: interrupt controller at 0x1fe00000000
+sabre: 1:1:1 pin 1 is interrupt 33
+sabre: 1:3:0 pin 1 is interrupt 32
+PCI-ATA: Controller in native mode: cmd 0x8000, ctrl 0x8082, irq 32
+sparc_int: vector 32 enabled (0x1fe00001000 = 0x800007e0)
+```
+
+`0x800007e0` is valid | IGN 0x7c0 | INO 0x20, read back from the register after writing it. So QEMU
+implements the mapping registers, at the addresses the manual gives, and the number the ATA driver is
+told is the number the firmware published.
+
+### What is not proven
+
+**No interrupt has ever been delivered.** A whole boot reports exactly one trap type:
+
+```
+sparc_int: first interrupt with trap type 0x4e, softint 0x1
+```
+
+0x4e is level 14, the %TICK comparator. Trap 0x60 is never taken, and neither is any other level.
+
+The reason is not a bug in the routing. `ATAChannel::WaitForInterrupt()` is called from exactly two
+places, both guarded by `request->UseDMA()` — and DMA is off on sparc pending the IOMMU. The driver's
+design is to poll for PIO and use interrupts for DMA, so with DMA disabled **nothing on this machine
+generates a device interrupt**. The whole ATA probe takes 0.3 seconds of polling and never waits.
+
+Nor can the CPU half be exercised on its own. Faking a packet by dispatching one to ourselves is the
+obvious test and the manual forecloses it: section 11.10.2, *"UltraSPARC-IIi does not send interrupts to
+any devices. A write to this register has no effect."* The outgoing path is stubbed out in silicon,
+because the part is a uniprocessor with no UPA peers.
+
+So the first real consumer will be DMA, and the two diagnostics above exist so that the moment delivery
+starts working — or conspicuously does not — it is one line in a boot log rather than an afternoon.
+
+### The correction
+
+Section 29 said the boot "takes minutes rather than seconds" because the disk stack runs on timeouts,
+and put interrupt routing on the critical path for that reason. **That was wrong.** With timestamps:
+
+```
+[  37.595]  loader done, kernel entered
+[  62.142]  sparc_int: interrupt controller
+[  63.539]  vector 32 enabled
+[  65.204]  Mounted boot partition: /dev/disk/ata/0/slave/raw
+```
+
+Sixty-five seconds in total, of which the first thirty-seven are the loader and the scripted menu
+navigation. The kernel reaches a mounted volume **twenty-seven seconds** after entry, and the entire
+PCI-to-ATA-to-mount sequence is **three** of those. Polling was never the cost.
+
+The timeout storms that prompted the diagnosis — hundreds of `device selection timeout` and
+`failed to send transfer request` lines — came from the configuration *before* the physical page mapper
+was implemented, when every data transfer failed and left DRQ asserted. They are absent from every boot
+since. I read a symptom of a bug I had not yet found as evidence about a mechanism, and then used it to
+order the work.
+
+The twenty-four seconds between kernel entry and the interrupt controller is where the time actually
+goes, and section 18 already says what is in there: `early_map()` asks Open Firmware for every mapping,
+OpenBIOS rebuilds its `translations` property on each call, and the cost is quadratic in the number of
+mappings. That is the thing to measure next if boot time matters — not the interrupt path.
+
+None of which makes this work wrong or wasted: nothing that needs an interrupt could have worked without
+it, and DMA, `hme` and USB all need one. It was simply not the reason the boot was slow, and the
+reasoning that put it first did not survive being measured.
