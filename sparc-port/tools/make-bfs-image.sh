@@ -3,13 +3,13 @@
 # Copyright 2026, Kevin Adams <kevinadams05@gmail.com>
 # Distributed under the terms of the MIT License.
 #
-# Build a BFS volume containing the SPARC kernel, so the Open Firmware loader
-# has something to find and boot.
+# Build a BFS volume containing the SPARC kernel and the kernel add-ons needed
+# to find a disk, so the Open Firmware loader has something to find and boot.
 #
 # Haiku's own build/scripts/build_haiku_image does this as part of assembling a
 # full system image, which needs all of userland to compile. This does only the
-# part the port needs right now: initialize BFS, create system/, and copy the
-# kernel in.
+# part the port needs right now: initialize BFS, create system/, copy the kernel
+# in, and install the boot-time kernel add-ons.
 #
 # bfs_shell is a daemon rather than a command-line tool. It talks to
 # fs_shell_command over a pair of FIFOs on file descriptors 3 and 4, and the
@@ -29,11 +29,40 @@ objects="$repo/generated.sparc/objects"
 bfs_shell="$objects/linux/x86_64/release/tools/bfs_shell/bfs_shell"
 fs_shell_command="$objects/linux/x86_64/release/tools/fs_shell/fs_shell_command"
 kernel="$objects/haiku/sparc/release/system/kernel/kernel_sparc"
+addons="$objects/haiku/sparc/release/add-ons/kernel"
+
+# The add-ons the loader has to preload for the kernel to reach a disk, each
+# named by its path below add-ons/kernel. That path is the same in the build
+# tree and on the volume, with one difference: the build leaves the binary at
+# <path>/<leaf> while the volume wants it at <path>.
+#
+# This is the same set Haiku's own image gives boot module symlinks to (see
+# build/jam/packages/Haiku), minus everything that is for hardware sun4u does
+# not have. Each one is here because something else in the list needs it: sabre
+# publishes the host bridge the pci bus manager attaches beneath,
+# generic_ide_pci binds the CMD646 through ata_adapter, ata presents itself to
+# the system as a SCSI bus, scsi_disk drives that bus through scsi_periph, and
+# the scsi bus manager defers work to dpc.
+addon_paths=(
+	busses/pci/sabre
+	bus_managers/pci
+	bus_managers/ata
+	bus_managers/scsi
+	busses/ata/generic_ide_pci
+	generic/ata_adapter
+	generic/dpc
+	generic/scsi_periph
+	drivers/disk/scsi/scsi_disk
+	drivers/disk/scsi/scsi_cd
+	file_systems/bfs
+	partitioning_systems/intel
+)
 
 output=bfs.img
 size_mb=48
 label=Haiku
 serial_debug=0
+install_addons=1
 
 usage() {
 	cat <<EOF
@@ -43,6 +72,9 @@ Usage: make-bfs-image.sh [options]
   --output FILE   BFS image to write, default $output
   --size-mb N     image size, default $size_mb
   --label NAME    volume name, default $label
+  --no-add-ons    leave the kernel add-ons out, giving a volume the loader can
+                  boot but the kernel cannot find a disk from. Only useful for
+                  telling a kernel problem apart from an add-on problem.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
                   framebuffer blue screen where nothing can read it.
@@ -62,6 +94,7 @@ while [[ $# -gt 0 ]]; do
 		--output)  output="$2"; shift 2 ;;
 		--size-mb) size_mb="$2"; shift 2 ;;
 		--label)   label="$2"; shift 2 ;;
+		--no-add-ons) install_addons=0; shift ;;
 		--serial-debug) serial_debug=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -77,6 +110,21 @@ for tool in "$bfs_shell" "$fs_shell_command"; do
 	fi
 done
 [[ -r "$kernel" ]] || { echo "kernel not found: $kernel" >&2; exit 1; }
+
+# All of them up front, so a half-populated image is not what reports the
+# missing one. The jam target is the leaf name in every case.
+if [[ "$install_addons" == "1" ]]; then
+	missing=()
+	for path in "${addon_paths[@]}"; do
+		[[ -r "$addons/$path/${path##*/}" ]] || missing+=("${path##*/}")
+	done
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		echo "missing kernel add-ons: ${missing[*]}" >&2
+		echo "build them with:" >&2
+		echo "  cd $repo/generated.sparc && jam -q ${missing[*]}" >&2
+		exit 1
+	fi
+fi
 
 work=$(mktemp -d)
 
@@ -118,6 +166,58 @@ trap cleanup EXIT
 shell_command mkdir /myfs/system
 shell_command cp -f ":$kernel" /myfs/system/kernel_sparc
 
+# fs_shell's mkdir has no -p, so intermediate directories are created one level
+# at a time. It also complains about a directory that already exists, and that
+# complaint comes out of the bfs_shell daemon's own stderr rather than the
+# client's, so it cannot be redirected away from here -- hence remembering what
+# has been created instead of asking the volume.
+declare -A created_directories=([system]=1)
+
+volume_mkdir_p() {
+	local partial=
+	local component
+	local IFS=/
+	for component in $1; do
+		partial="${partial:+$partial/}$component"
+		if [[ -z "${created_directories[$partial]:-}" ]]; then
+			shell_command mkdir "/myfs/$partial"
+			created_directories[$partial]=1
+		fi
+	done
+}
+
+if [[ "$install_addons" == "1" ]]; then
+	volume_mkdir_p system/add-ons/kernel/boot
+
+	for path in "${addon_paths[@]}"; do
+		leaf="${path##*/}"
+
+		volume_mkdir_p "system/add-ons/kernel/${path%/*}"
+		shell_command cp -f ":$addons/$path/$leaf" \
+			"/myfs/system/add-ons/kernel/$path"
+
+		# The loader looks in add-ons/kernel/boot first and only falls back to
+		# scanning the individual directories if every boot directory it knows
+		# about is missing -- and that fallback list is stale, still naming
+		# busses/ide where the ATA controller drivers have lived under
+		# busses/ata for years. So boot/ is the path that has to work.
+		#
+		# Symlinks rather than copies, and not for tidiness: the loader skips a
+		# file whose inode it has already loaded
+		# (src/system/boot/loader/elf.cpp), which is how bfs and intel avoid
+		# being loaded a second time when load_modules() finishes by scanning
+		# file_systems/ and partitioning_systems/ unconditionally. Copies would
+		# have their own inodes and would be loaded twice.
+		#
+		# The link is relative and resolved from boot/, so three levels up is
+		# the system directory. Both halves of that work: BFS stores ".." as a
+		# real b+tree entry (Inode.cpp), and the loader's Directory::Lookup
+		# traverses links.
+		shell_command ln -s "../../../add-ons/kernel/$path" \
+			"/myfs/system/add-ons/kernel/boot/$leaf"
+	done
+fi
+
 if [[ "$serial_debug" == "1" ]]; then
 	# The loader reads driver settings from this exact path
 	# (src/system/boot/loader/load_driver_settings.cpp). Without
@@ -128,17 +228,33 @@ if [[ "$serial_debug" == "1" ]]; then
 	serial_debug_output true
 	debug_screen true
 	SETTINGS
-	for directory in home home/config home/config/settings \
-			home/config/settings/kernel home/config/settings/kernel/drivers; do
-		shell_command mkdir "/myfs/$directory" || true
-	done
+	volume_mkdir_p home/config/settings/kernel/drivers
 	shell_command cp -f ":$settings" \
 		/myfs/home/config/settings/kernel/drivers/kernel
 fi
 
+# Done writing. The listing below comes from a second, interactive bfs_shell
+# rather than from the daemon: command output goes to the daemon's stdout, not
+# the client's, and the daemon's is not something this script can interleave
+# with its own. Reading the finished image back is a better check anyway --
+# it is the volume as the loader will see it, not as the writer meant it.
+shell_command quit >/dev/null 2>&1 || true
+exec 5>&- 6>&- 3<&- 4>&-
+wait "$bfs_pid" 2>/dev/null || true
+trap 'rm -rf "$work"' EXIT
+
 echo "--- volume contents ---"
-shell_command ls /myfs/system
+{
+	echo "ls /myfs/system"
+	if [[ "$install_addons" == "1" ]]; then
+		echo "ls /myfs/system/add-ons/kernel/boot"
+	fi
+	echo quit
+} | "$bfs_shell" "$output" 2>&1 | grep -v '^fssh:/> *$' | sed 's/^fssh:\/> //'
 
 echo
 echo "wrote $output ($size_mb MiB, BFS, label '$label')"
 echo "  system/kernel_sparc  $(stat -c%s "$kernel") bytes"
+if [[ "$install_addons" == "1" ]]; then
+	echo "  ${#addon_paths[@]} kernel add-ons, linked from system/add-ons/kernel/boot"
+fi

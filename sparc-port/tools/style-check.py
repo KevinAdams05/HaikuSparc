@@ -147,8 +147,10 @@ CONTROL_RE = re.compile(r"(?<![A-Za-z0-9_])(%s)\(" % "|".join(CONTROL_KEYWORDS))
 COMMENT_SPACE_RE = re.compile(r"(?<!:)//[A-Za-z0-9]")
 BRACE_SPACE_RE = re.compile(r"\)\{")
 POINTER_RE = re.compile(r"(?<=[A-Za-z0-9_]) [*&](?=[A-Za-z_])")
-CAST_SPACE_RE = re.compile(r"\((?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*\s*\*?\)\s+"
-    r"(?=[A-Za-z_(])")
+# The lookbehind is for placement new: "new(std::nothrow) Thing" has the shape
+# of a cast followed by a space, and is how every Haiku allocation is written.
+CAST_SPACE_RE = re.compile(r"(?<!new)\((?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*\s*"
+    r"\*?\)\s+(?=[A-Za-z_(])")
 OPERATOR_EOL_RE = re.compile(r"(?:\|\||&&|[-+*/%|&^<>=!]=?|\?)\s*$")
 STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 CHAR_RE = re.compile(r"'(?:[^'\\]|\\.)*'")
@@ -434,6 +436,7 @@ SELF_TEST_CASES = [
     ("a.sh", "    echo hello\n", None),
     ("a.cpp", "x = (char*) y;\n", "cast-space"),
     ("a.cpp", "x = (char*)y;\n", None),
+    ("a.cpp", "x = new(std::nothrow) Thing();\n", None),
     ("a.cpp", "int x;", "no-final-eol"),
     ("a.cpp", "\t" * 2 + "x" * 200 + "\n", "line-too-long"),
     ("a.md", "\t" * 2 + "x" * 200 + "\n", None),
