@@ -26,6 +26,7 @@ Exit criteria met, each by a deliberate test rather than by inference:
 | 4 | `system_time()` is right | monotonic, and agreeing with the raw `%TICK` delta (§24) |
 | 4 | A tick preempts a busy loop | `spinner reached 402130 ... without either thread yielding` (§24) |
 | 5 | KDL prints a correct backtrace across a spilled window | sixteen symbolised frames from `sc` (§25, §26) |
+| 3 | `wait_for_thread()` waits and reports | `returned 0x0, thread exited 0x1234` (§23, §26) |
 | 6 | *the model holds, and no shared code changed* | ranges disjoint; `user_memcpy` faults caught (§27) |
 | 6 | A static hello-world runs | **not met** — needs syscalls and an image build that can make SPARC media |
 | 7 | Mount BFS from a real disk; answer a ping | **not met** — the device tree reads; no drivers yet |
@@ -49,8 +50,9 @@ What exists:
 that is what the boot is actually blocked on. Userspace needs the image build to produce SPARC media
 before its exit criterion can even be attempted.
 
-**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), which is worth
-re-testing now that `setjmp` works, since it may have been the same bug.
+**Nothing is open.** The one item that was — `wait_for_thread()` tripping `could acquire exit_sem
+for thread 5` — was retested and is fixed: it was the `setjmp` bug (§26), which makes semaphore
+bookkeeping the third thing that bare `ret` broke.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1345,11 +1347,15 @@ of 128 after 2000001 yields`. It now runs from `arch_int_init_post_device_manage
 `main2`, which is the first thread the scheduler ever picks.
 
 **The first version used `wait_for_thread()`** and tripped `could acquire exit_sem for thread 5` —
-`acquire_sem_etc()` returning `B_OK` on a semaphore created with a count of zero. That is an
-invariant in the semaphore or thread-death bookkeeping, not a context switch problem, and this
-port had never exercised it. **It is left open rather than chased from here**, and the test polls
-with `thread_yield()` instead, which depends on far less: no semaphores, no thread-death path, no
-timer.
+`acquire_sem_etc()` returning `B_OK` on a semaphore created with a count of zero. That was left open
+rather than chased from here, and the test polls with `thread_yield()` instead, which depends on far
+less: no semaphores, no thread-death path, no timer.
+
+**It was `setjmp` (§26)**, retested and closed once that was fixed: `wait_for_thread returned 0x0,
+thread exited 0x1234 -- waited cleanly`. Semaphore bookkeeping was the third thing a bare `ret`
+broke, after the debug allocation pool and every debugger command. Worth remembering how it looked
+at the time: an invariant violation deep in shared, well-exercised code, which is exactly the shape
+of thing that gets blamed on the port's newest work rather than on a stub nobody had looked at.
 
 ### The barriers
 
