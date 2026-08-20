@@ -8,6 +8,8 @@
 #include "pci_private.h"
 #include "arch_cpu.h"
 
+#include <ByteOrder.h>
+
 
 //#define TRACE_PCI_IO
 #undef TRACE
@@ -63,6 +65,22 @@ pci_write_io_32(int mapped_io_addr, uint32 value)
 
 #else
 
+/*	PCI I/O space is little endian, and on a big-endian host that has to be said
+	out loud.
+
+	These reach the ports through a mapping of the host bridge's I/O window
+	rather than through an instruction that knows what bus it is talking to, so a
+	multi-byte load returns the bytes in the host's order and the value is
+	byte-reversed. The conversions below are what the specification already says
+	about the bus; they compile away entirely on a little-endian host, which is
+	every platform that took this path before SPARC.
+
+	The eight-bit accessors need nothing, and a caller reading a byte stream
+	rather than a number -- an ATA PIO data transfer, say -- has to convert back,
+	because a stream of bytes has no byte order to correct. See
+	ata_adapter_read_pio().
+*/
+
 static uint8*
 get_io_port_address(int ioPort)
 {
@@ -109,7 +127,7 @@ pci_read_io_16(int mapped_io_addr)
 	if (ptr == NULL)
 		return 0;
 
-	return *ptr;
+	return B_LENDIAN_TO_HOST_INT16(*ptr);
 }
 
 
@@ -121,7 +139,7 @@ pci_write_io_16(int mapped_io_addr, uint16 value)
 	if (ptr == NULL)
 		return;
 
-	*ptr = value;
+	*ptr = B_HOST_TO_LENDIAN_INT16(value);
 }
 
 
@@ -133,7 +151,7 @@ pci_read_io_32(int mapped_io_addr)
 	if (ptr == NULL)
 		return 0;
 
-	return *ptr;
+	return B_LENDIAN_TO_HOST_INT32(*ptr);
 }
 
 
@@ -145,7 +163,7 @@ pci_write_io_32(int mapped_io_addr, uint32 value)
 	if (ptr == NULL)
 		return;
 
-	*ptr = value;
+	*ptr = B_HOST_TO_LENDIAN_INT32(value);
 }
 
 #endif

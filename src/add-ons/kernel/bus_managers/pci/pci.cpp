@@ -778,8 +778,24 @@ PCI::InitDomainData(domain_data &data)
 				ioPortRange.host_address, ioPortRange.size, B_ANY_KERNEL_ADDRESS,
 				B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void **)&data.io_port_adr);
 
-			if (data.io_port_area < B_OK)
+			if (data.io_port_area < B_OK) {
 				data.io_port_adr = NULL;
+
+				// Said out loud, because the consequence is otherwise
+				// unrecognisable: pci_read_io_8() adds the port number to a null
+				// base and reads from low memory, so every driver that speaks to
+				// its device through I/O ports gets plausible-looking rubbish
+				// instead of an error. What that looked like on SPARC was an ATA
+				// controller reporting four devices present, all with the same
+				// impossible signature.
+				dprintf("PCI: failed to map the %" B_PRIu64 " KB I/O port "
+					"window at %#" B_PRIxPHYSADDR ": %s -- I/O port access "
+					"will not work\n", ioPortRange.size / 1024,
+					ioPortRange.host_address, strerror(data.io_port_area));
+			} else {
+				dprintf("PCI: I/O ports at %#" B_PRIxPHYSADDR " mapped to %p\n",
+					ioPortRange.host_address, data.io_port_adr);
+			}
 
 			// TODO: Map other IO ports (if any.)
 			break;
