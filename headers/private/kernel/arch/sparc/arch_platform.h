@@ -47,4 +47,9 @@ private:
 using BPrivate::SparcPlatform;
 
 
+#ifdef __cplusplus
+// In arch_platform.cpp. Walks the Open Firmware device tree and prints it.
+extern void sparc_dump_openfirmware_devices();
+#endif
+
 #endif	// _KERNEL_SPARC_ARCH_PLATFORM_H

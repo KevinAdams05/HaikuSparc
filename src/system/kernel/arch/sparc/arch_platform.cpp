@@ -298,5 +298,80 @@ arch_platform_init_post_vm(struct kernel_args *kernelArgs)
 status_t
 arch_platform_init_post_thread(struct kernel_args *kernelArgs)
 {
+	sparc_dump_openfirmware_devices();
+
 	return B_OK;
+}
+
+
+/*!	Walks the Open Firmware device tree, reporting what the machine has.
+
+	The first step of the device stack, and the reason it comes first: on sun4u
+	the firmware has already probed everything and describes it in a tree, with
+	the PCI configuration values the kernel would otherwise have to go and read
+	itself. A bus manager built on that starts from a list of devices rather than
+	from a scan.
+
+	Printed depth-first with the properties that identify a device. "reg" on a PCI
+	node begins with the configuration-space address of the function -- bus,
+	device and function packed together -- which is what a config-space accessor
+	needs as its handle.
+
+	Bounded by depth as well as by the tree, because a malformed sibling chain
+	would otherwise walk forever, and this runs before there is anything to catch
+	that.
+*/
+static void
+sparc_dump_device_tree(intptr_t node, int depth)
+{
+	const int kMaxDepth = 8;
+	if (depth > kMaxDepth)
+		return;
+
+	for (; node != 0 && node != OF_FAILED; node = of_peer(node)) {
+		char name[64];
+		char type[32];
+		uint32 reg[8];
+
+		if (of_getprop(node, "name", name, sizeof(name)) == OF_FAILED)
+			strlcpy(name, "?", sizeof(name));
+		if (of_getprop(node, "device_type", type, sizeof(type)) == OF_FAILED)
+			type[0] = '\0';
+
+		// Vendor and device ids are separate properties on Open Firmware rather
+		// than something to be read out of configuration space.
+		uint32 vendor = 0;
+		uint32 device = 0;
+		bool isPci = of_getprop(node, "vendor-id", &vendor, sizeof(vendor))
+				!= OF_FAILED
+			&& of_getprop(node, "device-id", &device, sizeof(device))
+				!= OF_FAILED;
+
+		intptr_t regLength = of_getprop(node, "reg", reg, sizeof(reg));
+
+		dprintf("%*s%s", depth * 2 + 1, " ", name);
+		if (type[0] != '\0')
+			dprintf(" (%s)", type);
+		if (isPci)
+			dprintf(" %04" B_PRIx32 ":%04" B_PRIx32, vendor, device);
+		if (regLength != OF_FAILED && regLength >= (intptr_t)sizeof(uint32))
+			dprintf(" reg %08" B_PRIx32, reg[0]);
+		dprintf("\n");
+
+		sparc_dump_device_tree(of_child(node), depth + 1);
+	}
+}
+
+
+void
+sparc_dump_openfirmware_devices()
+{
+	intptr_t root = of_finddevice("/");
+	if (root == OF_FAILED) {
+		dprintf("arch_platform: no Open Firmware root node\n");
+		return;
+	}
+
+	dprintf("arch_platform: Open Firmware device tree:\n");
+	sparc_dump_device_tree(of_child(root), 0);
 }
