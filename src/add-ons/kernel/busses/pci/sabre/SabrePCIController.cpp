@@ -32,6 +32,7 @@
 
 #include <AutoDeleter.h>
 #include <debug.h>
+#include <arch_int.h>
 #include <platform/openfirmware/openfirmware.h>
 
 
@@ -65,6 +66,15 @@
 // and memory is the whole set on sabre -- and the read below reports rather than
 // silently truncates if that ever stops being true.
 #define PCI_MAX_RANGES				8
+
+// The bus, device and function bits of a configuration-space address, which is
+// what a PCI child's "reg" property begins with.
+#define PCI_CONFIG_ADDRESS_MASK			0x00ffff00
+
+// An interrupt-map entry is six cells on this machine and a bridge publishes one
+// per device it has wiring for, so 128 covers a fully populated bus with room to
+// spare. Reported rather than silently truncated if it ever does not.
+#define PCI_MAX_INTERRUPT_MAP_CELLS		128
 
 /*	Physical, non-cacheable, little endian.
  *
@@ -446,26 +456,148 @@ SabrePCIController::GetMaxBusDevices(int32& count)
 }
 
 
-/*!	Interrupt routing, which this does not do yet.
- *
- *	The number in a device's configuration-space interrupt line register is not
- *	an interrupt this machine can install a handler for. sun4u routes PCI
- *	interrupts through the bridge's own interrupt mapping registers, and what
- *	connects a device to one of those is the "interrupt-map" property on the PCI
- *	node -- the same mechanism the flattened-device-tree platforms use, and the
- *	reason ECAMPCIControllerFDT has a Finalize() that walks it.
- *
- *	Reporting that rather than returning a plausible wrong number, because a
- *	wrong interrupt is a driver that installs a handler and then waits forever,
- *	which is a much harder thing to recognise than a driver that says it has no
- *	interrupt. Nothing the port needs to boot uses interrupts yet: the disk stack
- *	polls until an interrupt is available to it.
- */
+/*!	Finds the Open Firmware node for a PCI function.
+
+	A PCI child's "reg" property begins with the configuration-space address of
+	the function, which packs the bus, device and function exactly as a type 1
+	configuration address does. So the node can be found by the same number the
+	bus manager asks about, with no name matching and no assumption about where
+	in the tree it sits.
+
+	Depth-first from the bridge, because a function can be behind a
+	PCI-to-PCI bridge -- which on this machine every function is: sabre's own bus
+	holds nothing but the two halves of the simba.
+*/
+static intptr_t
+find_pci_node(intptr_t node, uint32 configurationAddress, int depth)
+{
+	const int kMaxDepth = 8;
+	if (depth > kMaxDepth)
+		return 0;
+
+	for (; node != 0 && node != OF_FAILED; node = of_peer(node)) {
+		uint32 reg[8];
+		intptr_t length = of_getprop(node, "reg", reg, sizeof(reg));
+		if (length != OF_FAILED && length >= (intptr_t)sizeof(uint32)
+			&& (reg[0] & PCI_CONFIG_ADDRESS_MASK) == configurationAddress) {
+			return node;
+		}
+
+		intptr_t found = find_pci_node(of_child(node), configurationAddress,
+			depth + 1);
+		if (found != 0)
+			return found;
+	}
+
+	return 0;
+}
+
+
+/*!	Which interrupt a PCI function is wired to, as the host bridge numbers them.
+
+	This is a translation, not a lookup: what a device knows is its own pin, one
+	of INTA to INTD, and what the bridge's mapping registers are indexed by is an
+	Interrupt Number Offset. The thing that connects them is the "interrupt-map"
+	property on the device's parent, and it is the parent's because the wiring it
+	describes is the parent's wiring.
+
+	An interrupt-map entry is a child unit address, a child interrupt specifier,
+	the parent's phandle, and the parent's interrupt specifier. Only the bits the
+	"interrupt-map-mask" selects take part in the comparison, which is how a
+	multifunction device shares one line: on this machine the mask keeps the bus
+	and device numbers and drops the function, so the ebus and the Ethernet
+	controller -- functions 0 and 1 of the same device -- both resolve to INO
+	0x21.
+
+	The INO is returned bare, without the interrupt group number. The kernel's
+	interrupt controller adds that when it programs a mapping register, because
+	the group is a property of the bridge rather than of the device, and keeping
+	it out of the number a driver sees means the number a driver sees is the one
+	the firmware published.
+
+	Declining is better than guessing. A wrong interrupt is a driver that installs
+	a handler and waits forever, which is a much harder thing to recognise than a
+	driver told it has no interrupt -- and the disk stack does have a polling
+	fallback to be told that with.
+*/
 status_t
 SabrePCIController::ReadIrq(uint8 bus, uint8 device, uint8 function, uint8 pin,
 	uint8& irq)
 {
-	return B_UNSUPPORTED;
+	if (pin == 0)
+		return B_BAD_VALUE;
+
+	uint32 configurationAddress = ((uint32)bus << 16)
+		| ((uint32)(device & 0x1f) << 11) | ((uint32)(function & 0x07) << 8);
+
+	intptr_t node = find_pci_node(of_child(fOpenFirmwareNode),
+		configurationAddress, 0);
+	if (node == 0)
+		return B_ENTRY_NOT_FOUND;
+
+	intptr_t parent = of_parent(node);
+	if (parent == 0 || parent == OF_FAILED)
+		return B_ENTRY_NOT_FOUND;
+
+	// The mask's length is the child half of an entry: a PCI unit address is
+	// three cells and its interrupt specifier one, but reading the length rather
+	// than assuming four is what makes this work unchanged if a machine ever
+	// describes itself differently.
+	uint32 mask[8];
+	intptr_t maskLength = of_getprop(parent, "interrupt-map-mask", mask,
+		sizeof(mask));
+	if (maskLength == OF_FAILED || maskLength < (intptr_t)(4 * sizeof(uint32)))
+		return B_ENTRY_NOT_FOUND;
+
+	uint32 maskCells = maskLength / sizeof(uint32);
+
+	// The parent's specifier is as many cells as the parent says. One, on every
+	// sun4u bridge; asking costs nothing and removes an assumption.
+	uint32 parentCells = 1;
+	of_getprop(parent, "#interrupt-cells", &parentCells, sizeof(parentCells));
+	if (parentCells < 1 || parentCells > 4)
+		parentCells = 1;
+
+	uint32 map[PCI_MAX_INTERRUPT_MAP_CELLS];
+	intptr_t mapLength = of_getprop(parent, "interrupt-map", map, sizeof(map));
+	if (mapLength == OF_FAILED)
+		return B_ENTRY_NOT_FOUND;
+
+	if (of_getproplen(parent, "interrupt-map") > (intptr_t)sizeof(map)) {
+		dprintf("sabre: \"interrupt-map\" is longer than %d cells; the rest is "
+			"ignored\n", PCI_MAX_INTERRUPT_MAP_CELLS);
+	}
+
+	uint32 mapCells = mapLength / sizeof(uint32);
+	uint32 entryCells = maskCells + 1 + parentCells;
+
+	for (uint32 i = 0; i + entryCells <= mapCells; i += entryCells) {
+		// The child unit address, then its interrupt specifier. Both sides are
+		// masked, because an entry may carry bits outside the mask and the
+		// comparison is only over what the mask keeps.
+		if ((map[i] & mask[0]) != (configurationAddress & mask[0]))
+			continue;
+
+		bool matches = true;
+		for (uint32 j = 1; j < maskCells - 1; j++) {
+			if ((map[i + j] & mask[j]) != 0) {
+				matches = false;
+				break;
+			}
+		}
+		if (!matches)
+			continue;
+
+		if ((map[i + maskCells - 1] & mask[maskCells - 1])
+			!= ((uint32)pin & mask[maskCells - 1])) {
+			continue;
+		}
+
+		irq = map[i + maskCells + 1] & INR_INO_MASK;
+		return B_OK;
+	}
+
+	return B_ENTRY_NOT_FOUND;
 }
 
 
@@ -488,10 +620,77 @@ SabrePCIController::GetRange(uint32 index, pci_resource_range* range)
 }
 
 
+/*!	Writes each device's resolved interrupt number into its configuration space.
+
+	This is what actually makes interrupt routing take effect, and it is the
+	controller's job rather than the bus manager's: nothing calls
+	read_pci_irq() -- the interface has it, but the mechanism is that a
+	controller walks its own devices here and pushes the answer in with
+	update_interrupt_line(). ECAMPCIControllerFDT::Finalize() does the same for
+	the flattened-device-tree platforms.
+
+	What is in the interrupt line register before this runs is whatever the
+	firmware left, and on this machine that is the PCI pin rather than anything a
+	handler can be installed on: the CMD646 reads back 3 and the Ethernet 1. A
+	driver installing on those would be waiting on interrupts belonging to other
+	devices.
+
+	Failing to resolve one is reported per device and not fatal. A device with no
+	interrupt-map entry is a device nothing has wiring for, which is a fact about
+	the machine rather than an error, and leaving its line alone is better than
+	writing a number that means something else.
+*/
 status_t
 SabrePCIController::Finalize()
 {
-	// Where the interrupt-map walk will go, once ReadIrq() has something to
-	// report. See the comment there.
+	for (uint8 bus = fFirstBus; bus <= fLastBus; bus++) {
+		for (uint8 device = 0; device < 32; device++) {
+			uint32 id;
+			if (ReadConfig(bus, device, 0, PCI_vendor_id, 4, id) != B_OK)
+				continue;
+			if ((id & 0xffff) == 0xffff || (id & 0xffff) == 0)
+				continue;
+
+			// A single-function device answers for function 0 only, and reading
+			// the others would be reading the same registers again.
+			uint32 headerType = 0;
+			ReadConfig(bus, device, 0, PCI_header_type, 1, headerType);
+			uint8 functions = (headerType & PCI_multifunction) != 0 ? 8 : 1;
+
+			for (uint8 function = 0; function < functions; function++) {
+				_FinalizeInterrupt(bus, device, function);
+			}
+		}
+
+		// fLastBus is inclusive and a uint8, so a bridge reporting 255
+		// subordinate buses would wrap the loop rather than end it.
+		if (bus == 0xff)
+			break;
+	}
+
 	return B_OK;
+}
+
+
+void
+SabrePCIController::_FinalizeInterrupt(uint8 bus, uint8 device, uint8 function)
+{
+	uint32 pin = 0;
+	if (ReadConfig(bus, device, function, PCI_interrupt_pin, 1, pin) != B_OK)
+		return;
+	if (pin == 0 || pin == 0xff)
+		return;
+
+	uint8 irq;
+	status_t status = ReadIrq(bus, device, function, (uint8)pin, irq);
+	if (status != B_OK) {
+		dprintf("sabre: no interrupt for %u:%u:%u pin %u: %s\n", bus, device,
+			function, (unsigned)pin, strerror(status));
+		return;
+	}
+
+	dprintf("sabre: %u:%u:%u pin %u is interrupt %u\n", bus, device, function,
+		(unsigned)pin, irq);
+
+	gPCI->update_interrupt_line(bus, device, function, irq);
 }

@@ -45,6 +45,8 @@ public:
 
 private:
 			status_t		_ReadRanges(intptr_t node);
+			void			_FinalizeInterrupt(uint8 bus, uint8 device,
+								uint8 function);
 			phys_addr_t		_ConfigAddress(uint8 bus, uint8 device,
 								uint8 function, uint16 offset);
 
@@ -61,6 +63,7 @@ private:
 
 
 extern device_manager_info* gDeviceManager;
+extern pci_module_info* gPCI;
 
 
 #endif	// _SABRE_PCI_CONTROLLER_H_

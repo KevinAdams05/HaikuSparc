@@ -8,6 +8,7 @@
 
 
 device_manager_info* gDeviceManager;
+pci_module_info* gPCI;
 
 
 static pci_controller_module_info sSabrePCIController = {
@@ -63,6 +64,7 @@ static pci_controller_module_info sSabrePCIController = {
 
 _EXPORT module_dependency module_dependencies[] = {
 	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
+	{ B_PCI_MODULE_NAME, (module_info**)&gPCI },
 	{}
 };
 
