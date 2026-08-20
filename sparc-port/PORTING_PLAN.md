@@ -537,28 +537,33 @@ datasheets, which RefDocs covers well.
 **Exit:** mount BFS from a real disk; answer a ping.
 **Risk: medium.** The IOMMU is the interesting part; the rest is conventional.
 
-**Status: the stack is assembled and reaches the disks.** A `busses/pci/sabre` driver publishes the
-host bridge to the device manager, so Haiku's own PCI bus manager attaches beneath it and enumerates
-sabre, both simba bridges, sunhme, the framebuffer and the CMD646. `generic_ide_pci` binds the CMD646
-through `ata_adapter`, and both QEMU disks identify by model, serial and geometry over PIO.
+**Status: it mounts.** The kernel boots on QEMU's sun4u and mounts BFS from a real disk:
 
-Two pieces of this phase are deliberately not done yet, and both are named in the code:
+```
+bfs: mounted "Haiku" (root node at 2051, device = /dev/disk/ata/0/slave/raw)
+Mounted boot partition: /dev/disk/ata/0/slave/raw
+```
 
-- **The IOMMU.** Bus-master DMA needs a DVMA address from a mapping nothing makes yet, so
-  `ata_adapter` reports the controller as unable to DMA on sparc. PIO is slow and correct.
-- **Interrupt routing.** `SabrePCIController::ReadIrq()` returns `B_UNSUPPORTED` rather than a
-  plausible wrong number, because a wrong interrupt is a driver that waits forever. It needs the
-  `interrupt-map` walk that `ECAMPCIControllerFDT::Finalize()` does for the flattened-device-tree
-  platforms.
+The whole chain works: a `busses/pci/sabre` driver publishes the host bridge, so Haiku's own PCI bus
+manager attaches beneath it and enumerates sabre, both simba bridges, sunhme, the framebuffer and the
+CMD646; `generic_ide_pci` binds the CMD646 through `ata_adapter`; `ata` presents itself as a SCSI bus;
+`scsi_disk` drives it through `scsi_periph`; `intel` reads the partition map and `bfs` mounts the
+volume. The kernel then replaces every preloaded add-on with the file behind it, read off that volume.
 
-`scsi_disk` binds to both disks and publishes `disk/ata/0/master/raw` and
-`disk/ata/0/slave/raw`; the CD-ROM identifies through the ATAPI path. The boot then grinds, polling a
-device that is not there — which is what the missing interrupt routing costs, and puts that piece of
-this phase on the critical path rather than in the "later" pile.
+Everything after the mount is the kernel looking for a userland that is not on the volume yet, which
+is Phase 6's packaging gap seen from the other side.
 
-See [PROGRESS §29](PROGRESS.md) for the eight bugs between the device manager and a published disk —
-including the TSB that was sitting on top of every thread stack, which is the one that had been
-corrupting register windows.
+Two pieces of this phase remain, both named in the code rather than left to be rediscovered:
+
+- **Interrupt routing.** `SabrePCIController::ReadIrq()` returns `B_UNSUPPORTED`, so the disk stack
+  runs entirely on timeouts. It needs the `interrupt-map` walk that
+  `ECAMPCIControllerFDT::Finalize()` already does for the flattened-device-tree platforms. This is
+  what makes the boot take minutes rather than seconds.
+- **The IOMMU.** PCI masters address host memory through the host bridge's IOMMU and nothing programs
+  it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is correct and slow.
+
+See [PROGRESS §29](PROGRESS.md) for the twelve bugs between the device manager and a mounted volume,
+and for the QEMU invocation that reproduces it.
 
 ### Phase 8 — Desktop
 

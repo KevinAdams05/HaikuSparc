@@ -2163,63 +2163,102 @@ atapi 1-0: model number: QEMU DVD-ROM
 
 Both disks and the CD-ROM, identified and published, with `scsi_disk` bound to them.
 
-### Where it stops now
+### Four more bugs, and then it mounts
 
-Immediately after, and it is not a fault: the serial console goes quiet after
+The polling turned out to be a symptom rather than a cause, and chasing it produced four more
+failures in a row — each one reachable only once the one before it was gone.
+
+**The absent device was a red herring.** Filling all four IDE slots made every device identify, and
+the boot still ended on `failed to read pio block`. So the transfer was failing against a device that
+was there.
+
+**A physical page could not be handed out as a pointer.** `GetPage()` returned `B_NOT_SUPPORTED`,
+because on this machine almost nothing needs it: `ASI_PHYS_USE_EC` addresses physical memory directly,
+which is what `MemsetPhysical()` and the two `Memcpy` methods use. But
+`ATAChannel::_TransferPIOPhysical()` is handed a scatter-gather list of *physical* addresses by the
+SCSI stack and maps each one with `vm_get_physical_page_current_cpu()` to move the bytes. So every
+data transfer failed, which left DRQ asserted on the device, which made every subsequent device
+selection time out — identification worked and nothing else did.
+
+The answer is a reserved window of kernel address space with entries written into it on demand, and
+Haiku's own generic physical page mapper doing the bookkeeping: a chunk pool with an LRU, the same
+code PowerPC and m68k use. `map_iospace_chunk()` never allocates, because the leaf page tables
+covering the window are built once from the boot-time allocator — filling one in cannot fail partway
+through and cannot need a page reservation in a path with no way to ask for one.
+
+**`UnmapPage()` had two bugs of its own**, and the boot reached them within a second of mounting. It
+took `DEBUG_PAGE_ACCESS_START()` around `PageUnmapped()` when the caller already holds the page —
+`VMTranslationMap::UnmapPages()` brackets every call with START/END, so `PageUnmapped()` only checks
+— which panicked with *"Invalid concurrent access to page ... (start), currently accessed by: 15"*,
+the thread colliding with itself. And it unlocked the map before calling `PageUnmapped()`, which
+releases the lock itself on both of its paths.
+
+**Add-on segments were a megabyte apart.** The linker aligns segments to 1 MB on sparc64, so the
+intel module's text ended at `0xdf84` and its data began at `0x10e000`. `load_kernel_add_on()`
+refuses an image whose segments are more than 8 KB apart — reasonably, since it reserves the whole
+span — so every add-on failed to load from disk with `B_BAD_DATA`, while the same file worked when
+the boot loader preloaded it. The loader maps each segment on its own and never looks at the distance
+between them, which is exactly why this appeared only once the kernel could read the boot volume and
+began replacing the preloaded images with the files behind them. `-z max-page-size=0x2000` packs them.
+
+### It boots
 
 ```
-ata 1 error: failed to read pio block
+scsi_disk: SCSI Disk (QEMU HARDDISK)
+publish device: node ..., path disk/ata/0/master/raw, module drivers/disk/scsi/scsi_disk/device_v1
+publish device: node ..., path disk/ata/0/slave/raw,  module drivers/disk/scsi/scsi_disk/device_v1
+Identified boot partition by partition offset.
+bfs: mounted "Haiku" (root node at 2051, device = /dev/disk/ata/0/slave/raw)
+Mounted boot partition: /dev/disk/ata/0/slave/raw
+swap_init_post_modules: Can't open/create /var/swap: No such file or directory
+no valid cpufreq module found
+no valid cpuidle module found
 ```
 
-— the probe of the device that is not there, channel 1 device 1 — and QEMU sits at 100% CPU. Twenty
-five minutes of that produced no further output.
+**Haiku's kernel boots on SPARC and mounts BFS from a real disk**, which is the first half of Phase
+7's exit criterion. Everything after the mount is the kernel going looking for a userland that is not
+on the volume — `make-bfs-image.sh` writes the kernel and the add-ons and nothing else — so it stops
+there quietly rather than failing.
 
-The QEMU monitor is the right tool here, because it can sample a running guest without needing the
-guest to cooperate. Two samples two seconds apart show two different places:
+The whole chain now works end to end: sabre publishes the host bridge, the PCI bus manager enumerates
+sabre and both simba bridges, `generic_ide_pci` binds the CMD646 through `ata_adapter`, `ata` presents
+itself as a SCSI bus, `scsi_disk` drives it through `scsi_periph`, `intel` reads the partition map and
+`bfs` mounts the volume — and then the kernel replaces every preloaded add-on with the file behind it,
+read off that volume.
 
-```
-pc: 00000000801d91e4   <- memchr, %o7 = 801dc130 = strnlen, from vsnprintf
-                          strnlen(0x80b167a8, SIZE_MAX)
-pc: 000000008108c198   <- an add-on, %g2 = 0xce008182
-```
+### Reproducing it
 
-So it is **not** hung. It is grinding, and both samples say what on:
+Four IDE slots filled, because the ATAPI probe of an absent device is where this used to grind:
 
-`0x80b167a8` is not a source string — dumping it gives `ata 1 error: failed to r...`, the log line
-that had just been printed. That is the debug output path working on its own buffer, which is what
-the "Last message repeated 12 times." filter in `dprintf()` does. So the first sample is a *symptom*
-of a message being printed over and over, not a bug in its own right.
-
-The second sample says what is printing it. `0xce000000` is where the PCI bus manager mapped the I/O
-window, and `0xce008182` is I/O port `0x8182` — channel 1's alternate status register. The driver is
-polling a device that will never answer.
-
-The first guess about *why* was that the probe of the absent device was the problem — channel 1 has
-only a CD-ROM on it, so its slave slot answers nothing. That guess was wrong, and cheaply so: filling
-all four IDE slots (`index=3` as a fourth disk) makes every device identify —
-
-```
-ata 1: identified ATAPI device 0     atapi 1-0: QEMU DVD-ROM
-ata 1: identified ATA device 1       ata 1-1: QEMU HARDDISK, QM00004
+```sh
+qemu-system-sparc64 -M sun4u -cpu "TI UltraSparc IIi" -m 512 -nographic \
+    -bios /usr/share/qemu/openbios-sparc64 \
+    -chardev socket,id=s0,path=$sock,server=on,wait=off -serial chardev:s0 \
+    -monitor unix:$mon,server=on,wait=off \
+    -drive file=loader.img,format=raw,if=ide,index=0,media=disk \
+    -drive file=bfs.img,format=raw,if=ide,index=1,media=disk \
+    -drive file=filler.img,format=raw,if=ide,index=2,media=disk \
+    -drive file=filler.img,format=raw,if=ide,index=3,media=disk \
+    -fda blank.fd </dev/null
 ```
 
-— and the boot still ends on the same line. So `failed to read pio block` is a real transfer failing
-against a device that *is* there, and something above it is retrying without giving up. Two candidates,
-both in upstream driver logic rather than in anything this port wrote: the SCSI bus manager's retry of
-a failed command, and `scsi_periph`'s error handling. The filler CD-ROM being a megabyte of zeros
-rather than a real ISO 9660 image is also worth ruling out first, since a read of it cannot succeed.
+Two things about this that cost time. QEMU's stdin has to be closed: with `-nographic` and an explicit
+`-serial`, the *monitor* lands on stdio, and a monitor that reads EOF takes the machine down with it —
+which presented as a serial socket that produced nothing at all. And `-monitor unix:` is worth having
+even when nothing is wrong; sampling a running guest twice through it is what distinguished "hung"
+from "grinding", and `x/24i` at a program counter is what identified the code doing the grinding.
 
-Underneath all of it is the missing interrupt routing. `SabrePCIController::ReadIrq()` returns
-`B_UNSUPPORTED`, so every ATA operation runs on timeouts and every retry costs wall-clock seconds
-that a working IRQ would not. That makes the interrupt-map walk — the thing
-`ECAMPCIControllerFDT::Finalize()` already does for the flattened-device-tree platforms, applied to
-the `interrupt-map` property on the sabre node — the next piece of Phase 7 rather than a later one.
+### What is left in Phase 7
 
-Two smaller things are worth doing alongside it, and neither is speculative:
+Two things, both named in the code rather than left to be rediscovered:
 
-- Bound the `%s` scan in the kernel's `dprintf()`. Walking four gigabytes for a missing terminator is
-  a poor failure mode for a log function, and the only reason it showed up here is that it was being
-  asked to do it constantly.
-- Give the ATA probe of an absent device a shorter path. Haiku's driver was written for machines where
-  the controller raises an interrupt; every timeout it takes here is a wall-clock second that a
-  working IRQ would not cost.
+**Interrupt routing.** `SabrePCIController::ReadIrq()` returns `B_UNSUPPORTED`, so the entire disk
+stack runs on timeouts. It needs the `interrupt-map` walk that `ECAMPCIControllerFDT::Finalize()`
+already does for the flattened-device-tree platforms. This is what makes the boot take minutes rather
+than seconds, and it is what makes the ATAPI probe of an absent device grind instead of failing.
+
+**The IOMMU.** PCI masters address host memory through the host bridge's IOMMU, and nothing programs
+it, so `ata_adapter` reports the controller as unable to DMA on sparc. PIO is correct and slow.
+
+And one thing outside it: **a userland on the volume**, which is Phase 6's packaging gap seen from the
+other side. The kernel is now waiting for one.
