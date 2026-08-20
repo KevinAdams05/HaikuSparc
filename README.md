@@ -16,7 +16,7 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 ## Status
 
 **The kernel runs its own MMU, page table and VM, schedules and preempts threads, keeps time, and
-can print a backtrace of its own stack.** Phases 0–5 are complete, including Phase 2 — the MMU and
+drops into a working kernel debugger.** Phases 0–5 are complete, including Phase 2 — the MMU and
 trap table, the gate this port has always turned on.
 
 On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
@@ -49,10 +49,14 @@ Phase 5, window-aware backtraces, is done — four phases later than the plan sa
 walks across spilled register windows and terminates at `sparc_thread_entry`, the fabricated frame
 Phase 3 built for a thread that had never run.
 
-Next is a usable kernel debugger. The stack walker works and the prompt now accepts a keypress — it
-never had, for the same `int` versus `intptr_t` reason as a Phase 1 bug — but the debugger's own
-command-evaluation path still faults, which is one bug away from this port having a real
-debugger.
+KDL works. `sc` prints a symbolised sixteen-frame backtrace and `threads` prints the thread table.
+That took two fixes beyond the stack walker: the prompt had never accepted a keypress, and
+`setjmp`/`longjmp` were a bare `ret` — which, on a machine where a leaf function must return with
+`retl`, transferred control two frames up while executing a stray instruction. That one bug is also
+why `DebugAllocPool::Free: bad address` had appeared in every boot since Phase 2.
+
+Next is Phase 6, userspace — or Phase 7's device stack, since the absence of a disk driver is where
+the boot actually stops.
 
 Twenty genuine bugs have been found and fixed along the way, several of them
 architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,

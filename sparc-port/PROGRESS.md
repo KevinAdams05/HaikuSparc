@@ -5,14 +5,15 @@ separate from [PORTING_PLAN.md](PORTING_PLAN.md): the plan describes the shape o
 should stay stable; this file changes constantly. Findings get promoted into the plan only when
 they change the plan.
 
-**State: Phases 0–5 complete. The kernel keeps time, preempts, and can print a backtrace.**
+**State: Phases 0–5 complete, and the port has a working kernel debugger.**
 
 The loader boots from Sun-disklabelled media, mounts a BFS volume and enters the kernel. The kernel
 takes the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
 the VM and slab allocator, initialises the ELF loader, the commpage and the scheduler, switches
-between and preempts kernel threads, keeps time from `%TICK`, and walks its own stack across spilled
-register windows. It gets as far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing,
-because there are no disk drivers yet.
+between and preempts kernel threads, keeps time from `%TICK`, and **drops into a usable KDL where
+`sc` prints a symbolised sixteen-frame backtrace and `threads` prints the thread table**. It gets as
+far as `KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk
+drivers yet.
 
 Exit criteria met, each by a deliberate test rather than by inference:
 
@@ -24,7 +25,7 @@ Exit criteria met, each by a deliberate test rather than by inference:
 | 3 | Two threads hand control back and forth | `counter 128 of 128 after 124 yields` (§23) |
 | 4 | `system_time()` is right | monotonic, and agreeing with the raw `%TICK` delta (§24) |
 | 4 | A tick preempts a busy loop | `spinner reached 402130 after 8720 us without either thread yielding` (§24) |
-| 5 | A correct backtrace across a spilled window | 24 identical call sites, and a printed trace ending at `sparc_thread_entry` (§25) |
+| 5 | KDL prints a correct backtrace across a spilled window | sixteen symbolised frames from `sc`, ending at `sparc_thread_entry` (§25, §26) |
 
 What exists:
 
@@ -34,22 +35,18 @@ What exists:
 | TSB | 256 KB split pair, a cache in front of the page table |
 | TLB miss fast path | 10 instructions; slow path walks the page table in about 20 more (§22) |
 | Trap table | 32 KB, geometry asserted at build time and re-checked every boot (§20) |
-| Failure reporting | unresolved misses and unhandled traps return to TL=0 and panic (§22) |
+| Failure reporting | unresolved misses and unhandled traps report the trapped window and panic (§22, §26) |
 | `VMTranslationMap` | `SPARCVMTranslationMap`, wired into `create_map` (§22) |
 | Context switch | twelve instructions, built on the window spill and fill handlers (§23) |
 | Clock and timer | `system_time()` from `%TICK`, level-14 interrupt, preemption (§24) |
-| Backtraces | window-aware stack walk, `sc`/`bt`/`where` registered (§25) |
+| Backtraces and KDL | window-aware stack walk; `sc`, `bt`, `where`, and every other command (§25, §26) |
+| `setjmp` / `longjmp` | implemented — they were a bare `ret` (§26) |
 
-**Next: a usable KDL.** The stack walker works but `sc` cannot be run interactively, because the
-debugger's own command-evaluation path faults — `kernel_debugger_loop` on a four-byte load through a
-pointer of 7, after `create_debug_alloc_pool`, and `DebugAllocPool::Free: bad address` in every boot
-since Phase 2. That is one bug away from the port having a real debugger, which makes it the highest
--value thing left.
+**Next: Phase 6, userspace.** Or Phase 7's device stack, since the boot's own stopping point is the
+absence of a disk driver.
 
-**Then Phase 6, userspace.**
-
-**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), and the boot ends at
-`did not find any boot partitions!`, which is the absence of disk drivers rather than a defect.
+**Open:** `wait_for_thread()` trips `could acquire exit_sem for thread 5` (§23), which is worth
+another look now that `setjmp` works.
 
 Read [PHASE2_MMU_DESIGN.md](PHASE2_MMU_DESIGN.md) before touching any of it: the mechanism, the
 sizing, the table layout and the QEMU-fidelity verification are all there.
@@ -1593,3 +1590,108 @@ called after `create_debug_alloc_pool`. `DebugAllocPool::Free: bad address` has 
 boot since Phase 2 and was ignored as cosmetic; it is probably the same thing.
 
 That is one bug away from this port having a real debugger, and it is not the stack walker.
+
+
+## 26. setjmp was a bare `ret`, and that is why KDL never worked
+
+Phase 5 left the stack walker working and `sc` unusable: any command typed at the prompt faulted.
+Chasing that turned out to be worth more than the stack walker.
+
+### Narrowing it
+
+`help` faulted at the same instruction as `sc`, so it was not the new code. A bare Enter did not,
+because that path never reaches the faulting instruction. The fault was
+`ld [%l0]` in `kernel_debugger_loop`, reading `sCurrentLine`.
+
+The trap report was extended to dump the trapped window — the handler runs in the same window as the
+code that trapped, so `%l0` through `%l7` are simply there to be read — and that changed the
+question:
+
+```
+sparc: trap 0x34 window cwp 2 cansave 4 canrestore 2 cleanwin 7 otherwin 0
+sparc: trapped locals 0x7 0xfffffffffffffff8 0x801f8a30 0x3c
+sparc:                0x1 0xa 0x0 0x80230470
+```
+
+`cansave + canrestore + otherwin = 6 = NWINDOWS - 2`, so the window accounting was healthy. `%l7`
+held `0x80230470`, and `nm` puts `sCurrentLine` at `0x8023b484`... at `0x8023b480`, exactly
+`%l7 + 0xb010`, which is what the instruction stream computes. So the relocation was right, `%l0`
+had held the right value, and **one register in an otherwise intact window had been replaced by 7**.
+
+That is a very different problem from a lost window, and the two look identical without the dump.
+
+### The theory that was wrong
+
+`read_line()` calls Open Firmware once per keypress, and Open Firmware's window traps are now
+serviced by *our* handlers — which assume a biased 64-bit kernel frame. If OpenBIOS used a different
+convention anywhere, our spill handler would write to the wrong place.
+
+Testable, so it was tested: an assembly probe loaded six locals with values that could not occur
+naturally, called into Open Firmware 256 times, and checked them after each.
+
+```
+arch_platform: 256 Open Firmware calls, corrupted local mask 0x0 -- windows preserved
+```
+
+Written in assembly because the question is about specific registers and C cannot ask it — at -O2
+the compiler decides which locals live where and need not keep any live across the call, and at -O0
+it puts them on the stack, where the question does not arise.
+
+### The actual cause
+
+`evaluate_debug_command()` reaches `debug_call_with_fault_handler()`, which calls `setjmp()`. And
+`setjmp` was:
+
+```
+FUNCTION(setjmp):
+	ret
+```
+
+That is worse than empty. `ret` is `jmpl %i7+8`, and `%i7` belongs to the caller's *caller* — these
+are leaf functions with no `save`, so a leaf using `ret` instead of `retl` **returns two frames up
+instead of one**. There was nothing in the delay slot either, so the first instruction of whatever
+followed in the text section executed on the way out.
+
+So `setjmp()` did not fail to save state. It transferred control to the wrong place while executing
+a stray instruction, and whatever it landed in scrambled registers on the way past.
+
+`__jmp_buf` was `unsigned long[1]` — not enough for even a stack pointer, with a comment saying the
+size had yet to be determined.
+
+### The implementation
+
+SPARC needs less in a `jmp_buf` than most architectures, for the same reason the context switch is
+twelve instructions: the callee-saved registers are the window registers, and `flushw` puts every one
+of them in the stack frame it belongs to. What is left to record is which stack and where to resume.
+
+`longjmp` uses the same pivot as the context switch — `save` for a window of its own, `flushw`, then
+write the saved pair into this window's `%i6` and `%i7` so that `ret; restore` lands on the target
+stack at the target address. Unwinding many frames costs nothing extra, because everything between
+here and there is already in memory. The return value rides out on the `restore`, which computes in
+the old window and writes in the new one, and so can reach `setjmp`'s caller's `%o0` — otherwise
+unreachable from there.
+
+### The result
+
+```
+kdebug> sc
+stack trace for thread 15 "main2"
+ 0 ... invoke_command_trampoline + 0x10
+ 1 ... arch_debug_call_with_fault_handler + 0x18
+ 2 ... debug_call_with_fault_handler + 0x90
+ 3 ... invoke_debugger_command + 0x120
+ ...
+11 ... panic + 0x64
+12 ... vfs_mount_boot_file_system + 0x1d4
+13 ... main2 + 0xf8
+14 ... common_thread_entry + 0x30
+15 ... sparc_thread_entry + 0x4
+kdebug>
+```
+
+`threads` prints the thread table. And **`DebugAllocPool::Free: bad address`, which had appeared in
+every boot since Phase 2 and was written off as cosmetic, is gone** — it was the same corruption all
+along.
+
+The lesson worth keeping is that one: a message that appears in every single boot and is dismissed as
+noise had been reporting a real fault in `setjmp` for five phases.

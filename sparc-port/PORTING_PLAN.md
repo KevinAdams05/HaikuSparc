@@ -491,11 +491,11 @@ Fixing it early pays for itself immediately.
 **Exit:** KDL prints a correct backtrace across a spilled window boundary.
 **Risk: medium.**
 
-**Status: done**, four phases later than this said to do it. The stack walk works and prints, and
-the debugger will now accept a keypress — that had never worked, for the same `int` versus
-`intptr_t` reason as a Phase 1 bug. What remains between this and a usable KDL is a fault in the
-debugger's own command-evaluation path, which is not the stack walker; see
-[PROGRESS §25](PROGRESS.md).
+**Status: done**, four phases later than this said to do it, and KDL is fully usable: `sc` prints a
+symbolised sixteen-frame backtrace and every other command works. Getting there took two fixes
+beyond the stack walker — the debugger had never accepted a keypress (`int` versus `intptr_t`, as in
+Phase 1), and `setjmp`/`longjmp` were a bare `ret`, which is why any command faulted. See
+[PROGRESS §25 and §26](PROGRESS.md).
 
 **The advice above was not taken, and the cost is now measurable.** Phases 2 and 3 were done without
 backtraces. What replaced them was a trap handler that returns to TL=0 and reports the trapped
