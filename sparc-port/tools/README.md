@@ -20,6 +20,37 @@ machines. Serial is the only console, so its output *is* the debugging channel.
 expiry exits 0 because that is the normal end of a scripted boot, not a failure. Use
 `--timeout 0` for interactive sessions. `ctrl-a x` quits, `ctrl-a c` reaches the QEMU monitor.
 
+### The recipe that actually boots
+
+```sh
+./make-boot-disk.sh --output loader.img          # the loader, on ext2 + a Sun label
+./make-bfs-image.sh --output bfs.img             # the kernel and its add-ons, on BFS
+
+./qemu-sun4u.sh --timeout 0 \
+    --serial /tmp/ser.sock --monitor /tmp/mon.sock \
+    --disk loader.img --disk bfs.img --disk junk.img --disk junk.img &
+./serial-driver.py --socket /tmp/ser.sock --log boot.log \
+    --script boot-kernel-debug --timestamps
+```
+
+`--disk` is repeatable and the order is load-bearing: index 0 and 1 are IDE channel 0's master
+and slave, 2 and 3 are channel 1's, and the loader has to be on index 0 with the BFS volume on
+index 1.
+
+**Fill all four slots.** The ATAPI probe of a device that is not there hangs the boot — twenty-five
+minutes produced no further output — and a real ISO 9660 image in the CD-ROM rather than a
+zero-filled file makes no difference, so this is the ATAPI path itself and not the media. Any two
+files will do for the spare slots. That bug is still open.
+
+**Close QEMU's stdin when the console is on a socket**, which `--serial` now does for you. With
+`-nographic` and an explicit `-serial`, the *monitor* lands on stdio, and a monitor that reads EOF
+takes the machine down with it — which presents as a serial socket that produces nothing at all.
+
+**Take `--monitor` even when nothing is wrong.** `info registers` and `x/24i <pc>` on a *running*
+guest is what distinguishes a hung kernel from a merely slow one, and sampling twice a couple of
+seconds apart settles it in one step. It is also how a physical address was shown to be a real
+register rather than a hole in the address space: write it, read it back.
+
 ### Why these particular QEMU settings
 
 - **`--cpu iii` / `--cpu iie`** — QEMU models both our targets by name: `TI UltraSparc IIi`
@@ -34,11 +65,17 @@ expiry exits 0 because that is the normal end of a scripted boot, not a failure.
 - **cmd646-ide** — QEMU emulates the Ultra 5/10's exact IDE controller, so `--disk` exercises
   the real target part. The Blade 150's ALi M5229 is *not* emulated and needs hardware.
 
-### Gotcha worth remembering
+### Gotchas worth remembering
 
 QEMU's `-nographic` serial output misbehaves when stdout is a pipe that closes early — piping
 into `head` produces *no output at all* rather than a truncated log. Use `--log FILE`, or
-redirect to a file, and grep afterwards.
+`--serial`, or redirect to a file, and grep afterwards.
+
+`-d int -D FILE` logs every trap with the complete register file, window state and `tbr`, and it
+is the instrument for anything to do with traps or windows (PROGRESS §14). Be ready for the size:
+ninety seconds of a kernel spinning produced **39 GB**. It is greppable and worth it — that trace
+is what showed a register window arriving corrupt from a *fill* rather than being written over —
+but delete it afterwards.
 
 ## `make-boot-disk.sh`
 

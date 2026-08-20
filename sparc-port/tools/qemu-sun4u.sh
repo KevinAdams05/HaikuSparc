@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 #
+# Copyright 2026, Kevin Adams <kevinadams05@gmail.com>
+# Distributed under the terms of the MIT License.
+#
 # Launch the QEMU sun4u machine for Haiku/SPARC development.
 #
 # The sun4u machine is modelled on the Sun Ultra 5/10, which is one of our two
@@ -9,8 +12,23 @@
 #
 # Serial is the only console. Everything this prints is the debugging channel.
 #
-# Copyright 2026, Kevin Adams <kevinadams05@gmail.com>
-# Distributed under the terms of the MIT License.
+# Three things about driving QEMU here that each cost an afternoon to find:
+#
+#   Fill all four IDE slots. The ATAPI probe of a device that is not there hangs
+#   the boot -- twenty-five minutes produced no further output, and a real ISO
+#   in the CD-ROM rather than a zero-filled file makes no difference. Any four
+#   files will do; two of them can be junk.
+#
+#   Close QEMU's stdin when the console is on a socket. With -nographic and an
+#   explicit -serial, the *monitor* lands on stdio, and a monitor that reads EOF
+#   takes the machine down with it -- which presents as a serial socket that
+#   produces nothing at all.
+#
+#   Take the monitor on a socket even when nothing is wrong. "info registers"
+#   and "x/24i <pc>" on a *running* guest is the instrument that distinguishes a
+#   hung kernel from a grinding one, and sampling twice two seconds apart says
+#   which in one step. It is also how a physical address was proved to be a real
+#   register rather than a hole.
 
 set -euo pipefail
 
@@ -20,13 +38,15 @@ BIOS=${BIOS:-/usr/share/qemu/openbios-sparc64}
 cpu_key=iii
 memory=512
 timeout_secs=60
-disk=
+disks=()
 cdrom=
 kernel=
 logfile=
 use_gdb=0
 gdb_port=1234
 tftp_dir=
+serial_socket=
+monitor_socket=
 extra=()
 
 usage() {
@@ -36,8 +56,14 @@ Usage: qemu-sun4u.sh [options] [-- extra qemu args]
   --cpu iii|iie      Target CPU. iii = UltraSPARC IIi (Ultra 10, default)
                                  iie = UltraSPARC IIe (Blade 150)
   --memory MB        Guest RAM, default 512
-  --disk FILE        Attach FILE as an IDE disk on the cmd646 controller
+  --disk FILE        Attach FILE as an IDE disk on the cmd646 controller.
+                     Repeatable, and worth repeating: see the note below about
+                     filling all four slots.
   --cdrom FILE       Attach FILE as an IDE CD-ROM
+  --serial SOCK      Put the console on a Unix socket instead of the terminal,
+                     for serial-driver.py to drive
+  --monitor SOCK     Put the QEMU monitor on a Unix socket. Worth having even
+                     when nothing is wrong -- see the note below.
   --kernel FILE      Boot an ELF directly, bypassing boot media (early bring-up)
   --tftp DIR         Serve DIR over the built-in TFTP server, for netboot
   --gdb [PORT]       Freeze at reset and wait for gdb (default port 1234)
@@ -58,12 +84,14 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--cpu)     cpu_key="$2"; shift 2 ;;
 		--memory)  memory="$2"; shift 2 ;;
-		--disk)    disk="$2"; shift 2 ;;
+		--disk)    disks+=("$2"); shift 2 ;;
 		--cdrom)   cdrom="$2"; shift 2 ;;
 		--kernel)  kernel="$2"; shift 2 ;;
 		--tftp)    tftp_dir="$2"; shift 2 ;;
 		--timeout) timeout_secs="$2"; shift 2 ;;
 		--log)     logfile="$2"; shift 2 ;;
+		--serial)  serial_socket="$2"; shift 2 ;;
+		--monitor) monitor_socket="$2"; shift 2 ;;
 		--gdb)
 			use_gdb=1
 			if [[ ${2-} =~ ^[0-9]+$ ]]; then gdb_port="$2"; shift; fi
@@ -100,9 +128,29 @@ nic="user,model=sunhme"
 [[ -n "$tftp_dir" ]] && nic+=",tftp=${tftp_dir}"
 args+=(-nic "$nic")
 
-[[ -n "$disk"   ]] && args+=(-drive "file=${disk},format=raw,if=ide,media=disk")
-[[ -n "$cdrom"  ]] && args+=(-drive "file=${cdrom},format=raw,if=ide,media=cdrom")
+# Explicit indices, because which IDE slot a drive lands in decides which device
+# the firmware and the kernel see it as: index 0 and 1 are channel 0's master and
+# slave, 2 and 3 are channel 1's. The boot recipe depends on that -- the loader
+# lives on index 0 and the BFS volume on index 1.
+index=0
+for file in ${disks[@]+"${disks[@]}"}; do
+	args+=(-drive "file=${file},format=raw,if=ide,index=${index},media=disk")
+	index=$((index + 1))
+done
+if [[ -n "$cdrom" ]]; then
+	args+=(-drive "file=${cdrom},format=raw,if=ide,index=${index},media=cdrom")
+fi
 [[ -n "$kernel" ]] && args+=(-kernel "$kernel")
+
+if [[ -n "$serial_socket" ]]; then
+	rm -f "$serial_socket"
+	args+=(-chardev "socket,id=s0,path=${serial_socket},server=on,wait=off")
+	args+=(-serial chardev:s0)
+fi
+if [[ -n "$monitor_socket" ]]; then
+	rm -f "$monitor_socket"
+	args+=(-monitor "unix:${monitor_socket},server=on,wait=off")
+fi
 
 if [[ $use_gdb -eq 1 ]]; then
 	args+=(-S -gdb "tcp::${gdb_port}")
@@ -119,10 +167,13 @@ echo "=== ctrl-a x to quit, ctrl-a c for the qemu monitor ===" >&2
 run() {
 	if [[ "$timeout_secs" != "0" ]]; then
 		# 124 from timeout is the normal end of an unattended run, not a failure.
-		timeout --foreground "$timeout_secs" "$QEMU" "${args[@]}" || {
+		timeout --foreground "$timeout_secs" "$QEMU" "${args[@]}" </dev/null || {
 			rc=$?; [[ $rc -eq 124 ]] && exit 0; exit $rc
 		}
 	else
+		if [[ -n "$serial_socket" ]]; then
+			exec "$QEMU" "${args[@]}" </dev/null
+		fi
 		exec "$QEMU" "${args[@]}"
 	fi
 }

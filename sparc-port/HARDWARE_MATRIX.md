@@ -85,6 +85,46 @@ all four target machines one porting problem instead of two:
 One bridge driver covers Ultra 5, Ultra 10, Blade 100 and Blade 150 — **and the QEMU machine
 we will develop against**.
 
+### How a device interrupt is identified
+
+Verified against the machine rather than only read, so it belongs here. A device interrupt on
+sun4u is named by an **Interrupt Number Register** value: eleven bits, a five-bit Interrupt Group
+Number and a six-bit Interrupt Number Offset. On UltraSPARC-IIi the IGN is **fixed at 0x1f** and
+not programmable, which the firmware confirms — sabre's own node publishes `0x7f0 0x7ee 0x7ef
+0x7e5`, being PCI bus error, DMA UE, DMA CE and power fail with `0x7c0` already OR'd in.
+
+The INO is what identifies the source, and its *value* decides which of the bridge's two register
+files programs it:
+
+| INO | Source | Register file |
+| --- | --- | --- |
+| `0b0bssnn` (`0x00`–`0x1f`) | PCI bus `b`, slot `ss`, pin `nn` = INTA–INTD | PCI |
+| `0x20` | SCSI — **and the onboard IDE, which occupies that slot on an Ultra 5/10** | OBIO |
+| `0x21` | Ethernet | OBIO |
+| `0x22` | Parallel port | OBIO |
+| `0x23`, `0x24` | Audio record, audio playback | OBIO |
+| `0x25` | Power fail | OBIO |
+| `0x26` | Keyboard / mouse / serial | OBIO |
+| `0x27` | Floppy | OBIO |
+| `0x29` | Keyboard | OBIO |
+| `0x2b` | Serial (observed on the ebus `su` at `0x3f8`) | OBIO |
+| `0x2e`, `0x2f`, `0x30` | DMA UE, DMA CE, PCI bus error | OBIO |
+
+That table is TABLE 19-28 of the `UltraSPARC IIi User's Manual (805-0087)`, and the entries for
+`0x20`, `0x21`, `0x29` and `0x2b` were confirmed by reading the firmware's own `interrupt-map`
+properties on the QEMU machine.
+
+**The `0x20` row is the trap.** The IDE controller is a PCI device whose interrupt is an *on-board*
+number, so it is programmed through the OBIO registers and not the PCI ones — because the onboard
+storage occupies the SCSI slot on this generation. Deciding which register file to use from what
+kind of device it is, rather than from the INO's value, programs a register belonging to nothing.
+
+What connects a device to its INO is the **`interrupt-map` property on the device's parent**, and
+on these machines that parent is the *simba*, not sabre: the wiring a map describes is the parent's
+wiring. Its mask keeps the bus and device numbers and drops the function, which is how a
+multifunction device shares a line — the ebus and the Ethernet controller are functions 0 and 1 of
+one device and both resolve to `0x21`.
+
 ---
 
 ## 4. Peripherals — the part that decides the work
