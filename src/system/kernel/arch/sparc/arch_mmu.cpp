@@ -12,6 +12,7 @@
 #include <arch_vm_translation_map.h>
 #include <debug.h>
 #include <platform/openfirmware/openfirmware.h>
+#include <thread.h>
 #include <vm/vm.h>
 
 
@@ -730,6 +731,40 @@ sparc_report_unresolved_miss()
 			sTrapData.missTrapType, sTrapData.missTpc, sTrapData.missTl,
 			sTrapData.missEntry, sTrapData.missCount);
 	} else {
+		// Everything that matters, in one line, before anything else. Not for
+		// brevity: a fault inside this function's own reporting re-enters it and
+		// overwrites sTrapData, so a report split across several calls can lose
+		// the part that identifies the failure and print eight window dumps of
+		// the recursion instead. That is not hypothetical -- panic() needs the
+		// current thread, and the fault this was written for was a lost thread
+		// pointer, so the panic below faulted in turn and the cascade ran to
+		// MAXTL. Which is why %g7 is here as well: when it is not a kernel
+		// address, nothing further in this function can work, and this line is
+		// the whole report.
+		uint64 threadPointer;
+		asm volatile("mov %%g7, %0" : "=r"(threadPointer));
+
+		dprintf("sparc: trap %#" B_PRIx64 " at pc %#" B_PRIx64 ", address %#"
+			B_PRIx64 ", tl %" B_PRIu64 ", tstate %#" B_PRIx64 ", called from %#"
+			B_PRIx64 ", returns to %#" B_PRIx64 ", %%g7 %#" B_PRIx64 "\n",
+			sTrapData.missTrapType, sTrapData.missTpc, sTrapData.missTagAccess,
+			sTrapData.missTl, sTrapData.missTstate, sTrapData.trapCallSite,
+			sTrapData.trapReturnAddress, threadPointer);
+
+		// The thread's stack, because a register window that came back wrong is
+		// most often a stack that was written over or run off the end of, and
+		// the trapped locals below are frequently stack addresses -- which only
+		// mean something next to the range they are supposed to be inside.
+		// Guarded on %g7 looking like a kernel address, since reading a Thread
+		// through a bad thread pointer is how this function last failed.
+		if (threadPointer >= KERNEL_BASE
+			&& threadPointer < KERNEL_BASE + KERNEL_SIZE) {
+			Thread* thread = (Thread*)threadPointer;
+			dprintf("sparc: thread %" B_PRId32 " \"%s\", kernel stack %#"
+				B_PRIxADDR " to %#" B_PRIxADDR "\n", thread->id, thread->name,
+				thread->kernel_stack_base, thread->kernel_stack_top);
+		}
+
 		uint64 windows = sTrapData.trapWindowState;
 		dprintf("sparc: trap %#" B_PRIx64 " window cwp %" B_PRIu64 " cansave %"
 			B_PRIu64 " canrestore %" B_PRIu64 " cleanwin %" B_PRIu64
