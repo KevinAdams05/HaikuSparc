@@ -427,6 +427,18 @@ rule KernelArchitectureSetup architecture
 			HAIKU_KERNEL_CCFLAGS += -mcmodel=medlow ;
 			HAIKU_KERNEL_C++FLAGS += -mcmodel=medlow ;
 
+			# The linker aligns segments to 1 MB on sparc64 by default, which
+			# leaves that much unused address space between an add-on's text and
+			# its data. load_kernel_add_on() refuses an image whose segments are
+			# more than 8 KB apart -- reasonably, since it reserves the whole
+			# span -- so every add-on failed to load from disk with B_BAD_DATA
+			# while the same file worked when the boot loader preloaded it, which
+			# maps each segment on its own.
+			#
+			# 0x2000 is the page size, so segments pack as tightly as they can.
+			HAIKU_KERNEL_PIC_LINKFLAGS += -z max-page-size=0x2000 ;
+			HAIKU_KERNEL_ADDON_LINKFLAGS += -z max-page-size=0x2000 ;
+
 			# Unfortunately it's not easy to make the kernel be
 			# position-independant, on sparc, that requires relocation support
 			# in the ELF loader to fill in the plt section.
