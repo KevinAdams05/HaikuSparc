@@ -8,6 +8,7 @@
 
 
 #include <stddef.h>
+#include <string.h>
 
 #include <arch_debug.h>
 #include <arch_thread_types.h>
@@ -16,6 +17,8 @@
 #include <smp.h>
 #include <thread.h>
 #include <timer.h>
+#include <vm/vm.h>
+#include <vm/vm_priv.h>
 #include <util/AutoLock.h>
 
 
@@ -66,18 +69,19 @@ sparc_clear_softint(uint64 bits)
 static void
 sparc_verify_iframe_layout()
 {
-	uint64 assembler[14];
+	uint64 assembler[17];
 	sparc_iframe_offsets(assembler);
 
-	const uint64 declared[14] = {
+	const uint64 declared[17] = {
 		offsetof(iframe, tstate), offsetof(iframe, tpc),
 		offsetof(iframe, tnpc), offsetof(iframe, tt), offsetof(iframe, y),
 		offsetof(iframe, g1), offsetof(iframe, g2), offsetof(iframe, g3),
 		offsetof(iframe, g4), offsetof(iframe, g5), offsetof(iframe, g6),
-		offsetof(iframe, g7), offsetof(iframe, pil), IFRAME_SIZEOF,
+		offsetof(iframe, g7), offsetof(iframe, pil), offsetof(iframe, sfsr),
+		offsetof(iframe, sfar), offsetof(iframe, tagAccess), IFRAME_SIZEOF,
 	};
 
-	for (int i = 0; i < 14; i++) {
+	for (int i = 0; i < 17; i++) {
 		if (assembler[i] != declared[i]) {
 			panic("sparc iframe layout %d: arch_traps.S says %#" B_PRIx64
 				", arch_int.h says %#" B_PRIx64, i, assembler[i], declared[i]);
@@ -184,6 +188,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	sparc_test_context_switch();
 	sparc_test_preemption();
 	sparc_test_backtrace();
+	sparc_test_user_memory();
 
 	return B_OK;
 }
@@ -288,5 +293,183 @@ sparc_test_preemption()
 	if (count == 0) {
 		panic("sparc: a busy loop was never preempted in %" B_PRIdBIGTIME
 			" us; the timer interrupt is not reaching the scheduler", elapsed);
+	}
+}
+
+
+/*!	The traps that mean the VM has to look at an address.
+
+	Runs at trap level zero on the faulting thread's own stack, which is what
+	makes it possible to block here at all -- and blocking is normal for a page
+	fault, since resolving one can mean paging something in or taking a mutex.
+
+	Interrupts are re-enabled if the faulting context had them enabled, and not
+	otherwise. That is not caution for its own sake: a thread that blocks with
+	interrupts disabled never gets the CPU back, because the timer that would
+	preempt whoever it is waiting for cannot fire. And a context that faulted
+	*with* interrupts already off is one that must not block -- user_memcpy() is
+	the case that matters -- which is exactly what the checks below handle
+	instead.
+*/
+extern "C" void
+sparc_page_fault(struct iframe *frame)
+{
+	uint64 trap = frame->tt;
+	bool isInstructionMiss = (trap & ~3) == TRAP_INSTRUCTION_MMU_MISS;
+	bool isDataMiss = (trap & ~3) == TRAP_DATA_MMU_MISS;
+	bool isProtection = (trap & ~3) == TRAP_DATA_PROTECTION;
+	bool isExecute = trap == TRAP_INSTRUCTION_ACCESS || isInstructionMiss;
+	bool isUser = (frame->tstate & TSTATE_PRIV) == 0;
+
+	// Where the address comes from depends on which trap this is. The "fast" MMU
+	// traps -- the two misses and the protection trap -- leave it in Tag Access
+	// rather than in a fault address register, which is most of what makes them
+	// fast.
+	addr_t address;
+	if (isDataMiss || isInstructionMiss || isProtection) {
+		address = (addr_t)(frame->tagAccess & ~(uint64)0x1fff);
+	} else if (trap == TRAP_INSTRUCTION_ACCESS) {
+		// An instruction fetch has no address register of its own; it faulted on
+		// the address it was fetching from.
+		address = (addr_t)frame->tpc;
+	} else {
+		address = (addr_t)frame->sfar;
+	}
+
+	// A protection trap is a write by definition -- it is what the hardware
+	// raises when a store finds a read-only entry. Otherwise SFSR says, and it
+	// is written for TLB misses too: SFSR's fault type has a bit for exactly
+	// that case.
+	bool isWrite = isProtection || (frame->sfsr & SFSR_WRITE) != 0;
+
+	Thread *thread = thread_get_current_thread();
+
+	// Faulting inside the kernel debugger is not recoverable by paging, and
+	// blocking there would hang the machine with everything else stopped. The
+	// debugger installs a handler for exactly this.
+	if (debug_debugger_running()) {
+		if (thread != NULL && thread->fault_handler != NULL) {
+			debug_set_page_fault_info(address, (addr_t)frame->tpc,
+				isWrite ? DEBUG_PAGE_FAULT_WRITE : 0);
+			frame->tpc = (uint64)(addr_t)thread->fault_handler;
+			frame->tnpc = frame->tpc + 4;
+			return;
+		}
+
+		panic("sparc: page fault in the debugger with no fault handler, "
+			"address %#" B_PRIxADDR " from pc %#" B_PRIx64, address,
+			frame->tpc);
+		return;
+	}
+
+	// A fault with interrupts already disabled cannot be resolved by blocking,
+	// so it had better be a fault somebody was expecting. user_memcpy() and the
+	// rest of user_access() set a handler precisely so that a bad user address
+	// becomes an error return rather than a dead kernel.
+	if ((frame->tstate & TSTATE_IE) == 0) {
+		if (thread != NULL && thread->fault_handler != NULL) {
+			frame->tpc = (uint64)(addr_t)thread->fault_handler;
+			frame->tnpc = frame->tpc + 4;
+			return;
+		}
+
+		panic("sparc: page fault with interrupts disabled and no fault handler, "
+			"address %#" B_PRIxADDR " from pc %#" B_PRIx64 " (trap %#" B_PRIx64
+			", sfsr %#" B_PRIx64 ")", address, frame->tpc, frame->tt,
+			frame->sfsr);
+		return;
+	}
+
+	enable_interrupts();
+
+	addr_t newInstructionPointer = 0;
+	vm_page_fault(address, (addr_t)frame->tpc, isWrite, isExecute, isUser,
+		&newInstructionPointer);
+
+	if (newInstructionPointer != 0) {
+		frame->tpc = (uint64)newInstructionPointer;
+		frame->tnpc = frame->tpc + 4;
+	}
+
+	disable_interrupts();
+}
+
+
+// #pragma mark - the user memory test
+
+
+/*!	Verifies the shared address space model, and that a bad user address is an
+	error rather than a dead kernel.
+
+	The porting plan singles this out as the thing to check early: section 4.3
+	chose one address space with kernel mappings marked Global and user mappings
+	tagged by context, precisely so that no shared Haiku code needs changing. If
+	that model did not hold -- if IS_USER_ADDRESS and IS_KERNEL_ADDRESS could not
+	both be simple range checks -- the scope of userspace support would be
+	completely different.
+
+	The second half is the page fault handler doing its job. user_access() sets
+	thread->fault_handler and longjmps out of a fault, which means a bad address
+	has to arrive as a fault the handler recognises. Before there was a handler
+	this would have been an unhandled trap and a panic; before setjmp worked it
+	would have been worse than that.
+*/
+void
+sparc_test_user_memory()
+{
+	// The two ranges must not overlap, and each must recognise its own.
+	bool ranges = IS_KERNEL_ADDRESS(KERNEL_BASE)
+		&& IS_KERNEL_ADDRESS(KERNEL_TOP)
+		&& !IS_KERNEL_ADDRESS(USER_BASE)
+		&& IS_USER_ADDRESS(USER_BASE)
+		&& IS_USER_ADDRESS(USER_TOP)
+		&& !IS_USER_ADDRESS(KERNEL_BASE);
+
+	dprintf("sparc_int: address space: user %#lx-%#lx, kernel %#lx-%#lx -- %s\n",
+		(addr_t)USER_BASE, (addr_t)USER_TOP, (addr_t)KERNEL_BASE,
+		(addr_t)KERNEL_TOP, ranges ? "disjoint" : "WRONG");
+
+	if (!ranges) {
+		panic("sparc: the user and kernel address ranges overlap or do not "
+			"recognise their own addresses");
+		return;
+	}
+
+	char buffer[16];
+	const char source[16] = "sparc user copy";
+
+	// A copy that must work, so that the failures below mean something. A kernel
+	// address is legitimate here: user_memcpy() only refuses a range that
+	// *crosses* the user/kernel boundary, not one entirely on either side, and
+	// kernel code does use it for kernel-to-kernel copies.
+	status_t good = user_memcpy(buffer, source, sizeof(buffer));
+	bool copied = good == B_OK && memcmp(buffer, source, sizeof(buffer)) == 0;
+
+	// A user address that is certainly not mapped. Not the low megabyte, which
+	// looks unmapped and is not -- the boot loader's identity mapping covers
+	// everything below 0x802000, and it survives into the kernel's page table.
+	// A gigabyte up is past everything the loader touched and still well below
+	// KERNEL_BASE.
+	status_t unmapped = user_memcpy(buffer, (const void*)0x40000000,
+		sizeof(buffer));
+
+	// And a range straddling the boundary, which has to be refused by the range
+	// check rather than by faulting: that check is what stops userland handing
+	// the kernel a pointer that starts in its own space and ends in the
+	// kernel's.
+	status_t straddling = user_memcpy(buffer,
+		(const void*)(KERNEL_BASE - sizeof(buffer) / 2), sizeof(buffer));
+
+	bool ok = copied && unmapped == B_BAD_ADDRESS
+		&& straddling == B_BAD_ADDRESS;
+
+	dprintf("sparc_int: user_memcpy good %#x, unmapped %#x, straddling %#x "
+		"-- %s\n", good, unmapped, straddling,
+		ok ? "faults caught" : "WRONG");
+
+	if (!ok) {
+		panic("sparc: user_memcpy gave %#x for a valid copy, %#x for an "
+			"unmapped user address and %#x for a straddling range; wanted OK, "
+			"B_BAD_ADDRESS, B_BAD_ADDRESS", good, unmapped, straddling);
 	}
 }

@@ -95,7 +95,14 @@
 #define IFRAME_G6			0x50
 #define IFRAME_G7			0x58
 #define IFRAME_PIL			0x60
-#define IFRAME_SIZEOF			0x70
+#define IFRAME_SFSR			0x68
+#define IFRAME_SFAR			0x70
+#define IFRAME_TAG_ACCESS		0x78
+#define IFRAME_SIZEOF			0x80
+
+// The data MMU's fault status and address registers.
+#define MMU_SFSR			0x18
+#define MMU_SFAR			0x20
 
 /*	The minimum SPARC V9 stack frame, from arch_thread_types.h: 128 bytes of
  *	register save area and 48 more for outgoing arguments.
@@ -325,65 +332,24 @@ FUNCTION(sparc_instruction_mmu_miss):
 	retry
 
 1:
-	/* Nothing mapped for this address. Record everything about it first: every
-	 * store goes to the trap data block, whose page is locked in the TLB for
-	 * exactly this reason.
-	 */
-	stx	%g1, [%g7 + TRAP_DATA_MISS_TAG_TARGET]
-	stx	%g2, [%g7 + TRAP_DATA_MISS_TSB_POINTER]
-	stx	%g6, [%g7 + TRAP_DATA_MISS_TAG_ACCESS]
-	stx	%g5, [%g7 + TRAP_DATA_MISS_ENTRY]
-
-	rdpr	%tt, %g6
-	stx	%g6, [%g7 + TRAP_DATA_MISS_TRAP_TYPE]
-	rdpr	%tpc, %g6
-	stx	%g6, [%g7 + TRAP_DATA_MISS_TPC]
-	rdpr	%tstate, %g6
-	stx	%g6, [%g7 + TRAP_DATA_MISS_TSTATE]
-
-	/* Counted last, so a non-zero count means the record above it is complete
-	 * rather than half written.
-	 */
-	stx	%o7, [%g7 + TRAP_DATA_TRAP_CALL_SITE]
-	stx	%i7, [%g7 + TRAP_DATA_TRAP_RETURN]
-
-	mov	SPARC_TRAP_UNRESOLVED_MISS, %g5
-	stx	%g5, [%g7 + TRAP_DATA_TRAP_KIND]
-
-	ldx	[%g7 + TRAP_DATA_MISS_COUNT], %g5
-	add	%g5, 1, %g5
-	stx	%g5, [%g7 + TRAP_DATA_MISS_COUNT]
-
-	/* Now get out of trap context and say so.
+	/* Nothing mapped for this address -- which is not an error, it is a page
+	 * fault. The page table is the authoritative record and it has no entry, so
+	 * the question is one for the VM: the address may belong to an area that has
+	 * not been faulted in yet, or to a copy-on-write page, or to nothing at all.
 	 *
-	 * Stopping here would be correct but useless: the machine would sit at a
-	 * known address with a complete record in memory and no way to print it, and
-	 * every unmapped address for the rest of the port would look like an
-	 * unexplained hang. Instead, return to TL=0 at a C function that panics with
-	 * what was just recorded.
+	 * This used to record the miss and stop, on the grounds that there was
+	 * nothing to escalate to. There is now. Reaching the fault path from here is
+	 * what makes user_memcpy() able to fail rather than hang: an unmapped user
+	 * address arrives as a miss, and a miss that the table cannot answer has to
+	 * become a fault or the retry loops forever.
 	 *
-	 * done restores TSTATE -- the normal global bank, the interrupted CWP and its
-	 * stack -- and sets the PC from TNPC, so overwriting TNPC first is what
-	 * redirects it. The instruction that faulted is not re-run, which would
-	 * matter if this were recoverable; it is not.
-	 *
-	 * Only from TL=1. Deeper than that, the level below is one of our own
-	 * handlers rather than ordinary kernel code, and returning into it with
-	 * different registers than it left would produce a second failure that told
-	 * us nothing about the first.
+	 * The fault entry reads the trap registers itself and takes the address from
+	 * Tag Access, which is where a fast MMU trap leaves it. It also switches off
+	 * the MMU globals this handler has been using, so the normal bank -- which
+	 * the interrupted code's globals are still in, untouched -- is what gets
+	 * saved.
 	 */
-	rdpr	%tl, %g6
-	stx	%g6, [%g7 + TRAP_DATA_MISS_TL]
-	cmp	%g6, 1
-	bne,pn	%xcc, 2f
-	 ldx	[%g7 + TRAP_DATA_REPORT_HANDLER], %g6
-
-	brz,pn	%g6, 2f
-	 nop
-	wrpr	%g6, 0, %tnpc
-	done
-
-2:	ba,a	2b
+	ba,a	sparc_fault_entry
 	 nop
 .endm
 
@@ -654,7 +620,7 @@ sparc_unhandled_trap_stop:
  *	a load-time relocation that leaves a displacement of zero -- a branch to
  *	itself, silently.
  */
-sparc_interrupt_entry:
+.macro TRAP_TO_C handler, raise_pil
 	save	%sp, -(SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
 
 	/* The trap registers first, while they still exist. */
@@ -690,6 +656,20 @@ sparc_interrupt_entry:
 	stx	%g6, [%l7 + IFRAME_G6]
 	stx	%g7, [%l7 + IFRAME_G7]
 
+	/* The data MMU's fault status and address, before anything else can
+	 * overwrite them. Meaningless for traps that do not set them, and cheaper to
+	 * record unconditionally than to decide here which those are.
+	 */
+	mov	MMU_SFSR, %l5
+	ldxa	[%l5] ASI_DMMU, %l5
+	stx	%l5, [%l7 + IFRAME_SFSR]
+	mov	MMU_SFAR, %l5
+	ldxa	[%l5] ASI_DMMU, %l5
+	stx	%l5, [%l7 + IFRAME_SFAR]
+	mov	MMU_TLB_TAG_ACCESS, %l5
+	ldxa	[%l5] ASI_DMMU, %l5
+	stx	%l5, [%l7 + IFRAME_TAG_ACCESS]
+
 	/* Raise the interrupt level so nothing can nest, and remember what it was.
 	 *
 	 * PSTATE.IE is already clear, so this looks redundant -- and it is not.
@@ -705,7 +685,9 @@ sparc_interrupt_entry:
 	 */
 	rdpr	%pil, %l5
 	stx	%l5, [%l7 + IFRAME_PIL]
+.if \raise_pil
 	wrpr	%g0, 15, %pil
+.endif
 
 	stx	%l0, [%l7 + IFRAME_TSTATE]
 	stx	%l1, [%l7 + IFRAME_TPC]
@@ -718,7 +700,7 @@ sparc_interrupt_entry:
 	 */
 	wrpr	%g0, 0, %tl
 
-	call	sparc_interrupt
+	call	\handler
 	 mov	%l7, %o0
 
 	/* Back up to trap level 1: `retry` is meaningless below it, and %tpc and
@@ -739,6 +721,17 @@ sparc_interrupt_entry:
 
 	ldx	[%l7 + IFRAME_PIL], %l6
 	wrpr	%l6, 0, %pil
+
+	/* Reload the trap state from the frame rather than from this window's
+	 * locals, so that a handler can change where the trap returns to. That is
+	 * not a hypothetical: it is how a page fault the VM cannot resolve is turned
+	 * into a jump to the faulting thread's fault handler, and without it the
+	 * handler's newIP is written into the frame and then quietly thrown away --
+	 * which shows up as the same fault repeating forever.
+	 */
+	ldx	[%l7 + IFRAME_TSTATE], %l0
+	ldx	[%l7 + IFRAME_TPC], %l1
+	ldx	[%l7 + IFRAME_TNPC], %l2
 
 	wr	%l4, 0, %y
 
@@ -778,11 +771,34 @@ sparc_interrupt_entry:
 	 */
 	restore
 	retry
+.endm
+
+
+/*	Deliberately local symbols: the table branches here with `ba,a`, and a branch
+ *	to a .global symbol goes through a load-time relocation that leaves a
+ *	displacement of zero -- a branch to itself, silently.
+ */
+sparc_interrupt_entry:
+	TRAP_TO_C sparc_interrupt, 1
+
+
+/*	The traps that mean "the VM needs to look at this address": an instruction or
+ *	data access exception, and a write to a page mapped read-only.
+ *
+ *	The interrupt level is deliberately *not* raised here. A fault handler has to
+ *	be able to block -- paging something in, taking a mutex -- and a thread that
+ *	blocks with interrupts blocked never gets the CPU back, because the timer that
+ *	would preempt whoever it is waiting for cannot fire. Whether interrupts are
+ *	on is decided in C from the faulting context's own PSTATE, which is the only
+ *	thing that knows whether blocking is allowed.
+ */
+sparc_fault_entry:
+	TRAP_TO_C sparc_page_fault, 0
 
 
 /*	Report this file's idea of the interrupt frame layout, for C++ to check.
  *
- *	void sparc_iframe_offsets(uint64 *out);   // fourteen entries
+ *	void sparc_iframe_offsets(uint64 *out);   // seventeen entries
  */
 FUNCTION(sparc_iframe_offsets):
 	mov	IFRAME_TSTATE, %o1
@@ -811,8 +827,14 @@ FUNCTION(sparc_iframe_offsets):
 	stx	%o1, [%o0 + (11 * 8)]
 	mov	IFRAME_PIL, %o1
 	stx	%o1, [%o0 + (12 * 8)]
-	mov	IFRAME_SIZEOF, %o1
+	mov	IFRAME_SFSR, %o1
 	stx	%o1, [%o0 + (13 * 8)]
+	mov	IFRAME_SFAR, %o1
+	stx	%o1, [%o0 + (14 * 8)]
+	mov	IFRAME_TAG_ACCESS, %o1
+	stx	%o1, [%o0 + (15 * 8)]
+	mov	IFRAME_SIZEOF, %o1
+	stx	%o1, [%o0 + (16 * 8)]
 	retl
 	 nop
 
@@ -952,6 +974,18 @@ FUNCTION(sparc_read_trap_page_table):
 	 nop
 
 
+/*	One trap table entry that branches to a handler.
+ *
+ *	Thirty-two bytes like every other entry, padded and asserted by .org, which
+ *	fails the build if a branch and its delay slot somehow grew past it.
+ */
+.macro TRAP_TO_HANDLER target
+8:	ba,a	\target
+	 nop
+	.org 8b + 32
+.endm
+
+
 /*	One trap table entry, for a trap with no handler.
  *
  *	Exactly eight instructions, because an ordinary entry is 32 bytes. The
@@ -1057,22 +1091,37 @@ FUNCTION(sparc_read_trap_page_table):
  *	stack it is writing belongs to a user process.
  */
 .macro TRAP_TABLE_HALF
-	/* 0x000-0x023: reset, instruction access, illegal instruction, privileged
-	 * action, floating point, tag overflow. Nothing handled yet, but every
-	 * entry is filled: an unhandled trap must reach a handler that reports it,
-	 * not run into blank space.
+	/* 0x000-0x007: reset and the instruction access error traps. */
+	.rept 0x008
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x008: instruction_access_exception -- an instruction fetch the MMU
+	 * refused, which is a page fault on the text side.
 	 */
-	.rept 0x024
+	TRAP_TO_HANDLER sparc_fault_entry
+
+	/* 0x009-0x023: illegal instruction, privileged action, floating point, tag
+	 * overflow. Nothing handled yet, but every entry is filled: an unhandled
+	 * trap must reach a handler that reports it, not blank space.
+	 */
+	.rept 0x01b
 	TRAP_UNHANDLED
 	.endr
 
 	/* 0x024-0x027: clean_window. The most frequent trap of all. */
 	TRAP_GROUP_CLEAN
 
-	/* 0x028-0x04d: interrupt levels 1 to 13, plus watchdog, alignment and the
-	 * rest. None handled yet.
-	 */
-	.rept 0x026
+	/* 0x028-0x02f: division by zero, and the rest. */
+	.rept 0x008
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x030: data_access_exception -- the ordinary page fault. */
+	TRAP_TO_HANDLER sparc_fault_entry
+
+	/* 0x031-0x04d: alignment, interrupt levels 1 to 13, and the rest. */
+	.rept 0x01d
 	TRAP_UNHANDLED
 	.endr
 
@@ -1093,13 +1142,13 @@ FUNCTION(sparc_read_trap_page_table):
 	TRAP_GROUP_INSTRUCTION_MISS
 	TRAP_GROUP_DATA_MISS
 
-	/* 0x06c-0x06f: fast_data_access_protection. A write to a read-only page,
-	 * which wants the slow path rather than a refill, so it is left unhandled
-	 * for now and will report itself if it happens.
+	/* 0x06c-0x06f: fast_data_access_protection -- a write to a page the TLB
+	 * holds read-only. Four entries, like the misses beside it, because the trap
+	 * types are spaced apart the same way.
 	 */
-	.rept 0x004
-	TRAP_UNHANDLED
-	.endr
+8:	ba,a	sparc_fault_entry
+	 nop
+	.org 8b + 128
 
 	/* 0x070-0x07f */
 	.rept 0x010
