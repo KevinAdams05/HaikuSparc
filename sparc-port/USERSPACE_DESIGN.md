@@ -78,22 +78,37 @@ Making the comparison G-aware in the literal sense — set the Global bit in the
 handler test it and compare fewer bits when it is set — costs a load-dependent branch on the hit path,
 which is the single hottest path in the system.
 
-There is a cheaper equivalence. The tag target contains `VA<63:22>` at bits 41:0, so **bit 41 of the
-tag target is VA<63>** — and that bit alone separates a kernel address from a user one, because
-`KERNEL_BASE` is `0xffffff0000000000` and user addresses live in the low half. The handler can
-therefore decide which kind of address faulted from a register it has already loaded, without touching
-memory and without consulting the stored tag at all:
+There is a cheaper equivalence. The tag target contains `VA<63:22>` at bits 41:0, so virtual address
+bit *n* sits at tag bit *n* − 22 — and a single bit separates the halves, because the kernel owns
+everything from `KERNEL_BASE` upwards and `KERNEL_BASE` is a power of two. On this port that is
+`0x80000000`, so the bit is **VA<31>, at tag bit 9**. The handler can therefore decide which kind of
+address faulted from a register it has already loaded, without touching memory and without consulting
+the stored tag at all:
 
 ```
-    if tag_target has bit 41 set:        # kernel address
+    if tag_target has bit 9 set:         # kernel address
         tag_target &= ~(0x1fff << 48)    # mask the context off
     xor against the stored tag
 ```
 
 Kernel tags stay stored with context zero, exactly as they are now. User tags get the mapping's
-context. Two extra instructions on the fast path, no branch that depends on a load, and the Global bit
-in the stored tag stays unused — which is fine, since its only purpose was to tell a handler to do what
+context. Four instructions on the fast path with no branch at all — shift the bit to the top, let an
+arithmetic shift turn it into an all-ones or all-zeroes mask, clear bits 63:48 — and the Global bit in
+the stored tag stays unused, which is fine, since its only purpose was to tell a handler to do what
 this handler now decides more cheaply.
+
+Note which way round it is: the mask applies to *kernel* addresses and the context is kept for
+everything else. So an address below `KERNEL_BASE` that no team owns — a wild pointer, a leftover
+firmware mapping — is compared with the context included and misses, which is the outcome it deserves.
+The reverse polarity would silently hand such an access a kernel translation.
+
+`KERNEL_BASE` being `0x80000000` rather than something in the high half is worth stating, because it is
+easy to assume otherwise from the other 64-bit ports and this document did on its first draft.
+`arch_kernel.h` records why: it previously carried x86_64's `0xffffff0000000000`, which described an
+address space this kernel has never been near, and `IS_KERNEL_ADDRESS` rejected every address the
+kernel actually uses. Userspace therefore gets the low 2 GB. Since the whole single-bit trick depends
+on that layout, `sparc_verify_mmu_defines()` derives the bit from `KERNEL_BASE` at init and panics if
+the two disagree — rather than leaving a constant that is correct only by coincidence.
 
 One consequence to state plainly: **user entries from different contexts alias in a shared TSB.** Their
 tags differ, so the comparison correctly misses and the slow path fixes it up — this is a capacity

@@ -49,7 +49,7 @@
 
   <line x1="76" y1="472" x2="1044" y2="472" stroke="#e4e7ec"/>
 
-  <text x="76" y="496" font-size="12.5" fill="#146638"><tspan font-weight="600">The fix, and it is cheap:</tspan> the tag target carries VA&lt;63&gt; at bit 41, so the handler can tell a kernel address from a user one without touching memory. If it is a kernel address, mask bits 60:48 off the target before the xor. Two instructions.</text>
+  <text x="76" y="496" font-size="12.5" fill="#146638"><tspan font-weight="600">The fix, and it is cheap:</tspan> the kernel owns everything above KERNEL_BASE and KERNEL_BASE is a power of two, so one bit decides — VA&lt;31&gt;, at tag bit 9. Mask the context off when it is set. Four instructions, no branch.</text>
 
   <!-- ============ C. register windows ============ -->
   <text x="56" y="556" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">REGISTER WINDOWS — THE 32 <tspan font-family="monospace">_OTHER</tspan> VECTORS, AND WHY THEY CANNOT DO THE OBVIOUS THING</text>

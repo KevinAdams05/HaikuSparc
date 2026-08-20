@@ -238,8 +238,13 @@ So the recommended design for the first working system is the same split-address
 Haiku's other 64-bit ports already use: **kernel mappings high and marked Global, user mappings
 low and tagged with a per-team 13-bit context id, all in one address space.** `IS_USER_ADDRESS`
 keeps working, `user_memcpy` stays ordinary, and Haiku's shared code needs no changes at all.
-The existing `arch_kernel.h` already declares `KERNEL_BASE` at `0xffffff0000000000`, so the tree
-is halfway to this model already.
+
+An earlier version of this section said `arch_kernel.h` already declared `KERNEL_BASE` at
+`0xffffff0000000000` and so was halfway to the model. It did, and that was the bug rather than the
+head start: the value was x86_64's and described an address space this kernel has never been near, so
+`IS_KERNEL_ADDRESS` rejected every address the kernel actually uses. `KERNEL_BASE` is `0x80000000`
+now, giving userspace the low 2 GB — a real limit rather than a generous one, and a direct consequence
+of the single address space this section chooses. The file records the reasoning.
 
 The costs are honest and small: the 13-bit context field gives 8192 contexts, so a context
 recycling scheme is needed; and we give up the theoretical syscall-time benefit of a separate
