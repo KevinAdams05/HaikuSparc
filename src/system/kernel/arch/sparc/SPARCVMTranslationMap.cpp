@@ -268,13 +268,91 @@ SPARCPageTableAllocator::Allocate() const
 }
 
 
+// #pragma mark - context ids
+
+
+/*	Which of the 8192 context ids are taken.
+
+	Id zero is the kernel's and is never allocated: kernel mappings are Global,
+	so the hardware matches them whatever the context register holds, and the
+	kernel needs no id of its own. See section 4.3 of the porting plan.
+
+	A bitmap and a spinlock rather than anything cleverer, because this is touched
+	twice in a team's life -- once at creation and once at destruction -- and the
+	interesting part is not the allocation policy but what has to happen when an
+	id changes hands. That is sparc_context_invalidate(), and it is the reason
+	an id is only ever reused after being freed rather than stolen from a live
+	address space.
+*/
+static const uint32 kContextWords = SPARC_CONTEXT_COUNT / 64;
+static uint64 sContextBitmap[kContextWords];
+static spinlock sContextLock = B_SPINLOCK_INITIALIZER;
+static uint32 sContextsInUse;
+
+
+/*!	Takes a free context id, or zero if there are none left.
+
+	Zero is the kernel's id and therefore usable as a failure value: a caller
+	that gets it back was asking for a user id and cannot have one.
+*/
+static uint32
+allocate_context()
+{
+	InterruptsSpinLocker locker(sContextLock);
+
+	for (uint32 word = 0; word < kContextWords; word++) {
+		if (sContextBitmap[word] == ~(uint64)0)
+			continue;
+
+		uint32 bit = __builtin_ctzll(~sContextBitmap[word]);
+		uint32 context = word * 64 + bit;
+
+		// Only reachable for word zero, where bit zero is the kernel's.
+		if (context == SPARC_KERNEL_CONTEXT) {
+			if ((sContextBitmap[word] | 1) == ~(uint64)0)
+				continue;
+			bit = __builtin_ctzll(~(sContextBitmap[word] | 1));
+			context = bit;
+		}
+
+		sContextBitmap[word] |= (uint64)1 << bit;
+		sContextsInUse++;
+		return context;
+	}
+
+	return SPARC_KERNEL_CONTEXT;
+}
+
+
+/*!	Gives a context id back, after removing every trace of its mappings.
+
+	The order is not negotiable. Invalidating after the id is free would leave a
+	window in which another team could be given it while the caches still hold
+	the old team's translations under it -- and the failure that produces is not
+	a slow path but one team reading another's memory.
+*/
+static void
+free_context(uint32 context)
+{
+	if (context == SPARC_KERNEL_CONTEXT)
+		return;
+
+	sparc_context_invalidate(context);
+
+	InterruptsSpinLocker locker(sContextLock);
+	sContextBitmap[context / 64] &= ~((uint64)1 << (context % 64));
+	sContextsInUse--;
+}
+
+
 // #pragma mark - SPARCVMTranslationMap
 
 
 SPARCVMTranslationMap::SPARCVMTranslationMap(bool kernel, phys_addr_t pageTable)
 	:
 	fIsKernel(kernel),
-	fPageTable(pageTable)
+	fPageTable(pageTable),
+	fContext(SPARC_KERNEL_CONTEXT)
 {
 	recursive_lock_init(&fLock, kernel ? "sparc kernel translation map"
 		: "sparc translation map");
@@ -285,12 +363,37 @@ SPARCVMTranslationMap::~SPARCVMTranslationMap()
 {
 	recursive_lock_destroy(&fLock);
 
+	free_context(fContext);
+
 	// Freeing a user page table's pages belongs here, and is not written yet
 	// because nothing creates one: userland does not run. Leaving it unwritten
 	// is a leak the moment it does, so it is called out rather than left to be
 	// discovered.
 	if (!fIsKernel && fPageTable != 0)
 		panic("SPARCVMTranslationMap: user page table teardown not implemented");
+}
+
+
+/*!	Claims the context id this address space's mappings will be tagged with.
+
+	Separate from the constructor because it can fail, and a translation map with
+	no context is not a translation map: every mapping it made would be tagged
+	with the kernel's id and matched for every team at once.
+*/
+status_t
+SPARCVMTranslationMap::Init()
+{
+	if (fIsKernel)
+		return B_OK;
+
+	fContext = allocate_context();
+	if (fContext == SPARC_KERNEL_CONTEXT) {
+		dprintf("sparc: all %d MMU contexts are in use\n",
+			SPARC_CONTEXT_COUNT - 1);
+		return B_BUSY;
+	}
+
+	return B_OK;
 }
 
 
@@ -417,8 +520,8 @@ SPARCVMTranslationMap::LookupEntry(addr_t virtualAddress,
 void
 SPARCVMTranslationMap::InvalidateCaches(addr_t virtualAddress)
 {
-	sparc_tsb_invalidate(virtualAddress);
-	sparc_tlb_demap(virtualAddress);
+	sparc_tsb_invalidate(virtualAddress, fContext);
+	sparc_tlb_demap(virtualAddress, fContext);
 }
 
 
@@ -855,8 +958,8 @@ map_iospace_chunk(addr_t virtualAddress, phys_addr_t physicalAddress,
 				true);
 
 		sparc_write_physical(entry, tte);
-		sparc_tsb_invalidate(virtualAddress + offset);
-		sparc_tlb_demap(virtualAddress + offset);
+		sparc_tsb_invalidate(virtualAddress + offset, SPARC_KERNEL_CONTEXT);
+		sparc_tlb_demap(virtualAddress + offset, SPARC_KERNEL_CONTEXT);
 	}
 
 	return B_OK;

@@ -125,8 +125,32 @@ extern void sparc_dump_tlb();
 extern status_t sparc_lock_trap_pages();
 extern status_t sparc_install_trap_table(struct kernel_args *args);
 extern bool sparc_mmu_is_installed();
-extern void sparc_tsb_invalidate(addr_t virtualAddress);
-extern void sparc_tlb_demap(addr_t virtualAddress);
+extern void sparc_tsb_invalidate(addr_t virtualAddress, uint32 context);
+extern void sparc_tlb_demap(addr_t virtualAddress, uint32 context);
+
+/*!	Makes \a context and \a pageTableRoot the ones the running thread uses.
+
+	Called from the context switch, so it must be cheap and must not block. The
+	kernel's own mappings are unaffected because they are Global; what changes is
+	which team's low-half mappings are visible.
+
+	Both together and never one without the other. The context register decides
+	which mappings the hardware will match, and the root decides which page table
+	the miss handler walks to find them -- so a pair that disagrees produces
+	translations from one team tagged with another's id, which is the worst
+	failure available here and the hardest to see.
+*/
+extern void sparc_switch_address_space(uint32 context,
+	phys_addr_t pageTableRoot);
+
+/*!	Removes every trace of a context, for reuse by a different team.
+
+	Both caches, because they fail differently. A stale TLB entry is removed by
+	one demap; a stale TSB line has to be found, since the TSB has no index by
+	context -- and a line left behind is not a slow path but a wrong answer, the
+	new team reading the old team's page.
+*/
+extern void sparc_context_invalidate(uint32 context);
 
 // TLB geometry. Both TLBs on the UltraSPARC-IIi are 64-entry fully associative,
 // and an entry is selected by putting its index in VA<8:3> of the address given
@@ -139,6 +163,34 @@ extern void sparc_tlb_demap(addr_t virtualAddress);
 // 8 KB are stored and read back here even though translation ignores them.
 #define TLB_TAG_VA_MASK				0xffffffffffffe000ULL
 #define TLB_TAG_CONTEXT_MASK		0x1fffULL
+
+// A demap is a store to ASI_DMMU_DEMAP or ASI_IMMU_DEMAP, and the *address* of
+// that store says what to remove rather than the data (FIGURE 15-16). VA<63:13>
+// names the page, bits 7:6 the type and bits 5:4 which context register to take
+// the context from.
+//
+// Only the secondary selector is used here, for both TLBs and for kernel
+// mappings as much as user ones. Borrowing the secondary context register keeps
+// the primary one -- which the running thread's own accesses depend on --
+// untouched, and it means one code path instead of a special case per privilege
+// level. OpenBSD's us_tlb_flush_pte() does the same, including using the
+// secondary selector on the IMMU. See sparc-port/THIRD_PARTY.md.
+#define TLB_DEMAP_TYPE_PAGE			(0ULL << 6)
+#define TLB_DEMAP_TYPE_CONTEXT		(1ULL << 6)
+#define TLB_DEMAP_TYPE_ALL			(2ULL << 6)
+#define TLB_DEMAP_CONTEXT_PRIMARY	(0ULL << 4)
+#define TLB_DEMAP_CONTEXT_SECONDARY	(1ULL << 4)
+#define TLB_DEMAP_CONTEXT_NUCLEUS	(2ULL << 4)
+
+// MMU context ids.
+//
+// Thirteen bits, so 8192 of them, and id zero belongs to the kernel. The kernel
+// never needs one of its own: every kernel mapping is Global, so the hardware
+// matches it whatever the context register says, which is the whole basis of the
+// shared address space in section 4.3 of sparc-port/PORTING_PLAN.md.
+#define SPARC_CONTEXT_BITS			13
+#define SPARC_CONTEXT_COUNT			(1 << SPARC_CONTEXT_BITS)
+#define SPARC_KERNEL_CONTEXT		0
 
 // TSB_Size for the kernel's own TSB. 8192 entries of 16 bytes is 128 KB per
 // TSB, and the split pair is 256 KB aligned to 256 KB. Sized from the measured
@@ -181,7 +233,8 @@ struct sparc_trap_data {
 	uint64	trapReturnAddress;	// 0x70  %i7 -- and where that frame returns to
 	uint64	trapWindowState;	// 0x78  CWP, CANSAVE, CANRESTORE, CLEANWIN packed
 	uint64	trapLocals[8];		// 0x80  %l0-%l7 of the window that trapped
-	uint64	reserved[8];		// pad to 256 bytes
+	uint64	userPageTableRoot;	// 0xc0  the running team's root, physical
+	uint64	reserved[7];		// pad to 256 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -199,6 +252,7 @@ struct sparc_trap_data {
 #define TRAP_DATA_TRAP_KIND			0x60
 #define TRAP_DATA_TRAP_CALL_SITE	0x68
 #define TRAP_DATA_TRAP_RETURN		0x70
+#define TRAP_DATA_USER_PAGE_TABLE	0xc0
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
@@ -231,7 +285,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		17
+#define TRAP_DATA_OFFSET_COUNT		18
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

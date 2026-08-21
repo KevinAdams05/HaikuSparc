@@ -125,13 +125,19 @@ TSB line still carrying it becomes a mapping into the wrong address space.
 The demap-by-context operation is what makes this tractable — one store to the DMMU and IMMU demap
 registers removes every non-locked entry for a context. The TSB has no such operation, so a reassigned
 context needs the TSB cleared of that context's lines, and since the TSB has no per-context index that
-means walking it. A first implementation should:
+means walking all 8192 of them.
 
-- allocate ids sequentially and only recycle when the space is exhausted,
-- on exhaustion, demap every context and clear the whole TSB rather than tracking which lines belong
-  to whom.
+**What was implemented is simpler than what this section first proposed**, and better for the same
+reason: an id is *freed when its address space is destroyed*, not stolen from a live one. That makes
+exhaustion mean 8191 simultaneously live teams rather than 8191 teams over the machine's uptime, which
+turns a recycling scheme into a case that does not arise. `arch_vm_translation_map_create_map()` fails
+if it ever does, which is honest and visible; stealing an id from an inactive address space, as the
+arm64 port does with refcounts, is the answer if it ever matters.
 
-Both are the slow, obviously-correct choice, and both are invisible until a system has run 8191 teams.
+The invalidation is the part that is not optional either way. It happens on *free*, before the id goes
+back in the bitmap, because the other order leaves a window where another team could be handed an id
+whose translations are still cached — and that failure is not a slow path, it is one team reading
+another team's memory.
 
 ### What is testable, and it is a real test
 
@@ -142,7 +148,68 @@ is the assertion the masking above exists to satisfy. That last part is the one 
 be discovered as a mysterious slowdown.
 
 
-## 3. Register windows across the boundary
+## 3. The page table root — implemented, reverted, and not understood
+
+This was not on the list in section 1, and it should have been. Contexts decide which mappings the
+*hardware* will match. They say nothing about which page table the TLB miss handler walks to find
+them — and that handler walks exactly one, whose physical root is put in `%g3` at cutover and never
+changes. A user address space gets a table of its own, so its mappings would never be found.
+
+The fix looks small. The same address bit the fast path already tests for the tag masking says which
+root applies; the kernel's is in `%g3`; the running team's can live in the trap data block beside the
+context register it has to agree with, written by the same function so the two cannot drift. Six
+instructions in the slow path.
+
+**It hangs the machine, reliably, and the reason does not survive contact with the evidence.**
+
+The symptom is precise. The boot proceeds normally for sixty-three seconds and stops inside
+`user_memcpy()` on the deliberate probe against an unmapped user address — the one arch_int.cpp already
+runs to prove faults are caught. Nothing is printed after it. Every kernel address is unaffected, which
+is why the boot gets that far: the probe is the first and only user-half access the whole boot makes.
+
+What the bisect found, one boot per row:
+
+| Slow-path selection | Result |
+| --- | --- |
+| `mov %g3, %g5`, then walk from `%g5` | boots, mounts, probe passes |
+| plus `srlx`/`andcc` to test the address bit | boots, mounts |
+| plus `ldx [%g7 + 0xc0]`, result discarded | boots, mounts |
+| plus a `stx` recording what was loaded | boots, mounts — **records `0x0`** |
+| `movne %xcc, %g3, %g5` then `brz` to the fault exit | hangs in the probe |
+| `movne` then `movrz %g5, %g3, %g5` | hangs earlier, during TSB area setup |
+| `ldx` then `movrz` alone | hangs earlier still |
+| two conditional branches, falling back to `%g3` | hangs in the probe, reproducible across reruns |
+
+Three things were checked rather than assumed. The **disassembly** of every variant is what was
+intended — `movre %g5, %g3, %g5` encodes rcond=RZ, rs1=`%g5`, rs2=`%g3`, rd=`%g5` correctly. The
+**loaded value is zero**, recorded by the handler itself into a spare trap-data word and printed. And
+`MOVcc` and `MOVR` **both work**, verified by a probe that runs them with known inputs in both the
+taken and not-taken direction and prints the results.
+
+Which leaves a contradiction. The last row's code ends with `%g5 == %g3` on every path — for a kernel
+address by the branch's delay slot, for a user address because the loaded root is zero and falls back
+— so it is behaviourally identical to the first row, and does strictly *less* work than the fourth. It
+hangs and they do not.
+
+Every variant that works is straight-line. Every variant that hangs makes `%g5`'s final value depend on
+data, even when the value is provably the same. That is the whole correlation, and it is not a
+correlation any model of the architecture explains, which means the model is wrong somewhere rather
+than the code being subtly buggy.
+
+So it is **reverted** rather than shipped. It is not needed until a user address space exists, and
+shipping a change that reliably hangs the boot to enable something nothing uses yet is the wrong trade.
+The half that is correct and verifiable stays: the trap data block has the field, offset-checked
+against the assembler like every other, and `sparc_switch_address_space()` writes it beside the context
+register. Only the reader is missing — which is also why **user address spaces do not work yet**, and
+this is the first thing to fix before they can.
+
+The next diagnostic, and it is cheap: run the failing build under `-accel tcg,one-insn-per-tb=on`. If
+the hang goes away, it is QEMU's translation of a branch inside the miss handler at TL>0 and the code
+is right; if it stays, it is ours. That single measurement decides which of two very different
+investigations to start, and it should be the first thing tried rather than more reading.
+
+
+## 4. Register windows across the boundary
 
 ### What the hardware does
 
@@ -194,7 +261,7 @@ assembler cannot see and which therefore needs the same offset-verification trea
 `sparc_verify_context_layout()` already gives `arch_context`.
 
 
-## 4. The syscall path
+## 5. The syscall path
 
 ### The trap number
 
@@ -238,11 +305,12 @@ where userspace will read it. No iframe field needed, which is why the iframe ha
 it — a fact worth stating, because their absence looks like an omission.
 
 
-## 5. Order of work
+## 6. Order of work
 
 1. **Contexts.** The allocator, the primary context register on address-space switch, and the tag
-   target masking. Testable on its own, as §2 describes, and it is the piece that would otherwise be
-   diagnosed as a performance mystery rather than a bug.
+   target masking. All three are done. What is *not* done is the page table root the miss handler needs
+   to go with them — §3 — and until that works no user address space can be mapped at all, so this
+   step is the blocker for every step below it rather than a finished one.
 2. **`arch_thread_enter_userspace` plus the syscall trap.** Together, because neither is observable
    without the other. Test with a hand-built user thread — a page of user memory containing a couple
    of instructions and a `ta` — rather than waiting for a userland. A thread that never executes
@@ -259,14 +327,15 @@ Steps 1 through 3 are kernel work with hand-built tests and no dependency on the
 depends on Phase 6's media gap, which is the reason this ordering puts it last rather than first.
 
 
-## 6. Decisions recorded
+## 7. Decisions recorded
 
 | Decision | Alternative rejected | Why |
 | --- | --- | --- |
 | One address space, kernel Global | Separate kernel context, `ASI_*_AS_IF_USER` for user memory | §4.3: the alternative is a cross-cutting change to Haiku's shared code. Ticket #19597. |
 | Mask the context off kernel tag targets | Set the Global bit in stored tags and branch on it | No load-dependent branch on the hottest path in the system |
 | One TSB shared by all contexts | Per-address-space TSB, base register switched on context switch | Aliasing is a capacity problem, not correctness. Revisit with a measurement. |
-| Sequential context ids, flush everything on exhaustion | Per-context TSB line tracking | Invisible until 8191 teams have run. Obviously correct beats clever. |
+| Free a context id when its address space is destroyed; fail on exhaustion | Stealing an id from an inactive address space | Exhaustion becomes 8191 *live* teams, which does not arise. Revisit with arm64's refcount scheme if it does. |
+| Invalidate a context before returning its id, never after | Invalidate on allocation | The other order has a window where a new team holds an id whose translations are still cached |
 | Spill user windows into a per-thread kernel save area | Store straight to the user stack via `ASI_AS_IF_USER_PRIMARY` | A fault at TL>0 nests toward a watchdog reset. Same rule the miss handler lives by. |
 | `ta 0x40` for syscalls | A low trap number | A stray `ta` with a small immediate hits an unhandled entry that reports |
 | Arguments in the ABI's reserved slots at `%sp + BIAS + 128` | A separate argument buffer the stub builds | The slots exist for exactly this; stack arguments already continue from there |

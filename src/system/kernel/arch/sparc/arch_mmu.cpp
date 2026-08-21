@@ -13,6 +13,7 @@
 #include <debug.h>
 #include <platform/openfirmware/openfirmware.h>
 #include <thread.h>
+#include <util/AutoLock.h>
 #include <vm/vm.h>
 #include <vm/VMAddressSpace.h>
 
@@ -471,10 +472,10 @@ sparc_mmu_create_tsb_area()
 static void
 sparc_verify_mmu_defines()
 {
-	uint64 assembler[7];
+	uint64 assembler[8];
 	sparc_mmu_defines(assembler);
 
-	const uint64 declared[7] = {
+	const uint64 declared[8] = {
 		SPARC_SEGMENT_TABLE_SHIFT,
 		SPARC_PAGE_DIRECTORY_SHIFT,
 		SPARC_PAGE_TABLE_SHIFT,
@@ -482,15 +483,16 @@ sparc_verify_mmu_defines()
 		SPARC_VA_HOLE_SHIFT,
 		TTE_TAG_CONTEXT_SHIFT,
 		TSB_TAG_KERNEL_BIT,
+		TSB_TAG_VA_SHIFT,
 	};
 
-	static const char* const kNames[7] = {
+	static const char* const kNames[8] = {
 		"PT_SEGMENT_SHIFT", "PT_DIRECTORY_SHIFT", "PT_TABLE_SHIFT",
 		"PT_INDEX_MASK", "PT_VA_HOLE_SHIFT", "TTE_TAG_CONTEXT_SHIFT",
-		"TSB_TAG_KERNEL_BIT",
+		"TSB_TAG_KERNEL_BIT", "TSB_TAG_VA_SHIFT",
 	};
 
-	for (int i = 0; i < 7; i++) {
+	for (int i = 0; i < 8; i++) {
 		if (assembler[i] != declared[i]) {
 			panic("sparc mmu define %s: arch_traps.S says %" B_PRIu64
 				", the headers say %" B_PRIu64, kNames[i], assembler[i],
@@ -956,6 +958,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, trapReturnAddress),
 		offsetof(sparc_trap_data, trapWindowState),
 		offsetof(sparc_trap_data, trapLocals),
+		offsetof(sparc_trap_data, userPageTableRoot),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1675,16 +1678,20 @@ sparc_is_locked_address(addr_t virtualAddress)
 }
 
 
-/*!	Drops a TSB line if it is the one describing this address.
+/*!	Drops a TSB line if it is the one describing this address in this context.
 
 	Conditional on the tag, because the TSB is direct-mapped: the line this
 	address indexes to may currently belong to a different address that collided
 	with it, and clearing that would evict a live translation for no reason. Not
 	a correctness problem -- it would be refilled from the page table -- but the
 	whole point of the TSB is to make that unnecessary.
+
+	The context is part of that comparison and not decoration. One TSB serves
+	every address space, so the same user address in two teams indexes to the
+	same line, and unmapping it in one of them must not throw away the other's.
 */
 void
-sparc_tsb_invalidate(addr_t virtualAddress)
+sparc_tsb_invalidate(addr_t virtualAddress, uint32 context)
 {
 	if (sKernelTsb == NULL)
 		return;
@@ -1697,8 +1704,10 @@ sparc_tsb_invalidate(addr_t virtualAddress)
 	uint32 index = (virtualAddress >> 13) & (KERNEL_TSB_ENTRIES - 1);
 	TsbEntry* entry = &sKernelTsb[index];
 
-	if (entry->fTag != (virtualAddress >> 22))
+	if (entry->fTag != (((uint64)context << TTE_TAG_CONTEXT_SHIFT)
+			| (virtualAddress >> TSB_TAG_VA_SHIFT))) {
 		return;
+	}
 
 	// Data first. A reader that sees a valid tag with cleared data treats the
 	// line as invalid and goes to the page table, which is correct; a reader
@@ -1720,7 +1729,7 @@ sparc_tsb_invalidate(addr_t virtualAddress)
 	defined to remove nothing.
 */
 void
-sparc_tlb_demap(addr_t virtualAddress)
+sparc_tlb_demap(addr_t virtualAddress, uint32 context)
 {
 	// A demap removes whatever matches the address, locked or not -- the Lock
 	// bit only exempts an entry from replacement. Refusing here is what keeps
@@ -1729,16 +1738,124 @@ sparc_tlb_demap(addr_t virtualAddress)
 	if (sparc_is_locked_address(virtualAddress))
 		return;
 
-	uint64 address = (uint64)virtualAddress & TLB_TAG_VA_MASK;
+	// A kernel mapping is demapped through the primary context selector, with
+	// no register touched at all. Its TTE is Global, so it is matched whatever
+	// the context is, and this is the path every demap in the system takes today
+	// -- worth leaving exactly as it was rather than routing it through the
+	// register borrowing below for the sake of one code path.
+	if (context == SPARC_KERNEL_CONTEXT) {
+		uint64 address = ((uint64)virtualAddress & TLB_TAG_VA_MASK)
+			| TLB_DEMAP_TYPE_PAGE | TLB_DEMAP_CONTEXT_PRIMARY;
+
+		asm volatile(
+			"stxa	%%g0, [%[address]] 0x5f\n\t"	// ASI_DMMU_DEMAP
+			"membar	#Sync\n\t"
+			"stxa	%%g0, [%[address]] 0x57\n\t"	// ASI_IMMU_DEMAP
+			"membar	#Sync"
+			:
+			: [address] "r"(address)
+			: "memory");
+		return;
+	}
+
+	uint64 address = ((uint64)virtualAddress & TLB_TAG_VA_MASK)
+		| TLB_DEMAP_TYPE_PAGE | TLB_DEMAP_CONTEXT_SECONDARY;
+
+	// The secondary context register is borrowed rather than the primary one, so
+	// that the accesses the interrupted code is in the middle of keep matching
+	// what they matched before. It is still per-CPU state though, and an
+	// interrupt handler that demapped something in between would restore the
+	// wrong value over the top of this one.
+	InterruptsLocker locker;
+
+	uint64 wasSecondary;
+	asm volatile(
+		"ldxa	[%[contextRegister]] 0x58, %[saved]\n\t"
+		"stxa	%[context], [%[contextRegister]] 0x58\n\t"
+		"membar	#Sync\n\t"
+		"stxa	%%g0, [%[address]] 0x5f\n\t"	// ASI_DMMU_DEMAP
+		"stxa	%%g0, [%[address]] 0x57\n\t"	// ASI_IMMU_DEMAP
+		"membar	#Sync\n\t"
+		"stxa	%[saved], [%[contextRegister]] 0x58\n\t"
+		"membar	#Sync"
+		: [saved] "=&r"(wasSecondary)
+		: [contextRegister] "r"(secondary_context), [context] "r"((uint64)context),
+		  [address] "r"(address)
+		: "memory");
+}
+
+
+/*!	Points the MMU at a different team's mappings. */
+void
+sparc_switch_address_space(uint32 context, phys_addr_t pageTableRoot)
+{
+	// The root first, because it is the one the miss handler reads out of
+	// memory. Between the two stores the register still names the outgoing team
+	// while the root names the incoming one, and a miss taken in that window
+	// would walk the new table and tag the result with the old id. Interrupts
+	// are already off here -- the scheduler holds a spinlock across the switch --
+	// but the ordering is written down rather than relied on, because the reason
+	// it is safe is not local to this function.
+	sTrapData.userPageTableRoot = pageTableRoot;
 
 	asm volatile(
-		"stxa %%g0, [%[address]] 0x5f\n\t"	// ASI_DMMU_DEMAP
-		"membar #Sync\n\t"
-		"stxa %%g0, [%[address]] 0x57\n\t"	// ASI_IMMU_DEMAP
-		"membar #Sync"
+		"stxa	%[context], [%[contextRegister]] 0x58\n\t"
+		"membar	#Sync"
 		:
-		: [address] "r"(address)
+		: [contextRegister] "r"(primary_context), [context] "r"((uint64)context)
 		: "memory");
+}
+
+
+/*!	Removes every trace of a context, so its id can be given to another team. */
+void
+sparc_context_invalidate(uint32 context)
+{
+	// The kernel's id is never reassigned, and demapping it wholesale would take
+	// the locked trap mappings out from under the next trap.
+	if (context == SPARC_KERNEL_CONTEXT)
+		return;
+
+	uint64 address = TLB_DEMAP_TYPE_CONTEXT | TLB_DEMAP_CONTEXT_SECONDARY;
+
+	InterruptsLocker locker;
+
+	uint64 wasSecondary;
+	asm volatile(
+		"ldxa	[%[contextRegister]] 0x58, %[saved]\n\t"
+		"stxa	%[context], [%[contextRegister]] 0x58\n\t"
+		"membar	#Sync\n\t"
+		"stxa	%%g0, [%[address]] 0x5f\n\t"	// ASI_DMMU_DEMAP
+		"stxa	%%g0, [%[address]] 0x57\n\t"	// ASI_IMMU_DEMAP
+		"membar	#Sync\n\t"
+		"stxa	%[saved], [%[contextRegister]] 0x58\n\t"
+		"membar	#Sync"
+		: [saved] "=&r"(wasSecondary)
+		: [contextRegister] "r"(secondary_context), [context] "r"((uint64)context),
+		  [address] "r"(address)
+		: "memory");
+
+	if (sKernelTsb == NULL)
+		return;
+
+	// And the TSB, which has no demap of its own. A linear scan of every line,
+	// which is the price of one shared TSB rather than one per address space --
+	// 8192 lines, on a path taken once per team rather than once per mapping.
+	//
+	// Leaving a line behind would not be a slow path. The next team to be given
+	// this id forms tag targets with it, matches the line, and reads the page
+	// that used to belong to somebody else.
+	uint64 wanted = (uint64)context << TTE_TAG_CONTEXT_SHIFT;
+	for (uint32 i = 0; i < KERNEL_TSB_ENTRIES; i++) {
+		if ((sKernelTsb[i].fTag & ((uint64)TTE_TAG_CONTEXT_MASK
+				<< TTE_TAG_CONTEXT_SHIFT)) != wanted) {
+			continue;
+		}
+
+		// Data first, for the reason sparc_tsb_invalidate() gives.
+		sKernelTsb[i].fData = 0;
+		sKernelTsb[i].fTag = 0;
+	}
 }
 
 #endif	// !_BOOT_MODE

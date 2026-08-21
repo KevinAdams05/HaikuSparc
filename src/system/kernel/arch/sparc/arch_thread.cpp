@@ -12,6 +12,9 @@
 #include <kernel.h>
 #include <thread.h>
 #include <vm/vm_types.h>
+#include <vm/VMAddressSpace.h>
+
+#include "SPARCVMTranslationMap.h"
 
 
 extern "C" void sparc_context_switch(struct arch_context *from,
@@ -156,12 +159,26 @@ arch_thread_init_tls(Thread *thread)
 void
 arch_thread_context_switch(Thread *from, Thread *to)
 {
-	// Nothing to do about address spaces: there is one, the kernel's, and its
-	// mappings are Global so they are not tagged with a context to switch. That
-	// is the shared-address-space decision in section 4.3 of the porting plan
-	// paying off; when user contexts arrive, the primary context register gets
-	// set here.
+	// Which team's low-half mappings the MMU should match from here on.
 	//
+	// The kernel's half needs nothing done to it: those mappings are Global, so
+	// the hardware matches them whatever this register holds. That is the
+	// shared-address-space decision in section 4.3 of the porting plan paying
+	// off -- the switch is one store rather than a page table reload, and kernel
+	// code keeps running through it without a flush.
+	//
+	// A kernel thread has no address space of its own and inherits whatever was
+	// loaded, which is harmless for the same reason: it has no low-half mappings
+	// to be confused about. Writing the kernel's id for it would cost a store
+	// and buy nothing.
+	VMAddressSpace* addressSpace = to->team->address_space;
+	if (addressSpace != NULL) {
+		SPARCVMTranslationMap* map = static_cast<SPARCVMTranslationMap*>(
+			addressSpace->TranslationMap());
+		if (map->Context() != SPARC_KERNEL_CONTEXT)
+			sparc_switch_address_space(map->Context(), map->PageTable());
+	}
+
 	// The thread pointer is not set here either. The scheduler writes %g7 through
 	// arch_thread_set_current_thread() immediately before calling this, so by the
 	// time the switch runs it already names the incoming thread.

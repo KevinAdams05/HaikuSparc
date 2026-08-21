@@ -321,6 +321,14 @@ arch_vm_translation_map_create_map(bool kernel, VMTranslationMap** _map)
 	if (map == NULL)
 		return B_NO_MEMORY;
 
+	// The context id, which a user map cannot do without and which is the one
+	// part of setting one up that can fail.
+	status_t status = map->Init();
+	if (status != B_OK) {
+		delete map;
+		return status;
+	}
+
 	*_map = map;
 	return B_OK;
 }

@@ -83,6 +83,8 @@ struct SPARCVMTranslationMap : public VMTranslationMap {
 									phys_addr_t pageTable = 0);
 	virtual						~SPARCVMTranslationMap();
 
+			status_t			Init();
+
 	virtual	bool				Lock();
 	virtual	void				Unlock();
 
@@ -124,6 +126,13 @@ struct SPARCVMTranslationMap : public VMTranslationMap {
 
 			phys_addr_t			PageTable() const	{ return fPageTable; }
 
+			/*!	The MMU context this address space's mappings are tagged with.
+
+				SPARC_KERNEL_CONTEXT for the kernel's map, which needs no id of
+				its own because its mappings are Global.
+			*/
+			uint32				Context() const		{ return fContext; }
+
 private:
 			phys_addr_t			LookupEntry(addr_t virtualAddress,
 									const SPARCPageTableAllocator* allocator);
@@ -131,6 +140,7 @@ private:
 
 			bool				fIsKernel;
 			phys_addr_t			fPageTable;
+			uint32				fContext;
 };
 
 

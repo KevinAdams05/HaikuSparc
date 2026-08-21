@@ -74,7 +74,8 @@
 #define TRAP_DATA_TRAP_RETURN		0x70
 #define TRAP_DATA_WINDOW_STATE		0x78
 #define TRAP_DATA_LOCALS		0x80
-#define TRAP_DATA_OFFSET_COUNT		17
+#define TRAP_DATA_USER_PAGE_TABLE	0xc0
+#define TRAP_DATA_OFFSET_COUNT		18
 
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
@@ -135,6 +136,7 @@
  *	derives the second from KERNEL_BASE rather than trusting either copy.
  */
 #define TTE_TAG_CONTEXT_SHIFT		48
+#define TSB_TAG_VA_SHIFT		22
 #define TSB_TAG_KERNEL_BIT		9
 
 // The Tag Access register's offset in the MMU register block.
@@ -326,7 +328,14 @@ FUNCTION(sparc_instruction_mmu_miss):
 	bgu,pn	%xcc, 1f
 	 nop
 
-	/* Level 1: the segment table, indexed by VA<42:33>. */
+	/*	Level 1: the segment table, indexed by VA<42:33>.
+	 *
+	 *	%g3 is the kernel's page table, and it is the only one this walks. A user
+	 *	address space has a table of its own and the handler has to be told which,
+	 *	so the root wants selecting here from the address -- and every attempt to
+	 *	do that so far has hung the machine in a way that does not yet make sense.
+	 *	See section 3 of sparc-port/USERSPACE_DESIGN.md, which has the bisect.
+	 */
 	srlx	%g6, PT_SEGMENT_SHIFT, %g4
 	and	%g4, PT_INDEX_MASK, %g4
 	sllx	%g4, 3, %g4
@@ -895,7 +904,7 @@ FUNCTION(sparc_iframe_offsets):
  *	a context shift that disagrees masks the wrong bits out of a tag target and
  *	simply misses forever.
  *
- *	void sparc_mmu_defines(uint64 *out);   // seven entries
+ *	void sparc_mmu_defines(uint64 *out);   // eight entries
  */
 FUNCTION(sparc_mmu_defines):
 	mov	PT_SEGMENT_SHIFT, %o1
@@ -912,6 +921,8 @@ FUNCTION(sparc_mmu_defines):
 	stx	%o1, [%o0 + (5 * 8)]
 	mov	TSB_TAG_KERNEL_BIT, %o1
 	stx	%o1, [%o0 + (6 * 8)]
+	mov	TSB_TAG_VA_SHIFT, %o1
+	stx	%o1, [%o0 + (7 * 8)]
 	retl
 	 nop
 
@@ -1007,6 +1018,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (15 * 8)]
 	mov	TRAP_DATA_LOCALS, %o1
 	stx	%o1, [%o0 + (16 * 8)]
+	mov	TRAP_DATA_USER_PAGE_TABLE, %o1
+	stx	%o1, [%o0 + (17 * 8)]
 	retl
 	 nop
 
