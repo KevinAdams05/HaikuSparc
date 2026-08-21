@@ -322,16 +322,74 @@ What has been eliminated, so the next attempt does not repeat it:
   does not: both `try_acquire_spinlock()` and `release_spinlock()` compile to
   `swap [%i0], %g1`, which is 32-bit.
 
-The lead worth following: `recursive_lock_unlock()` writes the holder from
-`thread_get_current_thread_id()`, which on this port is a read of `%g7` — and
-`%g7` has already produced one hard bug this week, in a different register bank.
-A `%g7` that is momentarily wrong would write a wrong holder and nothing would
-notice until the lock was destroyed. Check it by sampling `%g7` against
-`thread_get_current_thread()` across the paths that take this lock, rather than
-by reading more of `lock.cpp`.
+Then a second round, all negative, all measured:
 
-And measure before theorising: the destructor's own report is already written and
-was what eliminated three of the five theories above.
+- **The struct layout, measured rather than reasoned about.** The destructor
+  printed `KDEBUG 1, offsetof(mutex, holder) 20, sizeof(mutex) 32,
+  sizeof(spinlock) 4`, and `lock.cpp`'s own code in the binary reads `holder` at
+  `[%i0 + 0x14]` and `flags` at `[%i0 + 0x18]`. Both translation units agree, and
+  `0x8100def8 + 0x14` is exactly the address the destructor printed. **It is the
+  same word.**
+- **`mutex_init_etc()` failing to initialise it.** It sets `holder = -1` under
+  `KDEBUG`, so a never-locked mutex is not the answer.
+- **A thread id of 0 being stored as the holder.** It does happen —
+  `thread_get_current_thread()->id` is 0 for the early boot thread, and the
+  kernel map's lock is taken 868 times that way during
+  `vm_translation_map_init_post_area()`. But those balance, and nothing reports a
+  bad id at the time the user map is used.
+- **The page table teardown corrupting a later object.** The panic survives
+  making `_FreePageTable()` leak instead of free.
+- **The trap entry's kernel stack switch.** The panic survives reverting it to the
+  old unconditional `save`.
+- **The userspace probe.** The panic survives disabling it entirely.
+- **Memory visibility.** `mutex_destroy()` reads the holder *after*
+  `acquire_spinlock()`'s full `membar`, and the destructor's read does not — the
+  one asymmetry between them. Reading the address twice with
+  `memory_full_barrier()` in between gives **-1 both times**.
+
+So: address `0x8100df0c` reads -1, reads -1 again after a barrier, and reads 0
+from `mutex_destroy()` one call later. Between those reads are two function
+prologues, three stores into `mutex_destroy()`'s own stack frame, a `wrpr
+%pstate` to disable interrupts, and `acquire_spinlock()` — whose only write is a
+32-bit `swap` at `+0x10`, four bytes below the holder, verified in the binary.
+
+### And then the actual shape of it
+
+Instrumenting `mutex_destroy()` itself — printing the raw words it sees on entry
+and again after taking the spinlock — changed the question entirely:
+
+```
+mutex_destroy: 0x8100cb98 after spinlock holder -1, raw[4] 0x1 raw[5] 0xffffffff
+error starting "/boot/system/servers/launch_daemon" error = -1
+mutex_destroy: 0x8100cb98 entry holder 0, raw[4] 0x0 raw[5] 0x0
+PANIC
+```
+
+**`mutex_destroy()` runs twice on the same address**, and the second time the
+memory is *zeroed* — spinlock and holder both 0. The first call is the healthy
+one, with holder -1, which is exactly the value the destructor's own report kept
+showing. So nothing corrupts a holder: **the report and the panic were looking at
+two different destructions**, and every measurement above was consistent all
+along. The apparent contradiction was mine.
+
+`operator delete` is called with size 0x48, which is `sizeof(SPARCVMTranslationMap)`,
+so the object really is freed between the two. Either the same map is destroyed
+twice, or the address is reused by something whose lock was never initialised —
+and a zeroed mutex distinguishes those: `mutex_init_etc()` writes -1, so zeroed
+memory means no constructor ran there.
+
+Both live in the `launch_daemon` failure path, in shared code
+(`VMAddressSpace::~VMAddressSpace()` → `delete fTranslationMap`). It became
+reachable when `Map()` started succeeding, because before that a team failed
+earlier and took a different path out.
+
+**Next step**, and it is now a narrow question rather than a hunt: find the second
+caller. A generation counter in the map object, bumped in the constructor and
+checked in the destructor, separates double-destroy from address reuse in one
+boot; the destructor already carries a magic field in the experiment that got
+this far, and it read *valid* on the one destruction it saw, which is the
+remaining thing that does not add up. After that, `%i7` from the second call's
+frame names the caller directly.
 
 
 ## 5. The syscall path
