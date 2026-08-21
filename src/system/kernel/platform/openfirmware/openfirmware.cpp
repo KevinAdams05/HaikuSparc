@@ -5,6 +5,9 @@
  */
 
 #include <platform/openfirmware/openfirmware.h>
+#if defined(__sparc__) && !defined(_BOOT_PLATFORM_OPENFIRMWARE)
+#	include <arch_mmu.h>
+#endif
 
 #include <stdarg.h>
 
@@ -100,6 +103,13 @@ call_open_firmware(void *args)
 
 	asm volatile("mov %0, %%g6" : : "r"(savedG6));
 	asm volatile("mov %0, %%g7" : : "r"(savedG7));
+
+#ifndef _BOOT_PLATFORM_OPENFIRMWARE
+	// And the trap banks, which the two moves above cannot reach: they run at
+	// trap level zero on the normal bank, while the firmware's writes land in
+	// whichever bank its own PSTATE selects. See sparc_restore_trap_globals().
+	sparc_restore_trap_globals();
+#endif
 
 #ifndef _BOOT_PLATFORM_OPENFIRMWARE
 	restore_interrupts(interruptState);

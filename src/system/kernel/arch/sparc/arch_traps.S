@@ -328,18 +328,42 @@ FUNCTION(sparc_instruction_mmu_miss):
 	bgu,pn	%xcc, 1f
 	 nop
 
-	/*	Level 1: the segment table, indexed by VA<42:33>.
+	/*	Which page table to walk: the kernel's, or the running team's.
 	 *
-	 *	%g3 is the kernel's page table, and it is the only one this walks. A user
-	 *	address space has a table of its own and the handler has to be told which,
-	 *	so the root wants selecting here from the address -- and every attempt to
-	 *	do that so far has hung the machine in a way that does not yet make sense.
-	 *	See section 3 of sparc-port/USERSPACE_DESIGN.md, which has the bisect.
+	 *	One table per address space, so there are two roots and the address says
+	 *	which applies -- the same bit the fast path used to decide about the
+	 *	context, and for the same reason. %g3 holds the kernel's, put there at
+	 *	cutover; the team's comes from the trap data block, where the context
+	 *	switch writes it beside the context register it must agree with.
+	 *
+	 *	Branch-free: VA<31> shifted to the top and sign-extended is an all-ones
+	 *	mask for a kernel address and an all-zeroes one for a user address, which
+	 *	selects between the two roots without either being tested.
+	 *
+	 *	There is no zero case to handle. The field is initialised to the kernel's
+	 *	own root, so a user address faulting with no team current walks the kernel
+	 *	table and finds nothing -- the fault it deserves. Left at zero it would
+	 *	walk from physical address zero and read the bottom of memory as a page
+	 *	table.
+	 *
+	 *	This is the first code in the kernel to read [%g7 + offset] from the MMU
+	 *	global bank, and it stayed broken until that was true of something: the
+	 *	firmware clobbers %g7 in whichever bank its own PSTATE selects, and
+	 *	call_open_firmware() could only ever save the normal one. See
+	 *	sparc_restore_trap_globals().
 	 */
+	sllx	%g6, 63 - (TSB_TAG_KERNEL_BIT + TSB_TAG_VA_SHIFT), %g5
+	srax	%g5, 63, %g5
+	ldx	[%g7 + TRAP_DATA_USER_PAGE_TABLE], %g4
+	andn	%g4, %g5, %g4
+	and	%g3, %g5, %g5
+	or	%g4, %g5, %g5
+
+	/* Level 1: the segment table, indexed by VA<42:33>. */
 	srlx	%g6, PT_SEGMENT_SHIFT, %g4
 	and	%g4, PT_INDEX_MASK, %g4
 	sllx	%g4, 3, %g4
-	add	%g3, %g4, %g4
+	add	%g5, %g4, %g4
 	ldxa	[%g4] ASI_PHYS_USE_EC, %g4
 	brz,pn	%g4, 1f
 

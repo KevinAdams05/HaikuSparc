@@ -253,6 +253,10 @@ sparc_tsb_insert(addr_t virtualAddress, phys_addr_t physicalAddress,
 static void sparc_verify_tlb_load(struct kernel_args *args);
 static void sparc_verify_tsb_lookup();
 static void sparc_verify_trap_handlers(struct kernel_args *args);
+
+// See sparc_restore_trap_globals().
+static bool sObservedMmuGlobal = false;
+static uint64 sMmuGlobalAfterCall = 0;
 static void sparc_verify_mmu_defines();
 
 extern "C" void sparc_mmu_defines(uint64 *out);
@@ -1787,6 +1791,63 @@ sparc_tlb_demap(addr_t virtualAddress, uint32 context)
 		: [contextRegister] "r"(secondary_context), [context] "r"((uint64)context),
 		  [address] "r"(address)
 		: "memory");
+}
+
+
+/*!	Puts %g3 and %g7 back in the trap global banks after a firmware call.
+
+	Open Firmware uses the operating system's reserved registers for its own
+	state, which call_open_firmware() already knows: it saves and restores %g6
+	and %g7 around every client call. But that save runs as ordinary C at trap
+	level zero, so it saves the *normal* bank -- and the firmware's writes land
+	in whichever bank its own PSTATE selects. The MMU and alternate banks are
+	separate register files and were left to rot.
+
+	Nothing noticed for four phases because nothing read them. The TLB miss
+	handlers keep the trap data pointer in %g7 and the page table root in %g3
+	and use neither: the fast path reads MMU registers, the slow path walks
+	physical addresses out of %g3, and the paths that do use %g7 -- the fault
+	entry and the unhandled-trap reporter -- run on the *alternate* bank. The
+	first code to read [%g7 + offset] from the MMU bank found 0xffe80018, an
+	address inside the firmware's own image, and treated the word beside it as a
+	page table root.
+
+	So re-establish both banks from the values the kernel knows are right, rather
+	than saving and restoring three banks' worth around every call. Idempotent,
+	two stores per bank, and it cannot drift from what the cutover installed
+	because it calls the same function the cutover did.
+*/
+void
+sparc_restore_trap_globals()
+{
+	if (!sparc_mmu_is_installed())
+		return;
+
+	// One-shot: whether the firmware really does clobber the MMU bank, said out
+	// loud rather than left to be inferred from a fault three layers away.
+	if (!sObservedMmuGlobal) {
+		sObservedMmuGlobal = true;
+		sMmuGlobalAfterCall = sparc_read_trap_globals(SPARC_GLOBALS_MMU);
+	}
+
+	sparc_set_trap_globals(&sTrapData, sparc_kernel_page_table());
+}
+
+
+/*!	Says whether the firmware was found to have clobbered the MMU bank's %g7. */
+void
+sparc_report_mmu_global()
+{
+	if (!sObservedMmuGlobal) {
+		dprintf("sparc_mmu: no firmware call has been made since the cutover\n");
+		return;
+	}
+
+	bool clobbered = sMmuGlobalAfterCall != (uint64)(addr_t)&sTrapData;
+	dprintf("sparc_mmu: %%g7 in the MMU bank after a firmware call was %#"
+		B_PRIx64 ", trap data is at %p -- %s\n", sMmuGlobalAfterCall,
+		&sTrapData, clobbered ? "CLOBBERED, and restored each call"
+			: "unchanged");
 }
 
 

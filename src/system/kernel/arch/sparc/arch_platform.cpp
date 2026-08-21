@@ -12,6 +12,7 @@
 #include <KernelExport.h>
 
 #include <arch/generic/debug_uart.h>
+#include <arch_mmu.h>
 #include <boot/kernel_args.h>
 #include <platform/openfirmware/openfirmware.h>
 #include <real_time_clock.h>
@@ -303,6 +304,7 @@ arch_platform_init_post_thread(struct kernel_args *kernelArgs)
 	// After the tree walk, so it has hundreds of client calls to have noticed
 	// something in rather than one.
 	openfirmware_report_reserved_globals();
+	sparc_report_mmu_global();
 
 	return B_OK;
 }

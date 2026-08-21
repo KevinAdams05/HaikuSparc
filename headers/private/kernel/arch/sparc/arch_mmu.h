@@ -152,6 +152,15 @@ extern void sparc_switch_address_space(uint32 context,
 */
 extern void sparc_context_invalidate(uint32 context);
 
+/*!	Re-establishes %g3 and %g7 in the MMU and alternate global banks.
+
+	Call after any Open Firmware client call. The firmware writes the
+	operating system's reserved registers in whichever bank its own PSTATE
+	selects, and call_open_firmware() can only save the normal one.
+*/
+extern void sparc_restore_trap_globals();
+extern void sparc_report_mmu_global();
+
 // TLB geometry. Both TLBs on the UltraSPARC-IIi are 64-entry fully associative,
 // and an entry is selected by putting its index in VA<8:3> of the address given
 // to the Data Access or Tag Read ASI -- FIGURE 15-13, printed p.230.
