@@ -2568,3 +2568,65 @@ left before Haiku runs anything of its own is the userspace entry the kernel doe
 syscall path, and all 64 spill and fill vectors point at the kernel handlers — including the 32
 `_other` ones that fire precisely when the window being spilled belongs to userspace and must be able
 to fault.
+
+
+## 32. Contexts, and one wall
+
+With the device stack done, the critical path is userspace, and the pieces that make it possible are
+entangled enough that the order matters more than the code. So the design went in first --
+[USERSPACE_DESIGN.md](USERSPACE_DESIGN.md) -- and two things in it were findings rather than write-ups.
+
+The first is that §4.3's Global-bit model is sound but incomplete. The Global bit makes the *hardware*
+ignore the context when it matches a TLB entry, which is what lets the primary context register hold a
+team's id even inside the kernel, which is what keeps `user_memcpy()` ordinary. But the TSB comparison
+is software: the handler xors the hardware's tag target, carrying whatever context is loaded, against a
+tag written with the mapping's. Both are zero today. The moment a team runs they are not, and every
+kernel address misses the fast path for as long as that team is current -- correct, and slow enough to
+be the whole system's cost, and it would have presented as a performance mystery rather than a bug.
+
+The fix is four instructions and no branch. The kernel owns everything above `KERNEL_BASE` and
+`KERNEL_BASE` is a power of two, so one bit decides -- and it is already in the register the handler
+just loaded. Mask the context off when it is set.
+
+Worth noting what that bit is, because the design document got it wrong first. `KERNEL_BASE` on this
+port is `0x80000000`, not the `0xffffff0000000000` the other 64-bit ports use, so the bit is VA<31>
+rather than VA<63>. `arch_kernel.h` explains at length why: it *did* carry x86_64's value once, and
+`IS_KERNEL_ADDRESS` then rejected every address the kernel actually uses. The constant is now derived
+from `KERNEL_BASE` at init and checked, rather than being right by coincidence.
+
+Then the contexts themselves: a bitmap over the 8192 ids, id zero the kernel's, claimed in an `Init()`
+that can fail because a map with no context is not a map. Freed when the address space is destroyed
+rather than stolen from a live one, which turns exhaustion from a recycling scheme into a case that does
+not arise. Freeing invalidates first and returns the id second -- the other order has a window where a
+team is handed an id whose translations are still cached, and that is not a slow path, it is one team
+reading another's memory. Single-page invalidation became context-aware for the same reason: one TSB
+serves every address space, so unmapping an address in one team must not throw away another's line.
+
+### The wall
+
+Contexts decide what the hardware matches. They say nothing about which page table the miss handler
+walks, and it walks exactly one, whose root is in `%g3` from cutover. A user address space has a table
+of its own, so its mappings would never be found. That was not on the list and should have been.
+
+Six instructions should fix it: the same address bit picks between `%g3` and a root the context switch
+leaves in the trap data block. It hangs the machine, reliably, on the first access to a user address --
+which is the `user_memcpy()` probe §27 already runs, and the only user-half access the whole boot makes.
+
+Twelve boots of bisecting, and the result does not resolve. Every variant that uses the loaded root
+hangs; every variant that ignores it works -- **including one that computes the same value the working
+ones use**, branchlessly, with the field initialised to the kernel's own root. The disassembly is right
+in each case. The loaded value was recorded by the handler itself and printed. `MOVcc` and `MOVR` were
+both verified working by a direct probe rather than assumed. `%g7` is the structure's address in both
+global banks, the field is inside the 256 bytes, the structure is in `.bss`, and the page is locked
+cacheable covering all of it.
+
+So it is reverted rather than shipped: it is not needed until a user address space exists, and a change
+that reliably hangs the boot to enable something nothing uses yet is the wrong trade. The correct half
+stays -- the field, offset-checked like every other, written by `sparc_switch_address_space()` beside
+the context register it must agree with. Only the reader is missing, which is also why **user address
+spaces do not work yet**, and it is the first thing to fix before they can.
+
+The full bisect is in §3 of the design document, at length, along with the next measurement: run the
+failing build under `-accel tcg,one-insn-per-tb=on` and see whether the hang survives. That one number
+decides whether this is the emulator's translation of the miss handler or ours, and it should come
+before any more reading.
