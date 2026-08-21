@@ -107,6 +107,10 @@ struct iframe {
 // never collide with a real syscall number.
 #define SPARC_SYSCALL_TEST_ECHO		0xecc0
 
+// And one the userspace test program uses. Small enough to be a `mov` immediate,
+// because that program is hand-written assembly copied into a page.
+#define SPARC_SYSCALL_TEST_EXIT		0x555
+
 // Trap types 0x41 through 0x4f are interrupt_level_1 through _15, one entry
 // each rather than the groups of four the busier traps get.
 #define TRAP_INTERRUPT_LEVEL_BASE	0x40

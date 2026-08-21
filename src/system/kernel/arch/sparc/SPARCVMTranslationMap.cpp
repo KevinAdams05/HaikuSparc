@@ -365,12 +365,66 @@ SPARCVMTranslationMap::~SPARCVMTranslationMap()
 
 	free_context(fContext);
 
-	// Freeing a user page table's pages belongs here, and is not written yet
-	// because nothing creates one: userland does not run. Leaving it unwritten
-	// is a leak the moment it does, so it is called out rather than left to be
-	// discovered.
 	if (!fIsKernel && fPageTable != 0)
-		panic("SPARCVMTranslationMap: user page table teardown not implemented");
+		_FreePageTable();
+}
+
+
+/*!	Gives a user address space's page table back, one level at a time.
+
+	Only the tables themselves. The pages they described belong to the areas that
+	mapped them, and the VM has already unmapped every area by the time an address
+	space is destroyed -- so a non-zero leaf entry here is a mapping somebody
+	failed to remove, not a page to free, and freeing it would hand out memory
+	that is still referenced.
+
+	The kernel's table is never freed: it is the one every address space shares
+	through the Global bit, and it outlives all of them.
+
+	Interior entries hold physical addresses and are read with a physical access,
+	the same way the miss handler walks them, so this needs nothing mapped.
+*/
+void
+SPARCVMTranslationMap::_FreePageTable()
+{
+	for (uint32 segment = 0; segment < SPARC_PAGE_TABLE_ENTRIES; segment++) {
+		phys_addr_t directory = sparc_read_physical(fPageTable
+			+ segment * sizeof(uint64));
+		if (directory == 0)
+			continue;
+
+		for (uint32 index = 0; index < SPARC_PAGE_TABLE_ENTRIES; index++) {
+			phys_addr_t table = sparc_read_physical(directory
+				+ index * sizeof(uint64));
+			if (table != 0)
+				_FreePageTablePage(table);
+		}
+
+		_FreePageTablePage(directory);
+	}
+
+	_FreePageTablePage(fPageTable);
+	fPageTable = 0;
+}
+
+
+/*!	Returns one page of page table to the VM.
+
+	The early boot allocator has no counterpart and needs none: it is only used
+	for the kernel's own table, which is never freed.
+*/
+void
+SPARCVMTranslationMap::_FreePageTablePage(phys_addr_t address)
+{
+	vm_page* page = vm_lookup_page(address / B_PAGE_SIZE);
+	if (page == NULL) {
+		panic("SPARCVMTranslationMap: page table page at %#" B_PRIxPHYSADDR
+			" is not a page the VM knows about", address);
+		return;
+	}
+
+	DEBUG_PAGE_ACCESS_START(page);
+	vm_page_free(NULL, page);
 }
 
 
@@ -506,6 +560,20 @@ phys_addr_t
 SPARCVMTranslationMap::LookupEntry(addr_t virtualAddress,
 	const SPARCPageTableAllocator* allocator)
 {
+	// A user map is created before anything is mapped into it, so it starts with
+	// no table at all -- and the root is the one level the walk cannot allocate
+	// for itself, because it is where the walk starts. Left at zero the walk
+	// reads physical address zero and calls the bottom of memory a segment
+	// table, which is a hang rather than an error.
+	if (fPageTable == 0) {
+		if (allocator == NULL)
+			return 0;
+
+		fPageTable = allocator->Allocate();
+		if (fPageTable == 0)
+			return 0;
+	}
+
 	return sparc_page_table_lookup(fPageTable, virtualAddress, allocator);
 }
 

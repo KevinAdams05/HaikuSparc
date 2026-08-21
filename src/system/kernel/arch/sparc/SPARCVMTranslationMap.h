@@ -136,6 +136,8 @@ struct SPARCVMTranslationMap : public VMTranslationMap {
 private:
 			phys_addr_t			LookupEntry(addr_t virtualAddress,
 									const SPARCPageTableAllocator* allocator);
+			void				_FreePageTable();
+			void				_FreePageTablePage(phys_addr_t address);
 			void				InvalidateCaches(addr_t virtualAddress);
 
 			bool				fIsKernel;

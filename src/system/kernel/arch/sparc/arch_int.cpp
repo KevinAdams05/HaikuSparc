@@ -7,6 +7,7 @@
  */
 
 
+#include <setjmp.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -17,14 +18,29 @@
 #include <smp.h>
 #include <thread.h>
 #include <timer.h>
+#include <arch_mmu.h>
+#include <kernel.h>
 #include <vm/vm.h>
+#include <vm/vm_page.h>
 #include <vm/vm_priv.h>
+#include <vm/VMAddressSpace.h>
+
+#include "SPARCVMTranslationMap.h"
 #include <util/AutoLock.h>
 
 #include <platform/openfirmware/openfirmware.h>
 
 
 extern "C" void sparc_iframe_offsets(uint64 *out);
+extern "C" void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
+	addr_t arg1, addr_t arg2);
+extern "C" uint32 sparc_user_test_program[];
+extern "C" uint32 sparc_user_test_program_end[];
+
+// Set up by sparc_test_userspace(), read by sparc_syscall().
+static jmp_buf sUserTestReturn;
+static bool sUserTestActive = false;
+static uint64 sUserTestValue = 0;
 
 // Defined below sparc_interrupt(), which is where it is easiest to read, and
 // called from both of the paths that reach it.
@@ -445,6 +461,137 @@ sparc_test_syscall()
 }
 
 
+/*!	Runs an instruction in userspace.
+
+	The first one this port has ever run, and it exercises the pieces that could
+	not be tested any other way: an address space of its own, so the mappings are
+	context-tagged and the miss handler has to find them through the
+	per-address-space page table root; a drop of privilege through `done`; a trap
+	back out of unprivileged code; and the trap entry choosing a kernel stack
+	rather than the user's.
+
+	The program is three instructions, assembled rather than hand-encoded -- see
+	sparc_user_test_program in arch_asm.S -- and copied into a page. It reports a
+	value the kernel did not choose, so "the trap happened" and "the trap happened
+	where I meant it to" stay distinguishable.
+
+	Two deliberate compromises, both because this is a probe and not a thread.
+
+	The address space is never destroyed. A user page table's teardown is not
+	written yet and panics if reached, so keeping the reference forever is the
+	quiet option and the alternative is a boot that dies on cleanup.
+
+	And the trap out of userspace is pointed at a scratch stack instead of this
+	thread's own. A trap from userspace builds its frame at the top of the kernel
+	stack, which is right for a thread that really left the kernel and wrong here:
+	this function is still on that stack, and its frames are what the top holds.
+*/
+static void
+sparc_test_userspace()
+{
+	const addr_t kCodeAddress = 0x20000000;
+	const addr_t kStackAddress = 0x20100000;
+	const uint64 kExpected = 0x5ac;
+
+	// The stack the trap out of userspace lands on. See above.
+	static uint8 sTrapStack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
+
+	VMAddressSpace* addressSpace;
+	status_t status = VMAddressSpace::Create(1234, USER_BASE, USER_SIZE, false,
+		&addressSpace);
+	if (status != B_OK) {
+		panic("sparc: the userspace test could not make an address space: %s",
+			strerror(status));
+		return;
+	}
+
+	SPARCVMTranslationMap* map = static_cast<SPARCVMTranslationMap*>(
+		addressSpace->TranslationMap());
+
+	// Two pages for the program and its stack, and room for the page table
+	// levels underneath them -- a root, a directory and a leaf table, which the
+	// two addresses share because they are close enough to land in the same
+	// entries above the leaf. Reserved generously rather than exactly: getting it
+	// wrong asserts inside vm_page_allocate_page() rather than failing the map.
+	vm_page_reservation reservation;
+	vm_page_reserve_pages(&reservation, 16, VM_PRIORITY_SYSTEM);
+
+	vm_page* codePage = vm_page_allocate_page(&reservation,
+		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
+	vm_page* stackPage = vm_page_allocate_page(&reservation,
+		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
+
+	map->Lock();
+	// Writable as well as executable, because the kernel has to put the program
+	// there and the only mapping of that page is this one.
+	status_t codeStatus = map->Map(kCodeAddress,
+		(phys_addr_t)codePage->physical_page_number * B_PAGE_SIZE,
+		B_READ_AREA | B_WRITE_AREA | B_EXECUTE_AREA, 0, &reservation);
+	status_t stackStatus = map->Map(kStackAddress,
+		(phys_addr_t)stackPage->physical_page_number * B_PAGE_SIZE,
+		B_READ_AREA | B_WRITE_AREA, 0, &reservation);
+	map->Unlock();
+
+	if (codeStatus != B_OK || stackStatus != B_OK) {
+		panic("sparc: the userspace test could not map its pages: code %s, "
+			"stack %s", strerror(codeStatus), strerror(stackStatus));
+		return;
+	}
+
+	vm_page_unreserve_pages(&reservation);
+
+	dprintf("sparc_int: userspace: context %" B_PRIu32 ", page table %#"
+		B_PRIxPHYSADDR ", code at %#" B_PRIxADDR "\n", map->Context(),
+		map->PageTable(), kCodeAddress);
+
+	// Nothing may preempt this. A reschedule would switch address spaces, and
+	// the return into userspace would then be matched against another team's
+	// context -- a wrong answer rather than a failure.
+	cpu_status interruptState = disable_interrupts();
+
+	Thread* thread = thread_get_current_thread();
+	addr_t savedKernelStack = thread->kernel_stack_top;
+
+	sparc_switch_address_space(map->Context(), map->PageTable());
+	sparc_set_kernel_stack((addr_t)sTrapStack + sizeof(sTrapStack));
+
+	memcpy((void*)kCodeAddress, (const void*)&sparc_user_test_program,
+		(size_t)((addr_t)&sparc_user_test_program_end
+			- (addr_t)&sparc_user_test_program));
+	arch_cpu_sync_icache((void*)kCodeAddress, B_PAGE_SIZE);
+
+	sUserTestActive = true;
+	sUserTestValue = 0;
+
+	if (setjmp(sUserTestReturn) == 0) {
+		addr_t frame = ROUNDDOWN(kStackAddress + B_PAGE_SIZE
+			- SPARC_MINIMUM_FRAME_SIZE, 16);
+		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS, 0, 0);
+	}
+
+	// Back here through longjmp() from the system call handler.
+	//
+	// The root goes back to the kernel's own, not to zero. The miss handler
+	// selects between the two roots by address, and "user address" there means
+	// anything below KERNEL_BASE -- which includes the firmware's low identity
+	// mappings. A zero root makes the next miss on one of those walk from
+	// physical address zero. That is what the first attempt did, and it stopped
+	// the boot at the first device interrupt.
+	sparc_set_kernel_stack(savedKernelStack);
+	sparc_switch_address_space(SPARC_KERNEL_CONTEXT, sparc_kernel_page_table());
+	restore_interrupts(interruptState);
+
+	dprintf("sparc_int: userspace returned %#" B_PRIx64 " of %#" B_PRIx64
+		" -- %s\n", sUserTestValue, kExpected,
+		sUserTestValue == kExpected ? "ran in userspace" : "WRONG");
+
+	if (sUserTestValue != kExpected) {
+		panic("sparc: the userspace test reported %#" B_PRIx64 ", wanted %#"
+			B_PRIx64, sUserTestValue, kExpected);
+	}
+}
+
+
 status_t
 arch_int_init_post_device_manager(struct kernel_args *args)
 {
@@ -459,6 +606,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	sparc_test_backtrace();
 	sparc_test_user_memory();
 	sparc_test_syscall();
+	sparc_test_userspace();
 
 	return B_OK;
 }
@@ -679,6 +827,21 @@ sparc_syscall(struct iframe *frame)
 	}
 
 	switch (index) {
+		case SPARC_SYSCALL_TEST_EXIT:
+			if (sUserTestActive) {
+				sUserTestActive = false;
+				sUserTestValue = frame->out[0];
+
+				// Straight back to the test rather than to a userspace with
+				// nothing left to do. This abandons the trap return, which is
+				// only safe because TRAP_TO_C has already dropped to trap level
+				// zero: nothing is owed, and longjmp() puts the stack and the
+				// register windows back itself.
+				longjmp(sUserTestReturn, 1);
+			}
+			frame->out[0] = (uint64)B_NOT_SUPPORTED;
+			break;
+
 		case SPARC_SYSCALL_TEST_ECHO:
 			// Sums its arguments, so a wrong answer distinguishes "the arguments
 			// did not arrive" from "the result did not get back".

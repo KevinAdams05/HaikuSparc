@@ -201,8 +201,16 @@ FUNCTION(sparc_enter_userspace):
 	*/
 	flushw
 
-	/*	Trap level 1, where %tpc, %tnpc and %tstate exist to be written. `done`
+	/*	Trap level 1, where %tpc, %tnpc and %tstate exist to be written. `retry`
 		takes it back to zero.
+
+		`retry` and not `done`, and the difference is the whole of where userspace
+		starts. RETRY sets PC from TPC and NPC from TNPC; DONE sets PC from TNPC
+		and NPC from TNPC + 4 -- it exists to *skip* the instruction that trapped,
+		which is what a system call return wants and the opposite of what an entry
+		wants. Written with `done` first, this skipped the entry point's first
+		instruction and userspace began one instruction in, with whatever this
+		code had left in %g1.
 	*/
 	wrpr	%g0, 1, %tl
 
@@ -211,10 +219,13 @@ FUNCTION(sparc_enter_userspace):
 	wrpr	%g1, 0, %tnpc
 
 	/*	TSTATE, which is what `done` restores PSTATE and CWP from: CWP in bits
-		4:0, PSTATE in bits 20:8. Privilege dropped, interrupts enabled, FPU
-		usable. CCR and ASI are left zero -- a thread that has never run has
-		nothing in them, and handing userspace a condition code the kernel
-		happened to leave behind is a leak for no benefit.
+		4:0, PSTATE in bits 20:8. Privilege dropped, FPU usable, and interrupts
+		left exactly as the caller had them -- a thread being started for real
+		arrives here with them on, and a caller that wants userspace to run
+		uninterrupted can have that by asking for it rather than by editing this.
+		CCR and ASI are left zero -- a thread that has never run has nothing in
+		them, and handing userspace a condition code the kernel happened to leave
+		behind is a leak for no benefit.
 
 		CWP is this window's, so `done` returns into the window this code is
 		running in. That is what makes the three moves below work: they write
@@ -222,7 +233,7 @@ FUNCTION(sparc_enter_userspace):
 	*/
 	rdpr	%pstate, %g3
 	andn	%g3, PSTATE_PRIV, %g3
-	or	%g3, PSTATE_IE | PSTATE_PEF, %g3
+	or	%g3, PSTATE_PEF, %g3
 	sllx	%g3, 8, %g3
 	rdpr	%cwp, %g6
 	or	%g3, %g6, %g3
@@ -244,7 +255,7 @@ FUNCTION(sparc_enter_userspace):
 		Noted rather than papered over; nothing runs in userspace yet that could
 		exploit it. See sparc-port/USERSPACE_DESIGN.md.
 	*/
-	done
+	retry
 
 
 /*	The program that runs in userspace, to prove userspace runs.

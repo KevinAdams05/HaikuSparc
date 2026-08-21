@@ -21,6 +21,8 @@ extern "C" void sparc_context_switch(struct arch_context *from,
 	struct arch_context *to);
 extern "C" void sparc_thread_entry();
 extern "C" void sparc_context_offsets(uint64 *out);
+extern "C" void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
+	addr_t arg1, addr_t arg2);
 
 
 status_t
@@ -197,10 +199,28 @@ arch_thread_dump_info(void *info)
 }
 
 
+/*!	Drops this thread into userspace at \a entry, and does not come back.
+
+	The frame address is what has to be 16-byte aligned, not the stack pointer:
+	SPARC V9 biases %sp by 2047, so the two cannot both be, and it is the frame
+	the hardware and the ABI care about.
+
+	A minimum frame is reserved below the stack top rather than handing userspace
+	the top itself, because the first thing user code does is `save`, and a spill
+	of that window writes sixteen registers to the frame this %sp names. Without
+	the room, the spill writes above the stack.
+*/
 status_t
 arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1, void *arg2)
 {
-	panic("arch_thread_enter_uspace(): not yet implemented\n");
+	addr_t stackTop = thread->user_stack_base + thread->user_stack_size;
+	addr_t frame = ROUNDDOWN(stackTop - SPARC_MINIMUM_FRAME_SIZE, 16);
+
+	sparc_enter_userspace(entry, frame - SPARC_STACK_BIAS, (addr_t)arg1,
+		(addr_t)arg2);
+
+	// sparc_enter_userspace() does not return: it leaves through `done`.
+	panic("arch_thread_enter_userspace: returned from userspace entry");
 	return B_ERROR;
 }
 
