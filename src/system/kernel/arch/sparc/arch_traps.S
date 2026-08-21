@@ -99,7 +99,8 @@
 #define IFRAME_SFSR			0x68
 #define IFRAME_SFAR			0x70
 #define IFRAME_TAG_ACCESS		0x78
-#define IFRAME_SIZEOF			0x80
+#define IFRAME_OUT			0x80
+#define IFRAME_SIZEOF			0xb0
 
 // The data MMU's fault status and address registers.
 #define MMU_SFSR			0x18
@@ -700,7 +701,7 @@ sparc_unhandled_trap_stop:
  *	a load-time relocation that leaves a displacement of zero -- a branch to
  *	itself, silently.
  */
-.macro TRAP_TO_C handler, raise_pil
+.macro TRAP_TO_C handler, raise_pil, save_outs=0
 	save	%sp, -(SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
 
 	/* The trap registers first, while they still exist. */
@@ -775,6 +776,19 @@ sparc_unhandled_trap_stop:
 	stx	%l3, [%l7 + IFRAME_TT]
 	stx	%l4, [%l7 + IFRAME_Y]
 
+.if \save_outs
+	/* The trapped code's outs, which the `save` above turned into this window's
+	 * ins. Only a system call wants them, and only because its arguments and its
+	 * result live there -- see the note on iframe::out.
+	 */
+	stx	%i0, [%l7 + IFRAME_OUT + (0 * 8)]
+	stx	%i1, [%l7 + IFRAME_OUT + (1 * 8)]
+	stx	%i2, [%l7 + IFRAME_OUT + (2 * 8)]
+	stx	%i3, [%l7 + IFRAME_OUT + (3 * 8)]
+	stx	%i4, [%l7 + IFRAME_OUT + (4 * 8)]
+	stx	%i5, [%l7 + IFRAME_OUT + (5 * 8)]
+.endif
+
 	/* Down to trap level zero, so the handler runs like ordinary kernel code.
 	 * Interrupts stay disabled -- PSTATE.IE is still clear -- so nothing nests.
 	 */
@@ -801,6 +815,18 @@ sparc_unhandled_trap_stop:
 
 	ldx	[%l7 + IFRAME_PIL], %l6
 	wrpr	%l6, 0, %pil
+
+.if \save_outs
+	/* Back into the ins, so that `restore` hands them to the trapped window as
+	 * its outs. This is how a system call returns a value.
+	 */
+	ldx	[%l7 + IFRAME_OUT + (0 * 8)], %i0
+	ldx	[%l7 + IFRAME_OUT + (1 * 8)], %i1
+	ldx	[%l7 + IFRAME_OUT + (2 * 8)], %i2
+	ldx	[%l7 + IFRAME_OUT + (3 * 8)], %i3
+	ldx	[%l7 + IFRAME_OUT + (4 * 8)], %i4
+	ldx	[%l7 + IFRAME_OUT + (5 * 8)], %i5
+.endif
 
 	/* Reload the trap state from the frame rather than from this window's
 	 * locals, so that a handler can change where the trap returns to. That is
@@ -876,9 +902,31 @@ sparc_fault_entry:
 	TRAP_TO_C sparc_page_fault, 0
 
 
+/*	System call entry, reached by `ta SPARC_SYSCALL_TRAP` from either privilege
+ *	level.
+ *
+ *	The interrupt level is not raised, for the same reason the fault path does not
+ *	raise it: a system call blocks, and a thread that blocks with interrupts
+ *	blocked never gets the CPU back.
+ *
+ *	`save_outs` is what makes this different from every other trap here. A trap
+ *	does not rotate CWP, so the `save` inside TRAP_TO_C turns the caller's
+ *	%o0-%o5 into this window's %i0-%i5 -- the arguments -- and the closing
+ *	`restore` turns them back, which is how the result gets home. Those registers
+ *	are the calling convention, so they have to reach C, and the only way for
+ *	window registers to reach C is through memory.
+ *
+ *	Nothing else is needed here. TRAP_TO_C already reloads %tpc and %tnpc from the
+ *	frame on the way out, so advancing past the `ta` is one assignment in the
+ *	handler rather than a second return path.
+ */
+sparc_syscall_entry:
+	TRAP_TO_C sparc_syscall, 0, 1
+
+
 /*	Report this file's idea of the interrupt frame layout, for C++ to check.
  *
- *	void sparc_iframe_offsets(uint64 *out);   // seventeen entries
+ *	void sparc_iframe_offsets(uint64 *out);   // eighteen entries
  */
 FUNCTION(sparc_iframe_offsets):
 	mov	IFRAME_TSTATE, %o1
@@ -913,8 +961,10 @@ FUNCTION(sparc_iframe_offsets):
 	stx	%o1, [%o0 + (14 * 8)]
 	mov	IFRAME_TAG_ACCESS, %o1
 	stx	%o1, [%o0 + (15 * 8)]
-	mov	IFRAME_SIZEOF, %o1
+	mov	IFRAME_OUT, %o1
 	stx	%o1, [%o0 + (16 * 8)]
+	mov	IFRAME_SIZEOF, %o1
+	stx	%o1, [%o0 + (17 * 8)]
 	retl
 	 nop
 
@@ -1323,10 +1373,26 @@ FUNCTION(sparc_read_trap_page_table):
 	TRAP_GROUP_FILL
 	.endr
 
-	/* 0x100-0x1ff: the software traps, reached by the Tcc instructions. Haiku
-	 * will want one of these for system calls eventually.
+	/* 0x100-0x13f: software traps below the system call vector.
+	 *
+	 * Deliberately unhandled rather than ignored. A `ta` with a small immediate
+	 * is the shape a hand-written stub or a compiler is most likely to emit by
+	 * accident, so it should report rather than quietly do whatever the system
+	 * call vector does.
 	 */
-	.rept 0x100
+	.rept 0x040
+	TRAP_UNHANDLED
+	.endr
+
+	/* 0x140: `ta 0x40`, the system call. One entry, so .org asserts the size
+	 * the way the four-entry groups above do.
+	 */
+8:	ba,a	sparc_syscall_entry
+	 nop
+	.org 8b + 32
+
+	/* 0x141-0x1ff: the rest of the software traps. */
+	.rept 0x0bf
 	TRAP_UNHANDLED
 	.endr
 .endm

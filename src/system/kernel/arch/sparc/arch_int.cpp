@@ -252,19 +252,20 @@ sparc_interrupt_vector()
 static void
 sparc_verify_iframe_layout()
 {
-	uint64 assembler[17];
+	uint64 assembler[18];
 	sparc_iframe_offsets(assembler);
 
-	const uint64 declared[17] = {
+	const uint64 declared[18] = {
 		offsetof(iframe, tstate), offsetof(iframe, tpc),
 		offsetof(iframe, tnpc), offsetof(iframe, tt), offsetof(iframe, y),
 		offsetof(iframe, g1), offsetof(iframe, g2), offsetof(iframe, g3),
 		offsetof(iframe, g4), offsetof(iframe, g5), offsetof(iframe, g6),
 		offsetof(iframe, g7), offsetof(iframe, pil), offsetof(iframe, sfsr),
-		offsetof(iframe, sfar), offsetof(iframe, tagAccess), IFRAME_SIZEOF,
+		offsetof(iframe, sfar), offsetof(iframe, tagAccess),
+		offsetof(iframe, out), IFRAME_SIZEOF,
 	};
 
-	for (int i = 0; i < 17; i++) {
+	for (int i = 0; i < 18; i++) {
 		if (assembler[i] != declared[i]) {
 			panic("sparc iframe layout %d: arch_traps.S says %#" B_PRIx64
 				", arch_int.h says %#" B_PRIx64, i, assembler[i], declared[i]);
@@ -392,6 +393,58 @@ arch_int_init_post_vm(kernel_args *args)
 }
 
 
+/*!	Takes the system call trap, from kernel mode.
+
+	`ta` traps the same at either privilege level, so the whole path can be
+	checked before there is a userland to call it from: the table entry, the
+	iframe, the drop to trap level zero, the arguments arriving in the right
+	registers, the result getting home, and the return landing after the trap
+	rather than on it.
+
+	The last of those is the one worth testing deliberately. A trap returns with
+	`retry`, which re-executes the trapping instruction -- so a system call that
+	does not move %tnpc into %tpc loops forever, and the symptom is a hang with no
+	output rather than a wrong answer.
+
+	Six arguments summed, so a wrong total says the arguments did not arrive while
+	a right total from a wrong register says the result did not get back.
+*/
+static void
+sparc_test_syscall()
+{
+	const uint64 kArguments[6] = { 1, 2, 4, 8, 16, 32 };
+	const uint64 kExpected = 63;
+
+	uint64 result = 0;
+	asm volatile(
+		"mov	%[index], %%g1\n\t"
+		"mov	%[a0], %%o0\n\t"
+		"mov	%[a1], %%o1\n\t"
+		"mov	%[a2], %%o2\n\t"
+		"mov	%[a3], %%o3\n\t"
+		"mov	%[a4], %%o4\n\t"
+		"mov	%[a5], %%o5\n\t"
+		"ta	%[trap]\n\t"
+		"mov	%%o0, %[result]"
+		: [result] "=r"(result)
+		: [index] "r"((uint64)SPARC_SYSCALL_TEST_ECHO),
+		  [a0] "r"(kArguments[0]), [a1] "r"(kArguments[1]),
+		  [a2] "r"(kArguments[2]), [a3] "r"(kArguments[3]),
+		  [a4] "r"(kArguments[4]), [a5] "r"(kArguments[5]),
+		  [trap] "i"(SPARC_SYSCALL_TRAP)
+		: "g1", "o0", "o1", "o2", "o3", "o4", "o5", "memory");
+
+	dprintf("sparc_int: syscall returned %" B_PRIu64 " of %" B_PRIu64
+		" -- %s\n", result, kExpected,
+		result == kExpected ? "trap taken and returned" : "WRONG");
+
+	if (result != kExpected) {
+		panic("sparc: the system call trap returned %" B_PRIu64 ", wanted %"
+			B_PRIu64, result, kExpected);
+	}
+}
+
+
 status_t
 arch_int_init_post_device_manager(struct kernel_args *args)
 {
@@ -405,6 +458,7 @@ arch_int_init_post_device_manager(struct kernel_args *args)
 	sparc_test_preemption();
 	sparc_test_backtrace();
 	sparc_test_user_memory();
+	sparc_test_syscall();
 
 	return B_OK;
 }
@@ -585,6 +639,62 @@ sparc_test_preemption()
 	the case that matters -- which is exactly what the checks below handle
 	instead.
 */
+/*!	The system call trap.
+
+	Reached by `ta SPARC_SYSCALL_TRAP` from either privilege level, with the index
+	in %g1 and up to six arguments in %o0-%o5 -- which the entry has put in
+	frame->out, because window registers cannot reach C any other way.
+
+	Advancing past the trapping instruction is this function's job and not the
+	entry's. TRAP_TO_C reloads %tpc and %tnpc from the frame on the way out, so
+	moving %tnpc into %tpc is the whole of "return after the `ta`" -- and doing it
+	here rather than in assembly is what lets a handler that needs to restart or
+	redirect the call simply not do it.
+
+	Not yet a dispatcher. The kernel's syscall table is reached through
+	syscall_dispatcher(), which wants a contiguous argument list, and building one
+	from six registers plus the caller's stack is the next piece of work. This
+	answers a fixed set of calls so that the trap path itself can be tested --
+	including from kernel mode, since a `ta` traps the same either way.
+*/
+extern "C" void
+sparc_syscall(struct iframe *frame)
+{
+	uint64 index = frame->g1;
+	bool isUser = (frame->tstate & TSTATE_PRIV) == 0;
+
+	// Past the `ta`. %tnpc is the instruction after it, and on a trap from a
+	// delay slot it is not %tpc + 4, which is why it is copied rather than
+	// computed.
+	frame->tpc = frame->tnpc;
+	frame->tnpc = frame->tpc + 4;
+
+	static bool sReported = false;
+	if (!sReported) {
+		sReported = true;
+		dprintf("sparc_syscall: index %" B_PRIu64 ", args %#" B_PRIx64 " %#"
+			B_PRIx64 " %#" B_PRIx64 ", from %s, tpc %#" B_PRIx64 "\n", index,
+			frame->out[0], frame->out[1], frame->out[2],
+			isUser ? "userspace" : "the kernel", frame->tpc);
+	}
+
+	switch (index) {
+		case SPARC_SYSCALL_TEST_ECHO:
+			// Sums its arguments, so a wrong answer distinguishes "the arguments
+			// did not arrive" from "the result did not get back".
+			frame->out[0] = frame->out[0] + frame->out[1] + frame->out[2]
+				+ frame->out[3] + frame->out[4] + frame->out[5];
+			break;
+
+		default:
+			dprintf("sparc_syscall: unimplemented call %" B_PRIu64 " from %s\n",
+				index, isUser ? "userspace" : "the kernel");
+			frame->out[0] = (uint64)B_NOT_SUPPORTED;
+			break;
+	}
+}
+
+
 extern "C" void
 sparc_page_fault(struct iframe *frame)
 {

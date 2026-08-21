@@ -60,11 +60,52 @@ struct iframe {
 		// of those -- the "fast" in fast_data_access_protection means it skips
 		// the fault status registers -- so SFAR says nothing about it and this
 		// is the only place its address appears.
+	uint64	out[6];
+		// The trapped code's %o0-%o5, and only for the traps that ask for them.
+		//
+		// A trap does not rotate CWP, so the handler's `save` makes the trapped
+		// window the previous one and its outs become the handler's ins -- which
+		// is why nothing else here needs them, and why C cannot see them: they
+		// are register-window state, not memory.
+		//
+		// A system call needs them. Its arguments arrive in %o0-%o5 and its
+		// result goes back in %o0, so those registers are the interface, and
+		// putting them here is what lets the handler be written in C. Restored
+		// on the way out, so writing out[0] sets what the caller sees.
+		//
+		// Filled only when TRAP_TO_C is told to, because the interrupt path
+		// takes tens of thousands of traps a boot and has no use for them.
 };
 
-#define IFRAME_SIZEOF	128
+#define IFRAME_SIZEOF	176
 	// sizeof(struct iframe) rounded up to a 16-byte multiple, which is what
 	// stack frames have to be aligned to.
+
+/*	The system call.
+
+	SPARC V9's Tcc instructions produce trap types 0x100 + n for a software trap
+	number n in 0..127, and the architecture leaves the choice to the operating
+	system -- which is why SunOS, Solaris, Linux and the BSDs all use different
+	ones. Haiku on sparc uses 0x40, so trap type 0x140.
+
+	Mid-range on purpose. A `ta` with a small immediate is the shape a
+	hand-written stub or a compiler is most likely to emit by accident, and it
+	should land on an entry that reports rather than on this one.
+
+	The calling convention is the ABI's own, which is what makes it cheap: the
+	index in %g1, up to six arguments in %o0-%o5, the result in %o0. A trap does
+	not rotate CWP, so the handler's `save` makes those registers its %i's and
+	the closing `restore` puts them back -- no copying either way. Arguments
+	beyond six live where the ABI puts them, on the caller's stack, which the
+	kernel reaches with user_memcpy() like any other user pointer.
+*/
+#define SPARC_SYSCALL_TRAP			0x40
+#define TRAP_SYSCALL				(0x100 + SPARC_SYSCALL_TRAP)
+
+// A call index the kernel answers itself, for testing the trap path before there
+// is a dispatcher or a userland to reach it from. Deliberately absurd, so it can
+// never collide with a real syscall number.
+#define SPARC_SYSCALL_TEST_ECHO		0xecc0
 
 // Trap types 0x41 through 0x4f are interrupt_level_1 through _15, one entry
 // each rather than the groups of four the busier traps get.
