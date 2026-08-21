@@ -1510,6 +1510,11 @@ sparc_install_trap_table(struct kernel_args *args)
 	sTrapData.tsbBase = sKernelTsbPhysical;
 	sTrapData.pageTableRoot = sparc_kernel_page_table();
 
+	// The kernel's root, not zero, so that a user address faulting with no team
+	// current walks a real table and finds nothing rather than reading the
+	// bottom of physical memory as a page table. The context switch replaces it.
+	sTrapData.userPageTableRoot = sparc_kernel_page_table();
+
 	// Where an unresolved miss goes to be reported. Set before %tba, so the very
 	// first miss after the cutover already has somewhere to complain to.
 	sTrapData.reportHandler = (uint64)(addr_t)&sparc_report_unresolved_miss;

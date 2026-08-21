@@ -179,6 +179,7 @@ What the bisect found, one boot per row:
 | `movne` then `movrz %g5, %g3, %g5` | hangs earlier, during TSB area setup |
 | `ldx` then `movrz` alone | hangs earlier still |
 | two conditional branches, falling back to `%g3` | hangs in the probe, reproducible across reruns |
+| pure arithmetic — sign-extend the bit into a mask, `andn`/`and`/`or` the two roots, no control flow at all | hangs in the probe |
 
 Three things were checked rather than assumed. The **disassembly** of every variant is what was
 intended — `movre %g5, %g3, %g5` encodes rcond=RZ, rs1=`%g5`, rs2=`%g3`, rd=`%g5` correctly. The
@@ -191,10 +192,27 @@ address by the branch's delay slot, for a user address because the loaded root i
 — so it is behaviourally identical to the first row, and does strictly *less* work than the fourth. It
 hangs and they do not.
 
-Every variant that works is straight-line. Every variant that hangs makes `%g5`'s final value depend on
-data, even when the value is provably the same. That is the whole correlation, and it is not a
-correlation any model of the architecture explains, which means the model is wrong somewhere rather
-than the code being subtly buggy.
+The branchless arithmetic row was run to test the theory that control flow inside the miss handler was
+the trigger. It is not: that variant has none, and it hangs. It was run with the trap-data field
+*initialised to the kernel's root* rather than to zero, so it computes `%g5 = %g3` on both paths by
+construction — and `sparc_kernel_page_table()` is assigned once, and `sparc_verify_trap_globals()`
+already asserts that `%g3` holds exactly it.
+
+So the surviving correlation is narrower and stranger than "data-dependent": **every variant that uses
+the loaded value hangs, and every variant that ignores it works** — including a variant where the
+loaded value provably equals the register the working variants use.
+
+Which leaves only one shape of explanation: the load does not return what C wrote. Three ways that could
+happen were checked and none of them hold. The trap data block is at `0x8024f800` and `%g7` is exactly
+that in both the MMU and alternate global banks, verified at init. The field is at `+0xc0`, inside the
+256-byte structure, and the structure is in `.bss`. And the page is locked in the D-TLB as
+`va 0x8024e000 -> pa 0xc5a000, 8K, locked priv write global` — cacheable, covering the whole structure,
+so C's store and the handler's load are the same cached line. The initialisation runs inside
+`sparc_install_trap_table()`, before `%tba` is written, so it precedes the first miss our handlers see.
+
+That is where the investigation stands: an internally contradictory result with the obvious causes
+eliminated. It is written down at this length because the next person to look at it should not have to
+re-derive any of it.
 
 So it is **reverted** rather than shipped. It is not needed until a user address space exists, and
 shipping a change that reliably hangs the boot to enable something nothing uses yet is the wrong trade.
