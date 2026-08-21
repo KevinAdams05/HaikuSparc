@@ -354,15 +354,23 @@ SPARCVMTranslationMap::SPARCVMTranslationMap(bool kernel, phys_addr_t pageTable)
 	fPageTable(pageTable),
 	fContext(SPARC_KERNEL_CONTEXT)
 {
-	recursive_lock_init(&fLock, kernel ? "sparc kernel translation map"
-		: "sparc translation map");
+	// fLock is not ours. It is declared by VMTranslationMap, initialised by its
+	// constructor and destroyed by its destructor, so doing either here is
+	// duplicated ownership of somebody else's member -- and the destroy half of
+	// that was fatal: mutex_destroy() marks a destroyed mutex by setting its
+	// holder to 0, so the base class's destructor then found a holder of 0 where
+	// it wanted -1 and panicked.
+	//
+	// It hid for four phases because the panic that used to stand where the page
+	// table teardown is now fired first, before the base destructor could run,
+	// and because the check is "holder != -1 && current thread != holder" -- so
+	// a thread whose id is 0, which is every thread during early boot, matches a
+	// destroyed lock and passes.
 }
 
 
 SPARCVMTranslationMap::~SPARCVMTranslationMap()
 {
-	recursive_lock_destroy(&fLock);
-
 	free_context(fContext);
 
 	if (!fIsKernel && fPageTable != 0)
