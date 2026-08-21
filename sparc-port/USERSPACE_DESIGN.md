@@ -275,6 +275,51 @@ The matching `fill_*_other` reads from the user stack, which can also fault. Sam
 handler faults into a fixup path rather than trying to be clever, because a fill that cannot be
 satisfied is a thread that must be killed, not a trap to be retried.
 
+### Reaching them: the OTHERWIN transfer, which is not written
+
+The handlers exist and are verified. **They are also unreachable**, and this is the
+part to do next rather than a detail.
+
+The hardware picks `spill_*_other` over `spill_*_normal` when `OTHERWIN` is
+non-zero, and `OTHERWIN` is software-managed state. Nothing in this port writes
+it — the only reference anywhere is a *read*, in the unhandled-trap reporter. So
+it is zero always, the `_other` vectors never fire, and a user window spilled
+today goes through the kernel handler straight to the user's stack. That is why
+an eight-deep `save`/`restore` in the userspace test passes: it is exercising
+`spill_*_normal`, which works for a cooperative program and is the hole this
+design exists to close.
+
+What reaching them takes is the standard transfer, on kernel entry from
+userspace, after `TRAP_TO_C`'s own `save`:
+
+```
+	rdpr	%canrestore, %g1
+	wrpr	%g0, 0, %canrestore
+	wrpr	%g1, 0, %otherwin
+```
+
+The user's live windows become "other", so spilling any of them selects the
+handler that knows not to touch the user's stack. `CANSAVE + CANRESTORE +
+OTHERWIN = NWINDOWS - 2` is preserved, because the move is a move.
+
+And the reverse immediately before the closing `restore`, which is not optional:
+that `restore` returns *into* the trapped window, and with `OTHERWIN` non-zero
+and `CANRESTORE` zero it would trap to `fill_*_other` and try to fill a window
+that is still live in the register file.
+
+**The hazard, and the reason this was not rushed:** the C handler between those
+two points can block. A page fault pages something in; a system call sleeps. The
+context switch does `flushw`, which spills every window and renumbers the
+register file — and §29's preemption bug was exactly this, `retry` restoring a
+`CWP` that no longer meant the same window. `OTHERWIN` has to survive that, which
+means it belongs in the saved context alongside `PSTATE` and `PIL` rather than
+only in the registers. Getting it wrong gives an intermittent fault in ordinary
+kernel code, which is the worst failure mode this port has produced so far and
+took two sessions to find last time.
+
+So: handlers first, reachability second, and the second with a clear head.
+
+
 ### Where the save area lives
 
 `struct arch_thread` is the natural home and it is already the place `arch_context` lives. The save

@@ -76,7 +76,17 @@
 #define TRAP_DATA_LOCALS		0x80
 #define TRAP_DATA_USER_PAGE_TABLE	0xc0
 #define TRAP_DATA_KERNEL_STACK		0xc8
-#define TRAP_DATA_OFFSET_COUNT		19
+#define TRAP_DATA_WINDOW_SAVE		0xd0
+#define TRAP_DATA_OFFSET_COUNT		20
+
+/*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
+ *	the first word; slot N starts at base + (N + 1) * 256, so the header occupies
+ *	one slot's worth and the handler indexes with a shift. Checked against the
+ *	header by sparc_verify_mmu_defines().
+ */
+#define WINDOW_SAVE_SLOT_SHIFT		8
+#define WINDOW_SAVE_SLOTS		8
+#define WINDOW_SAVE_STACK_POINTER	128
 
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
@@ -564,6 +574,122 @@ sparc_immu_miss_slow:
 .endm
 
 
+/*	Spill a window that belongs to userspace.
+
+	The hardware picks this instead of spill_*_normal when OTHERWIN says the
+	window being spilled belongs to the other privilege level, which is exactly
+	the case the kernel handler must not touch: it would store sixteen registers
+	to an address userspace chose, from trap level one, where a fault nests one
+	deeper.
+
+	So the window goes to this thread's save area -- kernel memory, always mapped
+	-- and the biased %sp it belongs to goes with it, which is what lets the fill
+	side know whether a slot answers the frame being asked for.
+
+	Registers: %g7 is the trap data block and %g3 the page table root, both of
+	which belong to other handlers; %g1, %g2 and %g6 are this handler's.
+
+	Twenty-seven instructions, inside the thirty-two a four-entry group allows.
+*/
+.macro SPILL_USER_WINDOW
+	ldx	[%g7 + TRAP_DATA_WINDOW_SAVE], %g1
+	ldx	[%g1], %g2
+
+	/* Full is not survivable here and must not be written past: at most seven
+	 * windows can be live, so eight slots cannot overflow unless something else
+	 * is already wrong. Report rather than corrupt the thread beside it.
+	 */
+	cmp	%g2, WINDOW_SAVE_SLOTS
+	bgeu,pn	%xcc, sparc_unhandled_trap
+	 add	%g2, 1, %g6
+
+	sllx	%g6, WINDOW_SAVE_SLOT_SHIFT, %g6
+	add	%g1, %g6, %g6
+
+	stx	%l0, [%g6 + (0 * 8)]
+	stx	%l1, [%g6 + (1 * 8)]
+	stx	%l2, [%g6 + (2 * 8)]
+	stx	%l3, [%g6 + (3 * 8)]
+	stx	%l4, [%g6 + (4 * 8)]
+	stx	%l5, [%g6 + (5 * 8)]
+	stx	%l6, [%g6 + (6 * 8)]
+	stx	%l7, [%g6 + (7 * 8)]
+	stx	%i0, [%g6 + (8 * 8)]
+	stx	%i1, [%g6 + (9 * 8)]
+	stx	%i2, [%g6 + (10 * 8)]
+	stx	%i3, [%g6 + (11 * 8)]
+	stx	%i4, [%g6 + (12 * 8)]
+	stx	%i5, [%g6 + (13 * 8)]
+	stx	%i6, [%g6 + (14 * 8)]
+	stx	%i7, [%g6 + (15 * 8)]
+	stx	%sp, [%g6 + WINDOW_SAVE_STACK_POINTER]
+
+	add	%g2, 1, %g2
+	stx	%g2, [%g1]
+
+	saved
+	retry
+.endm
+
+
+/*	Fill a window that belongs to userspace.
+
+	The reverse, and conditional: a slot is only taken if it names the frame being
+	asked for, because a window spilled by the kernel and a window the user itself
+	pushed are indistinguishable from the trap type alone.
+
+	If it does not match -- or nothing is saved -- the window has to come from the
+	user's stack, and that load can fault for all the reasons the spill's store
+	could. Not handled yet: reported, rather than read and hoped for. A user
+	program that walks off its own stack currently stops the machine instead of
+	dying, which is wrong but is wrong in the direction that says so.
+*/
+.macro FILL_USER_WINDOW
+	ldx	[%g7 + TRAP_DATA_WINDOW_SAVE], %g1
+	ldx	[%g1], %g2
+
+	brz,pn	%g2, sparc_unhandled_trap
+	 sllx	%g2, WINDOW_SAVE_SLOT_SHIFT, %g6
+
+	add	%g1, %g6, %g6
+
+	ldx	[%g6 + WINDOW_SAVE_STACK_POINTER], %g4
+	cmp	%g4, %sp
+	bne,pn	%xcc, sparc_unhandled_trap
+	 sub	%g2, 1, %g2
+
+	ldx	[%g6 + (0 * 8)], %l0
+	ldx	[%g6 + (1 * 8)], %l1
+	ldx	[%g6 + (2 * 8)], %l2
+	ldx	[%g6 + (3 * 8)], %l3
+	ldx	[%g6 + (4 * 8)], %l4
+	ldx	[%g6 + (5 * 8)], %l5
+	ldx	[%g6 + (6 * 8)], %l6
+	ldx	[%g6 + (7 * 8)], %l7
+	ldx	[%g6 + (8 * 8)], %i0
+	ldx	[%g6 + (9 * 8)], %i1
+	ldx	[%g6 + (10 * 8)], %i2
+	ldx	[%g6 + (11 * 8)], %i3
+	ldx	[%g6 + (12 * 8)], %i4
+	ldx	[%g6 + (13 * 8)], %i5
+	ldx	[%g6 + (14 * 8)], %i6
+	ldx	[%g6 + (15 * 8)], %i7
+
+	stx	%g2, [%g1]
+
+	restored
+	retry
+.endm
+
+
+FUNCTION(sparc_spill_user):
+	SPILL_USER_WINDOW
+
+
+FUNCTION(sparc_fill_user):
+	FILL_USER_WINDOW
+
+
 FUNCTION(sparc_spill_kernel):
 	SPILL_KERNEL_WINDOW
 
@@ -1012,7 +1138,7 @@ FUNCTION(sparc_iframe_offsets):
  *	a context shift that disagrees masks the wrong bits out of a tag target and
  *	simply misses forever.
  *
- *	void sparc_mmu_defines(uint64 *out);   // eight entries
+ *	void sparc_mmu_defines(uint64 *out);   // eleven entries
  */
 FUNCTION(sparc_mmu_defines):
 	mov	PT_SEGMENT_SHIFT, %o1
@@ -1031,6 +1157,12 @@ FUNCTION(sparc_mmu_defines):
 	stx	%o1, [%o0 + (6 * 8)]
 	mov	TSB_TAG_VA_SHIFT, %o1
 	stx	%o1, [%o0 + (7 * 8)]
+	mov	WINDOW_SAVE_SLOT_SHIFT, %o1
+	stx	%o1, [%o0 + (8 * 8)]
+	mov	WINDOW_SAVE_SLOTS, %o1
+	stx	%o1, [%o0 + (9 * 8)]
+	mov	WINDOW_SAVE_STACK_POINTER, %o1
+	stx	%o1, [%o0 + (10 * 8)]
 	retl
 	 nop
 
@@ -1130,6 +1262,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (17 * 8)]
 	mov	TRAP_DATA_KERNEL_STACK, %o1
 	stx	%o1, [%o0 + (18 * 8)]
+	mov	TRAP_DATA_WINDOW_SAVE, %o1
+	stx	%o1, [%o0 + (19 * 8)]
 	retl
 	 nop
 
@@ -1261,6 +1395,18 @@ FUNCTION(sparc_read_trap_page_table):
 	.org 8b + 128
 .endm
 
+.macro TRAP_GROUP_SPILL_USER
+8:	SPILL_USER_WINDOW
+	.org 8b + 128
+.endm
+
+
+.macro TRAP_GROUP_FILL_USER
+8:	FILL_USER_WINDOW
+	.org 8b + 128
+.endm
+
+
 .macro TRAP_GROUP_FILL
 8:	FILL_KERNEL_WINDOW
 	.org 8b + 128
@@ -1389,14 +1535,15 @@ FUNCTION(sparc_read_trap_page_table):
 	TRAP_UNHANDLED
 	.endr
 
-	/* 0x080-0x09f: spill_0_normal through spill_7_normal.
-	 * 0x0a0-0x0bf: spill_0_other through spill_7_other.
+	/* 0x080-0x09f: spill_0_normal through spill_7_normal -- a kernel window.
+	 * 0x0a0-0x0bf: spill_0_other through spill_7_other -- a user window, which
+	 * the kernel must not store to the address userspace chose.
 	 */
 	.rept 8
 	TRAP_GROUP_SPILL
 	.endr
 	.rept 8
-	TRAP_GROUP_SPILL
+	TRAP_GROUP_SPILL_USER
 	.endr
 
 	/* 0x0c0-0x0df: fill_0_normal through fill_7_normal.
@@ -1406,7 +1553,7 @@ FUNCTION(sparc_read_trap_page_table):
 	TRAP_GROUP_FILL
 	.endr
 	.rept 8
-	TRAP_GROUP_FILL
+	TRAP_GROUP_FILL_USER
 	.endr
 
 	/* 0x100-0x13f: software traps below the system call vector.

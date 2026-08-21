@@ -150,6 +150,9 @@ extern void sparc_switch_address_space(uint32 context,
 */
 extern void sparc_set_kernel_stack(addr_t stackTop);
 
+/*!	Points the user window spill and fill handlers at this thread's save area. */
+extern void sparc_set_window_save(void* area);
+
 /*!	Removes every trace of a context, for reuse by a different team.
 
 	Both caches, because they fail differently. A stale TLB entry is removed by
@@ -251,7 +254,8 @@ struct sparc_trap_data {
 	uint64	trapLocals[8];		// 0x80  %l0-%l7 of the window that trapped
 	uint64	userPageTableRoot;	// 0xc0  the running team's root, physical
 	uint64	kernelStackTop;		// 0xc8  biased, for a trap out of userspace
-	uint64	reserved[6];		// pad to 256 bytes
+	uint64	windowSave;			// 0xd0  this thread's user window save area
+	uint64	reserved[5];		// pad to 256 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -271,6 +275,7 @@ struct sparc_trap_data {
 #define TRAP_DATA_TRAP_RETURN		0x70
 #define TRAP_DATA_USER_PAGE_TABLE	0xc0
 #define TRAP_DATA_KERNEL_STACK		0xc8
+#define TRAP_DATA_WINDOW_SAVE		0xd0
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
@@ -303,7 +308,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		19
+#define TRAP_DATA_OFFSET_COUNT		20
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

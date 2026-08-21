@@ -477,10 +477,10 @@ sparc_mmu_create_tsb_area()
 static void
 sparc_verify_mmu_defines()
 {
-	uint64 assembler[8];
+	uint64 assembler[11];
 	sparc_mmu_defines(assembler);
 
-	const uint64 declared[8] = {
+	const uint64 declared[11] = {
 		SPARC_SEGMENT_TABLE_SHIFT,
 		SPARC_PAGE_DIRECTORY_SHIFT,
 		SPARC_PAGE_TABLE_SHIFT,
@@ -489,15 +489,20 @@ sparc_verify_mmu_defines()
 		TTE_TAG_CONTEXT_SHIFT,
 		TSB_TAG_KERNEL_BIT,
 		TSB_TAG_VA_SHIFT,
+		__builtin_ctzll(SPARC_WINDOW_SAVE_SLOT_SIZE),
+		SPARC_WINDOW_SAVE_SLOTS,
+		SPARC_WINDOW_SAVE_STACK_POINTER,
 	};
 
-	static const char* const kNames[8] = {
+	static const char* const kNames[11] = {
 		"PT_SEGMENT_SHIFT", "PT_DIRECTORY_SHIFT", "PT_TABLE_SHIFT",
 		"PT_INDEX_MASK", "PT_VA_HOLE_SHIFT", "TTE_TAG_CONTEXT_SHIFT",
 		"TSB_TAG_KERNEL_BIT", "TSB_TAG_VA_SHIFT",
+		"WINDOW_SAVE_SLOT_SHIFT", "WINDOW_SAVE_SLOTS",
+		"WINDOW_SAVE_STACK_POINTER",
 	};
 
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < 11; i++) {
 		if (assembler[i] != declared[i]) {
 			panic("sparc mmu define %s: arch_traps.S says %" B_PRIu64
 				", the headers say %" B_PRIu64, kNames[i], assembler[i],
@@ -516,6 +521,14 @@ sparc_verify_mmu_defines()
 	if ((KERNEL_BASE & (KERNEL_BASE - 1)) != 0) {
 		panic("sparc mmu: KERNEL_BASE %#lx is not a power of two, so one bit "
 			"cannot separate kernel addresses from user ones", (addr_t)KERNEL_BASE);
+	}
+
+	// The save area's header has to be exactly one slot, or slot N is not where
+	// the handler's shift says it is.
+	if (offsetof(sparc_window_save, slots) != SPARC_WINDOW_SAVE_SLOT_SIZE) {
+		panic("sparc window save: slots start at %d, not one slot in at %d",
+			(int)offsetof(sparc_window_save, slots),
+			(int)SPARC_WINDOW_SAVE_SLOT_SIZE);
 	}
 
 	uint32 kernelBit = __builtin_ctzll(KERNEL_BASE) - TSB_TAG_VA_SHIFT;
@@ -777,9 +790,13 @@ sparc_verify_trap_table()
 		{ 0x268, "data MMU miss (TL>0)", 0xffffffff, 0xc4d80b20 },
 		// stx %l0, [%sp + 0x7ff] and ldx [%sp + 0x7ff], %l0.
 		{ 0x080, "spill (normal)",       0xffffffff, 0xe073a7ff },
-		{ 0x0a0, "spill (other)",        0xffffffff, 0xe073a7ff },
 		{ 0x0c0, "fill (normal)",        0xffffffff, 0xe05ba7ff },
-		{ 0x0e0, "fill (other)",         0xffffffff, 0xe05ba7ff },
+		// The _other pair go somewhere else entirely -- a window that belongs to
+		// userspace is saved into this thread's save area, not to the address
+		// userspace chose -- so they start by loading that area's pointer out of
+		// the trap data block: ldx [%g7 + TRAP_DATA_WINDOW_SAVE], %g1.
+		{ 0x0a0, "spill (other)",        0xffffffff, 0xc259e0d0 },
+		{ 0x0e0, "fill (other)",         0xffffffff, 0xc259e0d0 },
 		// clr %l0. gas emits the register form, or %g0, %g0, %l0, rather than
 		// the immediate one; the mask keeps the opcode, rd and rs1 and ignores
 		// which form was chosen.
@@ -965,6 +982,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, trapLocals),
 		offsetof(sparc_trap_data, userPageTableRoot),
 		offsetof(sparc_trap_data, kernelStackTop),
+		offsetof(sparc_trap_data, windowSave),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1862,6 +1880,14 @@ void
 sparc_set_kernel_stack(addr_t stackTop)
 {
 	sTrapData.kernelStackTop = stackTop - SPARC_STACK_BIAS;
+}
+
+
+/*!	Points the user window handlers at this thread's save area. */
+void
+sparc_set_window_save(void* area)
+{
+	sTrapData.windowSave = (uint64)(addr_t)area;
 }
 
 

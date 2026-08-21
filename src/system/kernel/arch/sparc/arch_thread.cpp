@@ -178,6 +178,11 @@ arch_thread_context_switch(Thread *from, Thread *to)
 	// in the trap entry because the entry runs on every interrupt.
 	sparc_set_kernel_stack(to->kernel_stack_top);
 
+	// And where the user window spill handler should put windows it cannot write
+	// to the user's stack. Per-thread, so this is a pointer swap rather than a
+	// copy -- see sparc_window_save.
+	sparc_set_window_save(&to->arch_info.windowSave);
+
 	VMAddressSpace* addressSpace = to->team->address_space;
 	if (addressSpace != NULL) {
 		SPARCVMTranslationMap* map = static_cast<SPARCVMTranslationMap*>(

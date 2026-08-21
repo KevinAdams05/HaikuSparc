@@ -71,6 +71,43 @@ struct arch_context {
 		// then drive the trap level below zero.
 };
 
+/*	Where a user register window goes when the kernel has to spill it.
+
+	Not to the user's stack, which is where it belongs and where it cannot be
+	written from. A spill handler runs at trap level one or deeper, and a store to
+	the user's stack can fault there -- the page may be paged out, may be
+	read-only, or the stack pointer may be whatever userspace felt like putting in
+	%sp. A fault at that trap level nests one deeper, and section 2.6 of the
+	porting plan says where that ends.
+
+	So the handler writes here instead: kernel memory, always mapped, always
+	writable, and per-thread so a context switch changes the pointer rather than
+	the contents. The fill side reads it back, and the stack pointer recorded
+	alongside each window is what makes that safe -- a fill only takes a slot that
+	names the frame being asked for.
+
+	Eight slots because there are eight windows and at most seven can be live, so
+	the ninth spill cannot happen. 256 bytes a slot rather than the 136 the
+	contents need, so the handler indexes with a shift instead of a multiply.
+*/
+#define SPARC_WINDOW_SAVE_SLOTS		8
+#define SPARC_WINDOW_SAVE_SLOT_SIZE	256
+#define SPARC_WINDOW_SAVE_REGISTERS	16
+
+struct sparc_window_save {
+	uint64	count;
+		// Slots in use. First, so the handler reaches it without an offset.
+	uint64	_padding[31];
+		// Rounds the header to one slot, so slot N is at base + (N + 1) * 256.
+
+	uint64	slots[SPARC_WINDOW_SAVE_SLOTS][SPARC_WINDOW_SAVE_SLOT_SIZE
+		/ sizeof(uint64)];
+		// Each slot: %l0-%l7, then %i0-%i7, then the biased %sp the window
+		// belongs to. The rest is padding.
+};
+
+#define SPARC_WINDOW_SAVE_STACK_POINTER	(SPARC_WINDOW_SAVE_REGISTERS * 8)
+
 // architecture specific thread info
 struct arch_thread {
 	struct arch_context	context;
@@ -79,6 +116,9 @@ struct arch_thread {
 
 	// used to track interrupts on this thread
 	struct iframe_stack	iframes;
+
+	// See sparc_window_save. Aligned so a slot never straddles a cache line.
+	struct sparc_window_save	windowSave __attribute__((aligned(16)));
 };
 
 struct arch_team {

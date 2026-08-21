@@ -278,6 +278,38 @@ FUNCTION(sparc_enter_userspace):
 #define USER_TEST_MAGIC			0x5ac
 
 FUNCTION(sparc_user_test_program):
+	/*	Nest deeply enough to force a spill.
+
+		sparc_enter_userspace() flushes every window, which leaves CANSAVE at
+		NWINDOWS-2 -- six on this processor. So the seventh `save` has nowhere to
+		go and traps, and because the window being spilled belongs to userspace
+		the hardware picks spill_*_other rather than spill_*_normal. Eight saves
+		to be sure of crossing it.
+
+		Each frame is the ABI minimum, and eight of them is 1408 bytes inside a
+		page, so the spills have somewhere real to write.
+	*/
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+	save	%sp, -176, %sp
+
+	/*	And back out, which is what exercises the fill side: the windows just
+		spilled have to come back from wherever they went.
+	*/
+	restore
+	restore
+	restore
+	restore
+	restore
+	restore
+	restore
+	restore
+
 	mov	USER_TEST_SYSCALL_EXIT, %g1
 	mov	USER_TEST_MAGIC, %o0
 	ta	USER_TEST_SYSCALL_TRAP
