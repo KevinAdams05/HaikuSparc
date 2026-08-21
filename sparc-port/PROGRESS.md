@@ -2602,31 +2602,79 @@ team is handed an id whose translations are still cached, and that is not a slow
 reading another's memory. Single-page invalidation became context-aware for the same reason: one TSB
 serves every address space, so unmapping an address in one team must not throw away another's line.
 
-### The wall
+### The wall, and what was behind it
 
 Contexts decide what the hardware matches. They say nothing about which page table the miss handler
 walks, and it walks exactly one, whose root is in `%g3` from cutover. A user address space has a table
 of its own, so its mappings would never be found. That was not on the list and should have been.
 
-Six instructions should fix it: the same address bit picks between `%g3` and a root the context switch
-leaves in the trap data block. It hangs the machine, reliably, on the first access to a user address --
-which is the `user_memcpy()` probe §27 already runs, and the only user-half access the whole boot makes.
+Six instructions fix it, and they hung the machine on the first access to a user address — the
+`user_memcpy()` probe from §27, the only user-half access the whole boot makes. Twelve boots of
+bisecting gave a result that made no sense: every variant that *used* the loaded root hung, every
+variant that *ignored* it worked, including a branchless one computing the same value. Disassembly
+right each time, loaded value recorded as `0x0`, `MOVcc` and `MOVR` both verified working.
 
-Twelve boots of bisecting, and the result does not resolve. Every variant that uses the loaded root
-hangs; every variant that ignores it works -- **including one that computes the same value the working
-ones use**, branchlessly, with the field initialised to the kernel's own root. The disassembly is right
-in each case. The loaded value was recorded by the handler itself and printed. `MOVcc` and `MOVR` were
-both verified working by a direct probe rather than assumed. `%g7` is the structure's address in both
-global banks, the field is inside the 256 bytes, the structure is in `.bss`, and the page is locked
-cacheable covering all of it.
+I reverted it and wrote it up as unexplained. That was the right call on the code and the wrong call on
+the diagnosis, because I had read *silence* as a hang.
 
-So it is reverted rather than shipped: it is not needed until a user address space exists, and a change
-that reliably hangs the boot to enable something nothing uses yet is the wrong trade. The correct half
-stays -- the field, offset-checked like every other, written by `sparc_switch_address_space()` beside
-the context register it must agree with. Only the reader is missing, which is also why **user address
-spaces do not work yet**, and it is the first thing to fix before they can.
+**The machine was not hung.** One `info registers` through the QEMU monitor put the PC at
+`sparc_unhandled_trap_stop` — a `b,a` to itself — with `%tl` at 2. That is this port's own designed
+behaviour for an unhandled trap at TL>1: record it and park at a named symbol rather than nest toward a
+watchdog reset. The trap data block held the record, and `-d int` held the register file at the faulting
+instruction:
 
-The full bisect is in §3 of the design document, at length, along with the next measurement: run the
-failing build under `-accel tcg,one-insn-per-tb=on` and see whether the hang survives. That one number
-decides whether this is the emulator's translation of the miss handler or ours, and it should come
-before any more reading.
+```
+Unaligned Memory Access (v=0034)   pc: 801b80d0   tl: 1   pstate: 00000414  (MG set)
+%g3 = 0000000000d92000   the kernel page table root, correct
+%g4 = 0000000000000016   the unaligned address
+%g5 = 0000000000000016   the "selected root"
+%g6 = 0000000040000000   Tag Access -- the probe address
+%g7 = 00000000ffe80018   NOT the trap data block
+```
+
+**`%g7` in the MMU global bank held an address inside Open Firmware's own image.** So the handler read
+the firmware's memory, got `0x16`, and used it as a page table root.
+
+`call_open_firmware()` already knew the firmware eats `%g6` and `%g7` — it saves and restores them, with
+a long comment about a timer interrupt that once read `%g7` as an OpenBIOS address. But that save is
+ordinary C at trap level zero, so it saves the **normal** bank, while the firmware's writes land in
+whichever bank its own PSTATE selects. The MMU and alternate banks are separate register files and had
+been rotting since the cutover, four phases ago.
+
+Nothing noticed because nothing read them. The miss handlers keep the trap data pointer in `%g7` and the
+page table root in `%g3` and use neither; the paths that *do* use `%g7` run on the alternate bank, which
+the firmware happened not to disturb. **The root selection was the first code in the kernel ever to
+read `[%g7 + offset]` from the MMU bank.**
+
+`sparc_restore_trap_globals()` now re-establishes both banks after every client call — by calling the
+same function the cutover called, so the two cannot drift — and says once what it found:
+
+```
+sparc_mmu: %g7 in the MMU bank after a firmware call was 0xffe80018,
+           trap data is at 0x8024f800 -- CLOBBERED, and restored each call
+```
+
+With that, the root selection works and stays. User addresses walk the running team's table, kernel
+addresses walk the kernel's, branch-free, and the field is initialised to the kernel's own root so a
+user address with no team current faults rather than walking from physical zero.
+
+### Three lessons, all cheap
+
+**Silence is not a hang.** This port builds a diagnostic for exactly this case and it worked perfectly.
+One `info registers` would have ended the investigation on the first boot instead of the twelfth. The
+instrument was already in my own notes as *the* thing to reach for; I reached for reading instead.
+
+**Bisecting told the truth and was still misleading.** "Every variant that uses the loaded value fails"
+was correct and complete, and pointed at the value rather than at the register it was loaded through.
+
+**A verification that runs once verifies once.** `sparc_verify_trap_globals()` checks `%g7` in both banks
+at boot, passes, and then the value rots. Anything the firmware can reach needs re-establishing, not
+proving once.
+
+### Where that leaves the phase
+
+Step 1 of the userspace design is done: contexts, the TSB comparison that survives them, and a
+per-address-space page table root. A user address space can be mapped and its mappings found. What
+remains is the register windows across the privilege boundary, the syscall path,
+`arch_thread_enter_userspace()`, and a userland — §4 onwards of
+[USERSPACE_DESIGN.md](USERSPACE_DESIGN.md).

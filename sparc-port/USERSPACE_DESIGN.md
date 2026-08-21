@@ -20,7 +20,7 @@ work.
 
 | # | Piece | State |
 | --- | --- | --- |
-| 1 | MMU contexts, and a TSB comparison that survives them | Nothing allocates a context; the fast path assumes zero |
+| 1 | MMU contexts, a TSB comparison that survives them, and a per-address-space page table root | **Done** |
 | 2 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
 | 3 | The syscall path | No trap number chosen; `libroot`'s `syscalls.inc` emits no instructions at all |
 | 4 | `arch_thread_enter_userspace`, signal frames, TLS | Three stubs and a `panic` |
@@ -148,83 +148,89 @@ is the assertion the masking above exists to satisfy. That last part is the one 
 be discovered as a mysterious slowdown.
 
 
-## 3. The page table root — implemented, reverted, and not understood
+## 3. The page table root, and the register the firmware was eating
 
 This was not on the list in section 1, and it should have been. Contexts decide which mappings the
-*hardware* will match. They say nothing about which page table the TLB miss handler walks to find
-them — and that handler walks exactly one, whose physical root is put in `%g3` at cutover and never
-changes. A user address space gets a table of its own, so its mappings would never be found.
+*hardware* will match. They say nothing about which page table the TLB miss handler walks — and that
+handler walks exactly one, whose physical root is put in `%g3` at cutover and never changes. A user
+address space gets a table of its own, so its mappings would never be found.
 
-The fix looks small. The same address bit the fast path already tests for the tag masking says which
-root applies; the kernel's is in `%g3`; the running team's can live in the trap data block beside the
+The fix is small and now works. The same address bit the fast path tests for the tag masking says which
+root applies; the kernel's is in `%g3`; the running team's lives in the trap data block beside the
 context register it has to agree with, written by the same function so the two cannot drift. Six
-instructions in the slow path.
+instructions, branch-free — sign-extend the bit into a mask and select between the two roots with
+`andn`/`and`/`or`.
 
-**It hangs the machine, reliably, and the reason does not survive contact with the evidence.**
+Getting there took a day, because it hung the machine and the hang was three layers away from its
+cause. The path is worth recording, since the same shape will recur.
 
-The symptom is precise. The boot proceeds normally for sixty-three seconds and stops inside
-`user_memcpy()` on the deliberate probe against an unmapped user address — the one arch_int.cpp already
-runs to prove faults are caught. Nothing is printed after it. Every kernel address is unaffected, which
-is why the boot gets that far: the probe is the first and only user-half access the whole boot makes.
+### What it looked like
 
-What the bisect found, one boot per row:
+The boot proceeded normally for sixty-three seconds and stopped inside `user_memcpy()` on the
+deliberate probe against an unmapped user address — the only user-half access the whole boot makes.
+Nothing was printed after it. Twelve boots of bisecting produced a result that made no sense: every
+variant that *used* the loaded root hung, every variant that *ignored* it worked, including a
+branchless one that computed the same value the working ones used. The disassembly was right each time.
+The loaded value was recorded by the handler itself and printed as `0x0`. `MOVcc` and `MOVR` were both
+verified working by a direct probe.
 
-| Slow-path selection | Result |
-| --- | --- |
-| `mov %g3, %g5`, then walk from `%g5` | boots, mounts, probe passes |
-| plus `srlx`/`andcc` to test the address bit | boots, mounts |
-| plus `ldx [%g7 + 0xc0]`, result discarded | boots, mounts |
-| plus a `stx` recording what was loaded | boots, mounts — **records `0x0`** |
-| `movne %xcc, %g3, %g5` then `brz` to the fault exit | hangs in the probe |
-| `movne` then `movrz %g5, %g3, %g5` | hangs earlier, during TSB area setup |
-| `ldx` then `movrz` alone | hangs earlier still |
-| two conditional branches, falling back to `%g3` | hangs in the probe, reproducible across reruns |
-| pure arithmetic — sign-extend the bit into a mask, `andn`/`and`/`or` the two roots, no control flow at all | hangs in the probe |
+At that point the conclusion drawn was "internally contradictory, causes eliminated" — and reverting was
+right, but the diagnosis was not finished. The mistake was reading *silence* as a hang.
 
-Three things were checked rather than assumed. The **disassembly** of every variant is what was
-intended — `movre %g5, %g3, %g5` encodes rcond=RZ, rs1=`%g5`, rs2=`%g3`, rd=`%g5` correctly. The
-**loaded value is zero**, recorded by the handler itself into a spare trap-data word and printed. And
-`MOVcc` and `MOVR` **both work**, verified by a probe that runs them with known inputs in both the
-taken and not-taken direction and prints the results.
+### What it actually was
 
-Which leaves a contradiction. The last row's code ends with `%g5 == %g3` on every path — for a kernel
-address by the branch's delay slot, for a user address because the loaded root is zero and falls back
-— so it is behaviourally identical to the first row, and does strictly *less* work than the fourth. It
-hangs and they do not.
+The machine was not hung. `info registers` on the live guest through the QEMU monitor put the PC at
+`sparc_unhandled_trap_stop` — a `b,a` to itself — with `%tl` at 2. That is this port's own designed
+behaviour: an unhandled trap at TL>1 parks at a named symbol rather than nesting toward a watchdog
+reset. The trap data block had the whole record, and `-d int` had the register file at the faulting
+instruction:
 
-The branchless arithmetic row was run to test the theory that control flow inside the miss handler was
-the trigger. It is not: that variant has none, and it hangs. It was run with the trap-data field
-*initialised to the kernel's root* rather than to zero, so it computes `%g5 = %g3` on both paths by
-construction — and `sparc_kernel_page_table()` is assigned once, and `sparc_verify_trap_globals()`
-already asserts that `%g3` holds exactly it.
+```
+Unaligned Memory Access (v=0034)   pc: 801b80d0   tl: 1   pstate: 00000414  (MG set)
+%g3 = 0000000000d92000   the kernel page table root, correct
+%g4 = 0000000000000016   the unaligned address
+%g5 = 0000000000000016   the "selected root"
+%g6 = 0000000040000000   Tag Access -- the probe address
+%g7 = 00000000ffe80018   NOT the trap data block
+```
 
-So the surviving correlation is narrower and stranger than "data-dependent": **every variant that uses
-the loaded value hangs, and every variant that ignores it works** — including a variant where the
-loaded value provably equals the register the working variants use.
+`%g7` in the **MMU global bank** held an address inside Open Firmware's own image — one of the locked
+512 KB firmware pages. So `ldx [%g7 + 0xc0]` read the firmware's memory, got `0x16`, and used it as a
+page table root.
 
-Which leaves only one shape of explanation: the load does not return what C wrote. Three ways that could
-happen were checked and none of them hold. The trap data block is at `0x8024f800` and `%g7` is exactly
-that in both the MMU and alternate global banks, verified at init. The field is at `+0xc0`, inside the
-256-byte structure, and the structure is in `.bss`. And the page is locked in the D-TLB as
-`va 0x8024e000 -> pa 0xc5a000, 8K, locked priv write global` — cacheable, covering the whole structure,
-so C's store and the handler's load are the same cached line. The initialisation runs inside
-`sparc_install_trap_table()`, before `%tba` is written, so it precedes the first miss our handlers see.
+`call_open_firmware()` already knew the firmware eats `%g6` and `%g7`; it saves and restores them, and
+carries a long comment about a timer interrupt that once read `%g7` as an OpenBIOS address. But that
+save is ordinary C at trap level zero, so it saves the **normal** bank, and the firmware's writes land
+in whichever bank its own PSTATE selects. The MMU and alternate banks are separate register files and
+had been rotting since the cutover.
 
-That is where the investigation stands: an internally contradictory result with the obvious causes
-eliminated. It is written down at this length because the next person to look at it should not have to
-re-derive any of it.
+Nothing noticed for four phases because nothing read them. The miss handlers keep the trap data pointer
+in `%g7` and the page table root in `%g3` and use neither — the fast path reads MMU registers, the slow
+path walks physical addresses out of `%g3`, and the paths that *do* use `%g7`, the fault entry and the
+unhandled-trap reporter, run on the alternate bank, which the firmware happened not to disturb. The
+root selection was the first code in the kernel ever to read `[%g7 + offset]` from the MMU bank.
 
-So it is **reverted** rather than shipped. It is not needed until a user address space exists, and
-shipping a change that reliably hangs the boot to enable something nothing uses yet is the wrong trade.
-The half that is correct and verifiable stays: the trap data block has the field, offset-checked
-against the assembler like every other, and `sparc_switch_address_space()` writes it beside the context
-register. Only the reader is missing — which is also why **user address spaces do not work yet**, and
-this is the first thing to fix before they can.
+`sparc_restore_trap_globals()` re-establishes both banks after every client call, by calling the same
+function the cutover called so the two cannot drift, and reports once what it found:
 
-The next diagnostic, and it is cheap: run the failing build under `-accel tcg,one-insn-per-tb=on`. If
-the hang goes away, it is QEMU's translation of a branch inside the miss handler at TL>0 and the code
-is right; if it stays, it is ours. That single measurement decides which of two very different
-investigations to start, and it should be the first thing tried rather than more reading.
+```
+sparc_mmu: %g7 in the MMU bank after a firmware call was 0xffe80018,
+           trap data is at 0x8024f800 -- CLOBBERED, and restored each call
+```
+
+### Three lessons, all cheap
+
+**Silence is not a hang.** This port builds a diagnostic for exactly this case — record the trap and
+park at a named symbol — and it worked perfectly. One `info registers` would have ended the
+investigation on the first boot instead of the twelfth.
+
+**Bisecting told the truth and it was still misleading.** "Every variant that uses the loaded value
+fails" was correct, complete, and pointed at the value rather than at the register it was loaded
+through. The correlation was real; the inference from it was not.
+
+**A verification that runs once verifies once.** `sparc_verify_trap_globals()` checks `%g7` in both
+banks at boot, passes, and then the value rots. Anything the firmware can reach needs re-establishing
+or re-checking, not proving once.
 
 
 ## 4. Register windows across the boundary
@@ -325,10 +331,9 @@ it — a fact worth stating, because their absence looks like an omission.
 
 ## 6. Order of work
 
-1. **Contexts.** The allocator, the primary context register on address-space switch, and the tag
-   target masking. All three are done. What is *not* done is the page table root the miss handler needs
-   to go with them — §3 — and until that works no user address space can be mapped at all, so this
-   step is the blocker for every step below it rather than a finished one.
+1. **Contexts.** The allocator, the primary context register on address-space switch, the tag target
+   masking, and the per-address-space page table root the miss handler needs to go with them. **Done.**
+   A user address space can now be mapped and its mappings found.
 2. **`arch_thread_enter_userspace` plus the syscall trap.** Together, because neither is observable
    without the other. Test with a hand-built user thread — a page of user memory containing a couple
    of instructions and a `ta` — rather than waiting for a userland. A thread that never executes
@@ -356,4 +361,5 @@ depends on Phase 6's media gap, which is the reason this ordering puts it last r
 | Invalidate a context before returning its id, never after | Invalidate on allocation | The other order has a window where a new team holds an id whose translations are still cached |
 | Spill user windows into a per-thread kernel save area | Store straight to the user stack via `ASI_AS_IF_USER_PRIMARY` | A fault at TL>0 nests toward a watchdog reset. Same rule the miss handler lives by. |
 | `ta 0x40` for syscalls | A low trap number | A stray `ta` with a small immediate hits an unhandled entry that reports |
+| Re-establish the trap global banks after every firmware call | Saving and restoring three banks' worth around each one | Idempotent, two stores per bank, and it calls the same function the cutover did so it cannot drift |
 | Arguments in the ABI's reserved slots at `%sp + BIAS + 128` | A separate argument buffer the stub builds | The slots exist for exactly this; stack arguments already continue from there |
