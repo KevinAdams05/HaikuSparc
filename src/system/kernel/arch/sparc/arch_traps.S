@@ -75,7 +75,8 @@
 #define TRAP_DATA_WINDOW_STATE		0x78
 #define TRAP_DATA_LOCALS		0x80
 #define TRAP_DATA_USER_PAGE_TABLE	0xc0
-#define TRAP_DATA_OFFSET_COUNT		18
+#define TRAP_DATA_KERNEL_STACK		0xc8
+#define TRAP_DATA_OFFSET_COUNT		19
 
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
@@ -136,6 +137,10 @@
  *	values are checked against it at init by sparc_verify_mmu_defines(), which
  *	derives the second from KERNEL_BASE rather than trusting either copy.
  */
+// TSTATE_PRIV, from arch_int.h: PSTATE occupies TSTATE bits 20:8, so PRIV's
+// 0x004 lands at 0x400.
+#define TSTATE_PRIV			0x400
+
 #define TTE_TAG_CONTEXT_SHIFT		48
 #define TSB_TAG_VA_SHIFT		22
 #define TSB_TAG_KERNEL_BIT		9
@@ -702,7 +707,36 @@ sparc_unhandled_trap_stop:
  *	itself, silently.
  */
 .macro TRAP_TO_C handler, raise_pil, save_outs=0
-	save	%sp, -(SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
+	/*	Which stack this trap's frame goes on.
+	 *
+	 *	For a trap from the kernel, below the frame of whatever trapped -- which
+	 *	is what `save %sp, -N, %sp` does, and what this used to be
+	 *	unconditionally.
+	 *
+	 *	For a trap from userspace it cannot be that. %sp then belongs to the user,
+	 *	who chose it: the page may not be mapped, may not be writable, may not be
+	 *	aligned, and may point at something the user would like the kernel to
+	 *	overwrite for them. So the frame goes on this thread's kernel stack, whose
+	 *	biased and already-adjusted top the context switch leaves in the trap data
+	 *	block.
+	 *
+	 *	`save rs1, rs2, rd` computes in the *old* window and writes rd in the new
+	 *	one, and the globals are shared by both -- which is what lets the address
+	 *	be worked out here and land in the new window's %sp either way.
+	 *
+	 *	%g1 and %g2 only. %g3 holds the page table root in the MMU bank and the
+	 *	fault path arrives here with that bank selected, so clobbering it would
+	 *	break the next miss rather than this trap.
+	 */
+	rdpr	%tstate, %g1
+	sub	%sp, (SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %g2
+	andcc	%g1, TSTATE_PRIV, %g0
+	bne,pt	%xcc, 7f
+	 nop
+	ldx	[%g7 + TRAP_DATA_KERNEL_STACK], %g2
+	sub	%g2, (SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %g2
+7:
+	save	%g2, %g0, %sp
 
 	/* The trap registers first, while they still exist. */
 	rdpr	%tstate, %l0
@@ -1094,6 +1128,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (16 * 8)]
 	mov	TRAP_DATA_USER_PAGE_TABLE, %o1
 	stx	%o1, [%o0 + (17 * 8)]
+	mov	TRAP_DATA_KERNEL_STACK, %o1
+	stx	%o1, [%o0 + (18 * 8)]
 	retl
 	 nop
 

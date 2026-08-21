@@ -12,6 +12,23 @@
  *	describe, so the two copies cannot drift apart unnoticed.
  */
 #define SPARC_MINIMUM_FRAME_SIZE	176
+
+// PSTATE fields, from arch_thread_types.h, which this file cannot include.
+// Checked against it by sparc_verify_context_layout().
+#define PSTATE_IE			0x002
+#define PSTATE_PRIV			0x004
+#define PSTATE_PEF			0x010
+
+
+/*	%g2 and %g3 are the SPARC V9 "application" globals and %g6/%g7 are reserved
+ *	for system software, so the assembler insists they be declared before use.
+ *	Scratch is right for sparc_enter_userspace(), which never returns: the values
+ *	it leaves in them belong to nobody.
+ */
+.register %g2, #scratch
+.register %g3, #scratch
+.register %g6, #scratch
+.register %g7, #scratch
 #define CONTEXT_SP			0
 #define CONTEXT_PC			8
 #define CONTEXT_PSTATE			16
@@ -154,3 +171,110 @@ FUNCTION(sparc_context_offsets):
 	retl
 	 nop
 FUNCTION_END(sparc_context_offsets)
+
+
+/*	Drops into userspace, and does not come back.
+
+	void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
+		uint64 arg1, uint64 arg2);
+
+	The stack pointer is biased -- SPARC V9 keeps %sp at the frame address minus
+	2047 -- because that is the form the hardware wants and the caller is the one
+	that knows the frame it built.
+
+	Everything that has to survive is moved into globals first, because the
+	window registers are precisely what is about to be thrown away.
+*/
+FUNCTION(sparc_enter_userspace):
+	mov	%o0, %g1			// entry
+	mov	%o1, %g2			// stack pointer, biased
+	mov	%o2, %g4			// arg1
+	mov	%o3, %g5			// arg2
+
+	/*	Nothing of the kernel's may be left in a register window.
+
+		Two reasons, and the second is the one that bites. Userspace can read
+		any window below the current one with `restore`, so kernel values left
+		there are readable. And a spill from userspace writes a whole window to
+		the user's stack -- so a kernel value still sitting in one would be
+		written out to memory the user owns, whether it reads it or not.
+	*/
+	flushw
+
+	/*	Trap level 1, where %tpc, %tnpc and %tstate exist to be written. `done`
+		takes it back to zero.
+	*/
+	wrpr	%g0, 1, %tl
+
+	wrpr	%g1, 0, %tpc
+	add	%g1, 4, %g1
+	wrpr	%g1, 0, %tnpc
+
+	/*	TSTATE, which is what `done` restores PSTATE and CWP from: CWP in bits
+		4:0, PSTATE in bits 20:8. Privilege dropped, interrupts enabled, FPU
+		usable. CCR and ASI are left zero -- a thread that has never run has
+		nothing in them, and handing userspace a condition code the kernel
+		happened to leave behind is a leak for no benefit.
+
+		CWP is this window's, so `done` returns into the window this code is
+		running in. That is what makes the three moves below work: they write
+		the registers userspace will start with, directly.
+	*/
+	rdpr	%pstate, %g3
+	andn	%g3, PSTATE_PRIV, %g3
+	or	%g3, PSTATE_IE | PSTATE_PEF, %g3
+	sllx	%g3, 8, %g3
+	rdpr	%cwp, %g6
+	or	%g3, %g6, %g3
+	wrpr	%g3, 0, %tstate
+
+	mov	%g2, %sp
+	mov	%g4, %o0
+	mov	%g5, %o1
+
+	/*	The globals are not cleared, and %g7 is the reason: it holds the kernel's
+		thread pointer, and the trap handlers read it to find out which thread
+		took the trap. Zeroing it here would make the first trap out of userspace
+		dereference null.
+
+		So userspace can see it, and userspace changing it would make the next
+		trap read the wrong thread. That is a real hole and it is where thread
+		local storage will have to be dealt with -- SPARC userspace wants %g7 for
+		its own thread pointer, which is the same register for the same reason.
+		Noted rather than papered over; nothing runs in userspace yet that could
+		exploit it. See sparc-port/USERSPACE_DESIGN.md.
+	*/
+	done
+
+
+/*	The program that runs in userspace, to prove userspace runs.
+
+	Copied into a user page by sparc_test_userspace(), so it must be position
+	independent and touch nothing but its own registers -- no stack, no globals
+	other than the one the calling convention gives it, and no memory at all.
+
+	The two constants have to agree with SPARC_SYSCALL_TRAP and
+	SPARC_SYSCALL_TEST_EXIT in arch_int.h, which this file cannot include. A
+	disagreement is caught by the test itself rather than by a check: the wrong
+	trap number lands on an unhandled vector and the wrong index falls through to
+	the "unimplemented call" path, and either way the test does not pass.
+
+	It reports a value the kernel did not choose, so that "the trap happened"
+	and "the trap happened where I meant it to" are distinguishable.
+*/
+#define USER_TEST_SYSCALL_TRAP		0x40
+#define USER_TEST_SYSCALL_EXIT		0x555
+#define USER_TEST_MAGIC			0x5ac
+
+FUNCTION(sparc_user_test_program):
+	mov	USER_TEST_SYSCALL_EXIT, %g1
+	mov	USER_TEST_MAGIC, %o0
+	ta	USER_TEST_SYSCALL_TRAP
+
+	/*	Not reached: the handler does not return here. Spinning rather than
+		falling through, because what follows in the page is whatever the page
+		had in it.
+	*/
+1:	ba,a	1b
+	 nop
+FUNCTION(sparc_user_test_program_end):

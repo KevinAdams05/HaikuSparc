@@ -171,6 +171,11 @@ arch_thread_context_switch(Thread *from, Thread *to)
 	// loaded, which is harmless for the same reason: it has no low-half mappings
 	// to be confused about. Writing the kernel's id for it would cost a store
 	// and buy nothing.
+	// Where a trap out of userspace will build its frame. Per-thread, because
+	// each thread has its own kernel stack, and recorded here rather than derived
+	// in the trap entry because the entry runs on every interrupt.
+	sparc_set_kernel_stack(to->kernel_stack_top);
+
 	VMAddressSpace* addressSpace = to->team->address_space;
 	if (addressSpace != NULL) {
 		SPARCVMTranslationMap* map = static_cast<SPARCVMTranslationMap*>(

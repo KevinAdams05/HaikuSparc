@@ -9,6 +9,7 @@
 #include <stddef.h>
 
 #include <arch_cpu.h>
+#include <arch_thread_types.h>
 #include <arch_vm_translation_map.h>
 #include <debug.h>
 #include <platform/openfirmware/openfirmware.h>
@@ -963,6 +964,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, trapWindowState),
 		offsetof(sparc_trap_data, trapLocals),
 		offsetof(sparc_trap_data, userPageTableRoot),
+		offsetof(sparc_trap_data, kernelStackTop),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1848,6 +1850,18 @@ sparc_report_mmu_global()
 		B_PRIx64 ", trap data is at %p -- %s\n", sMmuGlobalAfterCall,
 		&sTrapData, clobbered ? "CLOBBERED, and restored each call"
 			: "unchanged");
+}
+
+
+/*!	Records this thread's kernel stack, for a trap out of userspace to land on.
+
+	Biased, as SPARC V9 stack pointers are, so that the trap entry can treat it
+	the same way it treats the %sp it would otherwise have used.
+*/
+void
+sparc_set_kernel_stack(addr_t stackTop)
+{
+	sTrapData.kernelStackTop = stackTop - SPARC_STACK_BIAS;
 }
 
 
