@@ -21,10 +21,10 @@ work.
 | # | Piece | State |
 | --- | --- | --- |
 | 1 | MMU contexts, a TSB comparison that survives them, and a per-address-space page table root | **Done** |
-| 2 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
-| 3 | The syscall path | No trap number chosen; `libroot`'s `syscalls.inc` emits no instructions at all |
-| 4 | `arch_thread_enter_userspace`, signal frames, TLS | Three stubs and a `panic` |
-| 5 | A userland to run | Phase 6's packaging gap, seen from the other side |
+| 2 | The syscall trap, and entering userspace | **Done** — `ta 0x40`, and an instruction runs unprivileged |
+| 3 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
+| 4 | Signal frames, TLS, and the `%g7` question `sparc_enter_userspace()` leaves open | Stubs |
+| 5 | A userland to run | `libroot`'s `syscalls.inc` emits no instructions at all; plus Phase 6's packaging gap |
 
 Items 1 and 2 are prerequisites for everything else and are independent of each other, so they can be
 built and tested in either order. Item 1 is testable without any of the others, which makes it the
@@ -285,6 +285,55 @@ assembler cannot see and which therefore needs the same offset-verification trea
 `sparc_verify_context_layout()` already gives `arch_context`.
 
 
+## 4a. Open: the map lock's holder goes to zero
+
+The boot panics after the mount, in `launch_daemon`'s address space teardown:
+
+```
+PANIC: mutex_destroy(): the lock (0x8100def8) is held by 0, not by the caller
+```
+
+Reachable now only because `Map()` finally succeeds. Before the page table root
+was allocated, every `Map()` failed immediately, so a user map's lock was taken
+and released and nothing else happened; the map was then destroyed cleanly. Now
+the map is actually used, and by the time it is destroyed its lock's holder is 0
+rather than the -1 an unheld mutex carries.
+
+**Not caused by the userspace work.** It happens with `sparc_test_userspace()`
+disabled, so it is `launch_daemon`'s address space and not the probe's.
+
+What has been eliminated, so the next attempt does not repeat it:
+
+- **Object corruption.** Instrumenting the destructor printed the lock's own
+  address, matching the panic exactly, with `holder` reading **-1** and
+  `recursion` 0 — an initialised, unheld lock. The object is intact.
+- **The value changing across the report.** Re-read immediately after the
+  `dprintf` and compared: unchanged. So the same field reads -1 from the
+  destructor and 0 from `mutex_destroy()` a call later, which is the part that
+  does not fit any model yet.
+- **Double destruction.** One destructor report per boot.
+- **A `KDEBUG` layout disagreement** between `SPARCVMTranslationMap.cpp` and
+  `lock.cpp`. `fLock.lock.holder` only compiles when `KDEBUG` is on, and
+  `mutex_destroy()`'s check is `#if KDEBUG`, so both translation units see the
+  same struct.
+- **A spinlock write spilling into the neighbouring field.** `holder` sits
+  immediately after the mutex's `spinlock` and `mutex_destroy()` acquires it, so
+  a 64-bit atomic on a 32-bit field would zero `holder` exactly as observed. It
+  does not: both `try_acquire_spinlock()` and `release_spinlock()` compile to
+  `swap [%i0], %g1`, which is 32-bit.
+
+The lead worth following: `recursive_lock_unlock()` writes the holder from
+`thread_get_current_thread_id()`, which on this port is a read of `%g7` — and
+`%g7` has already produced one hard bug this week, in a different register bank.
+A `%g7` that is momentarily wrong would write a wrong holder and nothing would
+notice until the lock was destroyed. Check it by sampling `%g7` against
+`thread_get_current_thread()` across the paths that take this lock, rather than
+by reading more of `lock.cpp`.
+
+And measure before theorising: the destructor's own report is already written and
+was what eliminated three of the five theories above.
+
+
 ## 5. The syscall path
 
 ### The trap number
@@ -334,10 +383,10 @@ it — a fact worth stating, because their absence looks like an omission.
 1. **Contexts.** The allocator, the primary context register on address-space switch, the tag target
    masking, and the per-address-space page table root the miss handler needs to go with them. **Done.**
    A user address space can now be mapped and its mappings found.
-2. **`arch_thread_enter_userspace` plus the syscall trap.** Together, because neither is observable
-   without the other. Test with a hand-built user thread — a page of user memory containing a couple
-   of instructions and a `ta` — rather than waiting for a userland. A thread that never executes
-   `save` needs none of item 3, which is what makes this a step and not a leap.
+2. **`arch_thread_enter_userspace` plus the syscall trap. Done.** An instruction runs in userspace,
+   in its own context-tagged address space, and traps back with a value it chose. Three things had to
+   go with it: the page table root allocated on demand, the trap entry choosing a kernel stack rather
+   than the user's, and user page table teardown. One thing came out of it and is still open — §4a.
 3. **The `_other` window handlers.** Then extend the test thread to `save` and `restore` and nest a
    few calls deep, which is what actually exercises them.
 4. **Signals and TLS.** `arch_setup_signal_frame`, `arch_restore_signal_frame`,

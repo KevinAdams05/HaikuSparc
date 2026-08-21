@@ -2678,3 +2678,97 @@ per-address-space page table root. A user address space can be mapped and its ma
 remains is the register windows across the privilege boundary, the syscall path,
 `arch_thread_enter_userspace()`, and a userland — §4 onwards of
 [USERSPACE_DESIGN.md](USERSPACE_DESIGN.md).
+
+
+## 33. An instruction runs in userspace
+
+```
+sparc_int: userspace: context 1, page table 0x11ba000, code at 0x20000000
+sparc_int: userspace returned 0x5ac of 0x5ac -- ran in userspace
+```
+
+Three instructions, in their own address space, unprivileged, trapping back through the system call
+vector with a value the kernel did not pick. The order the design document set out held up: contexts
+first, then the syscall trap and the entry together, and the register windows last — because a user
+thread that never executes `save` needs none of the window work, which is what turns the second step
+into a step rather than a leap.
+
+### The syscall trap, tested without a userland
+
+`ta 0x40`, trap type 0x140, with the calling convention the ABI already implies: index in `%g1`, six
+arguments in `%o0`–`%o5`, result in `%o0`. Arguments past six live where the ABI puts them, on the
+caller's stack, which the kernel reads with `user_memcpy()` like any other user pointer.
+
+The entry is one line, because `TRAP_TO_C` already does all of it. What it needed was the argument
+registers. A trap does not rotate CWP, so the `save` inside `TRAP_TO_C` turns the caller's `%o0`–`%o5`
+into the handler's `%i0`–`%i5` — the convention working for free, and simultaneously the reason C cannot
+see them. So `iframe` gained `out[6]`, filled and restored only when asked, since the interrupt path
+takes tens of thousands of traps a boot and has no use for them.
+
+Advancing past the trapping instruction is the handler's job, not the entry's, because `TRAP_TO_C`
+already reloads `%tpc` and `%tnpc` from the frame — the same mechanism that turns an unresolvable page
+fault into a jump to the thread's fault handler. One assignment, and a call that needs to restart
+itself simply does not make it.
+
+All of which is testable **from kernel mode**, because `ta` traps identically at either privilege level.
+That is the whole reason this came before entering userspace: the table entry, the iframe, the drop to
+trap level zero, the arguments arriving, the result getting home and the return landing *after* the trap
+were all checked with no userland in sight. The last of those earns its own assertion — a trap returns
+with `retry`, so a system call that forgets to move `%tnpc` into `%tpc` loops forever, and the symptom
+is a hang with no output rather than a wrong answer.
+
+### Then three things that were not on the list
+
+**A trap out of userspace must not build its frame on the user's stack.** `TRAP_TO_C` began with
+`save %sp, -N, %sp`, which is right from the kernel and unusable from userspace: `%sp` then belongs to
+the user, who chose it. The entry now reads `TSTATE.PRIV` and takes this thread's kernel stack out of
+the trap data block instead. `save rs1, rs2, rd` computes in the old window and writes `rd` in the new
+one, and globals are shared by both, which is what lets the address be worked out before the save and
+land in the new window's `%sp` either way. `%g1` and `%g2` only — `%g3` holds the page table root in the
+MMU bank and the fault path arrives with that bank selected, which is §32's lesson applied before rather
+than after.
+
+**Nothing allocated a user page table root.** A user map is created before anything is mapped into it,
+so `fPageTable` started at zero and stayed there, and the walk then read physical address zero and
+called the bottom of memory a segment table. A comment claimed the first `Map()` would allocate one; it
+did not. The root is the one level the walk cannot allocate for itself, because it is where the walk
+starts.
+
+**User page table teardown**, which was a `panic("not implemented")` and is now written. Only the
+tables: the pages they described belong to the areas that mapped them, and the VM has unmapped every
+area by the time an address space dies — so a non-zero leaf entry is a mapping somebody failed to
+remove, not a page to free, and freeing it would hand out memory that is still referenced.
+
+### `retry`, not `done`
+
+The bug worth remembering. `RETRY` takes PC from TPC and NPC from TNPC. `DONE` takes PC from TNPC and
+NPC from TNPC + 4 — it exists to *skip* the instruction that trapped, which is exactly what a system
+call return wants and exactly the opposite of what an entry wants.
+
+Written with `done`, userspace began one instruction in, with whatever the entry code had left in `%g1`,
+and reported a system call index of `0x20000004` — the code address plus four. The wrong answer named
+its own cause, which is the useful kind.
+
+The other self-inflicted one: restoring the user page table root to *zero* on the way out stopped the
+boot at the first device interrupt. The miss handler selects by address, and "user address" there means
+anything below `KERNEL_BASE`, which includes the firmware's low identity mappings. It goes back to the
+kernel's own root.
+
+### The boot now panics, and it is not this
+
+After the mount, in `launch_daemon`'s address space teardown: `mutex_destroy()` finds the map lock's
+holder set to 0. It happens with the userspace probe disabled, so it belongs to a real team's address
+space and not to the test. It is reachable now only because `Map()` finally succeeds — before, every
+`Map()` failed and the lock was taken, released, and never used again.
+
+§4a of [USERSPACE_DESIGN.md](USERSPACE_DESIGN.md) has it: five theories eliminated by measurement
+rather than by reading, including the tempting one — `holder` sits immediately after the mutex's
+spinlock, so a 64-bit atomic on a 32-bit field would zero it exactly as observed, and both spinlock
+paths compile to a 32-bit `swap`. The lead is `%g7` again, from a different direction:
+`recursive_lock_unlock()` writes the holder from `thread_get_current_thread_id()`, which here is a read
+of `%g7`.
+
+Worth stating plainly: **the tree panics on every boot**, after the volume mounts. It panicked in the
+same place before this work, with a different message, because teardown was unimplemented. That is a
+different panic in the same never-exercised path rather than a regression — but it is a panic, and it is
+the next thing.
