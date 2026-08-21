@@ -2772,3 +2772,72 @@ Worth stating plainly: **the tree panics on every boot**, after the volume mount
 same place before this work, with a different message, because teardown was unimplemented. That is a
 different panic in the same never-exercised path rather than a regression — but it is a panic, and it is
 the next thing.
+
+
+## 34. The teardown panic: a member that was never ours
+
+Closed, and the fix is a deletion.
+
+`fLock` is declared by `VMTranslationMap`, initialised by its constructor and destroyed by its
+destructor. `SPARCVMTranslationMap` did both again, on the same inherited member — so the lock was
+destroyed twice, the derived destructor first and the base's automatically after it. And
+`mutex_destroy()` marks a destroyed mutex by setting its holder to 0:
+
+```c
+	lock->name = NULL;
+	lock->flags = 0;
+#if KDEBUG
+	lock->holder = 0;
+```
+
+So the second destroy found 0 where it wanted -1 and panicked with the value the first one had written.
+
+Two things hid it for four phases. The `panic("teardown not implemented")` that used to stand where the
+page table teardown is now fired *first*, before the base destructor could run — so implementing
+teardown exposed this rather than caused it. And the check is `holder != -1 && current thread != holder`,
+so a thread whose id is 0 — which is every thread during early boot — matches a destroyed lock and
+passes. Zeroed mutexes were being destroyed all through early boot without complaint. `launch_daemon`
+was simply the first real thread to do it.
+
+### How a day was spent not finding it
+
+Worth writing down, because the failure was methodological rather than technical.
+
+The destructor read the holder as -1. The panic, one call later, read 0. Same address — verified. Same
+struct layout — measured from both translation units and from the binary, not reasoned about. Unchanged
+across a full memory barrier. Not the spinlock's atomic, which is a 32-bit `swap` four bytes below.
+Not `mutex_init_etc()`, which does write -1. Not the page table teardown, which the panic survives
+leaking. Not the trap entry's stack switch, which it survives reverting. Not the userspace probe, which
+it survives disabling.
+
+Seven eliminations, every one of them sound, and all of them useless — because the premise underneath
+was wrong. There was never one destruction to explain. Two calls, and the report and the panic were
+looking at different ones.
+
+What ended it was **instrumenting the callee instead of the caller**: log every `mutex_destroy()` with
+`__builtin_return_address(0)` and look for an address that appears twice.
+
+```
+MD 0x8100de58 0x801ce930 -1      the derived destructor, healthy
+MD 0x8100de58 0x801cea14  0      the base's, panics
+```
+
+One boot. The lesson is not "instrument more" — it is that a contradiction between two measurements is
+evidence about the *model*, not about the memory. Both readings were right. The assumption that they
+described the same event was the bug, and it was mine, and it survived seven experiments designed to
+test everything except it.
+
+Same shape as §32, where a bisect was correct and complete and pointed at the value rather than at the
+register it was loaded through. Twice in two days: when elimination keeps succeeding and the answer
+keeps not appearing, the thing to question is the frame, not the next candidate.
+
+### Where the boot ends now
+
+```
+sparc_int: userspace returned 0x5ac of 0x5ac -- ran in userspace
+bfs: mounted "Haiku" (root node at 2051, device = /dev/disk/ata/0/slave/raw)
+error starting "/boot/system/servers/launch_daemon" error = -1
+```
+
+No panics. That last line is correct rather than a failure: there is no userland on the volume to start.
+It is also the whole of what is left before Haiku runs something of its own.

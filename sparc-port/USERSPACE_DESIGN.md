@@ -317,7 +317,56 @@ only in the registers. Getting it wrong gives an intermittent fault in ordinary
 kernel code, which is the worst failure mode this port has produced so far and
 took two sessions to find last time.
 
-So: handlers first, reachability second, and the second with a clear head.
+### And WSTATE, which the first version of this section missed
+
+Working the accounting through properly turns up something the design above got
+wrong, and it is worth stating because it changes what has to be written.
+
+`OTHERWIN` is not the only selector. The trap type for a spill is
+`0x80 + 4 × WSTATE.NORMAL` when `OTHERWIN` is zero and
+`0xa0 + 4 × WSTATE.OTHER` when it is not — which is why there are eight groups of
+each rather than one. `WSTATE` is how the operating system says *which* handler a
+spill should use, and it has a normal half and an other half precisely so that
+"spilling my own window" and "spilling the other privilege level's window" can be
+answered differently.
+
+The consequence: **`spill_*_normal` needs a user variant too.** A user program that
+nests deeply spills its own windows while running unprivileged. `OTHERWIN` is zero
+then — the kernel is not involved — so the hardware picks `_normal`, and today
+that is the kernel handler storing to the user's stack with kernel privilege. The
+store lands in the right place and skips the page protections, which is wrong for
+the same reason the `_other` case was: it should be an `ASI_AS_IF_USER_PRIMARY`
+store that faults if the user cannot write there.
+
+So `WSTATE.NORMAL` wants one value while the kernel runs and another while
+userspace does, set on the way in and out alongside the `OTHERWIN` transfer.
+
+### And the save area has to be emptied before returning to userspace
+
+The other thing the accounting forces. Leaving user windows in the kernel's save
+area across a return does not work: on the way out the kernel restores
+`CANRESTORE` from `OTHERWIN`, and a `restore` past the live windows then traps to
+a fill with `OTHERWIN` at zero — the `_normal` vector, which is not where the
+saved copies are.
+
+Which is what §4's "copy it out later at TL=0" means concretely: before returning
+to userspace, whatever is in the save area is written to the user's stack from
+C, where a fault is an ordinary page fault and can page the stack in or kill the
+thread. Linux calls this `fault_in_user_windows` and does it in its return path
+for exactly this reason. `thread_at_kernel_exit()` is the natural hook here.
+
+So the full piece is four parts, and only the first is written:
+
+1. **The `_other` handlers and the save area.** Done.
+2. `WSTATE` and the `OTHERWIN` transfer on kernel entry and exit.
+3. A user variant of the `_normal` spill and fill, storing through
+   `ASI_AS_IF_USER_PRIMARY`.
+4. Flushing the save area to the user stack at TL=0 before returning to
+   userspace, and `OTHERWIN` and `WSTATE` preserved in `arch_context` across a
+   context switch — because the handler between entry and exit can block, and a
+   switch does `flushw`.
+
+Handlers first, reachability second, and the second with a clear head.
 
 
 ### Where the save area lives
