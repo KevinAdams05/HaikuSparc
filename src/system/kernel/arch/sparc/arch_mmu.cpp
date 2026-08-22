@@ -983,6 +983,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, userPageTableRoot),
 		offsetof(sparc_trap_data, kernelStackTop),
 		offsetof(sparc_trap_data, windowSave),
+		offsetof(sparc_trap_data, currentThread),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1539,6 +1540,11 @@ sparc_install_trap_table(struct kernel_args *args)
 	// bottom of physical memory as a page table. The context switch replaces it.
 	sTrapData.userPageTableRoot = sparc_kernel_page_table();
 
+	// Whatever is current now, so a trap taken before the first context switch
+	// loads a real thread pointer rather than zero. The boot thread is a real
+	// Thread; it simply has an id of 0.
+	sTrapData.currentThread = (uint64)(addr_t)thread_get_current_thread();
+
 	// Where an unresolved miss goes to be reported. Set before %tba, so the very
 	// first miss after the cutover already has somewhere to complain to.
 	sTrapData.reportHandler = (uint64)(addr_t)&sparc_report_unresolved_miss;
@@ -1880,6 +1886,14 @@ void
 sparc_set_kernel_stack(addr_t stackTop)
 {
 	sTrapData.kernelStackTop = stackTop - SPARC_STACK_BIAS;
+}
+
+
+/*!	Records what %g7 must be for kernel C code. See the header. */
+void
+sparc_set_current_thread(void* thread)
+{
+	sTrapData.currentThread = (uint64)(addr_t)thread;
 }
 
 

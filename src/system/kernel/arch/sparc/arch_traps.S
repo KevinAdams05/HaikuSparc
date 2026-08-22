@@ -77,7 +77,8 @@
 #define TRAP_DATA_USER_PAGE_TABLE	0xc0
 #define TRAP_DATA_KERNEL_STACK		0xc8
 #define TRAP_DATA_WINDOW_SAVE		0xd0
-#define TRAP_DATA_OFFSET_COUNT		20
+#define TRAP_DATA_CURRENT_THREAD	0xd8
+#define TRAP_DATA_OFFSET_COUNT		21
 
 /*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
  *	the first word; slot N starts at base + (N + 1) * 256, so the header occupies
@@ -882,9 +883,24 @@ sparc_unhandled_trap_stop:
 	 * which is worse than not switching at all: the handler would save one
 	 * bank's globals and restore them into another.
 	 */
+	/*	The thread pointer kernel C code must see, read while the trap's own
+		global bank is still selected -- the trap data block is reached through
+		*that* bank's %g7, and the normal bank's belongs to whoever was
+		interrupted.
+	 *
+	 *	Which is the whole point: userspace owns the normal %g7 while it runs,
+	 *	because that is where SPARC keeps the thread pointer for thread local
+	 *	storage. So a trap out of userspace finds a value userspace chose there,
+	 *	and every thread_get_current_thread() in the handler would follow it.
+	 *
+	 *	%l6 carries it across the bank switch, because window registers are not
+	 *	banked. It is free until the epilogue reloads %pil into it.
+	 */
+	ldx	[%g7 + TRAP_DATA_CURRENT_THREAD], %l6
+
 	rdpr	%pstate, %l5
-	andn	%l5, PSTATE_AG | PSTATE_MG | PSTATE_IG, %l6
-	wrpr	%l6, 0, %pstate
+	andn	%l5, PSTATE_AG | PSTATE_MG | PSTATE_IG, %l5
+	wrpr	%l5, 0, %pstate
 
 	/* The frame sits above this window's own save area. */
 	add	%sp, SPARC_MINIMUM_FRAME_SIZE + BIAS, %l7
@@ -896,6 +912,12 @@ sparc_unhandled_trap_stop:
 	stx	%g5, [%l7 + IFRAME_G5]
 	stx	%g6, [%l7 + IFRAME_G6]
 	stx	%g7, [%l7 + IFRAME_G7]
+
+	/*	And now overwrite it, after the interrupted code's value is safely in the
+		frame. The epilogue restores it from there, so userspace gets its own %g7
+		back on the way out and never sees the kernel's.
+	 */
+	mov	%l6, %g7
 
 	/* The data MMU's fault status and address, before anything else can
 	 * overwrite them. Meaningless for traps that do not set them, and cheaper to
@@ -1207,6 +1229,21 @@ FUNCTION(sparc_set_trap_globals):
 	mov	%o0, %g7
 	mov	%o1, %g3
 
+	/*	And the interrupt bank, which was left out until something read it.
+	 *
+	 *	UltraSPARC-IIi gives the interrupt traps a bank of their own, selected by
+	 *	PSTATE.IG (TABLE 14-12) -- that was section 22's bug, a handler running on
+	 *	the wrong bank because only AG was cleared. Nothing read %g7 there, so
+	 *	nothing noticed it was never written, until TRAP_TO_C started loading the
+	 *	current thread out of the trap data block through whichever bank the trap
+	 *	selected. An interrupt then read a garbage pointer and reported a thread
+	 *	of -1.
+	 */
+	or	%o3, PSTATE_IG, %o4
+	wrpr	%o4, 0, %pstate
+	mov	%o0, %g7
+	mov	%o1, %g3
+
 	/* Restores the normal bank and the caller's interrupt state at once. */
 	wrpr	%o2, 0, %pstate
 	retl
@@ -1264,6 +1301,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (18 * 8)]
 	mov	TRAP_DATA_WINDOW_SAVE, %o1
 	stx	%o1, [%o0 + (19 * 8)]
+	mov	TRAP_DATA_CURRENT_THREAD, %o1
+	stx	%o1, [%o0 + (20 * 8)]
 	retl
 	 nop
 

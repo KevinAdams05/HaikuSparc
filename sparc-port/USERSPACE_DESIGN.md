@@ -23,7 +23,7 @@ work.
 | 1 | MMU contexts, a TSB comparison that survives them, and a per-address-space page table root | **Done** |
 | 2 | The syscall trap, and entering userspace | **Done** — `ta 0x40`, and an instruction runs unprivileged |
 | 3 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
-| 4 | Signal frames, TLS, and the `%g7` question `sparc_enter_userspace()` leaves open | Stubs |
+| 4 | Signal frames and TLS. The `%g7` question is settled — §4b | Stubs |
 | 5 | A userland to run | `libroot`'s `syscalls.inc` emits no instructions at all; plus Phase 6's packaging gap |
 
 Items 1 and 2 are prerequisites for everything else and are independent of each other, so they can be
@@ -484,6 +484,59 @@ boot; the destructor already carries a magic field in the experiment that got
 this far, and it read *valid* on the one destruction it saw, which is the
 remaining thing that does not add up. After that, `%i7` from the second call's
 frame names the caller directly.
+
+
+## 4b. The %g7 decision, settled
+
+`%g7` was wanted by two owners. In the kernel it is the thread pointer —
+`thread_get_current_thread()` is a read of it, and every C trap handler needs it.
+In userspace it is *also* the thread pointer, because that is where SPARC keeps
+one for thread local storage. There is one `%g7` per register bank, and the normal
+bank is the one both use.
+
+So `sparc_enter_userspace()` originally left the globals alone and said why:
+zeroing `%g7` made the first trap out of userspace dereference null, and leaving
+it meant userspace could read the kernel's thread pointer and — worse — write it,
+so that the next trap's handler followed a value userspace chose.
+
+Three ways out were available:
+
+| Option | Cost |
+| --- | --- |
+| Load the kernel's pointer on trap entry from the trap data block | Two instructions per trap |
+| Give userspace a different register, say `%g6` | Diverges from what every SPARC toolchain and libc expects |
+| Stop using `%g7` in the kernel; derive the `Thread*` from the kernel stack pointer | Arithmetic on the hottest accessor in the kernel |
+
+**The first, and it needed no new machinery.** The trap data block is per-CPU and
+is reached through the *trap's own* global bank — a separate register file
+userspace has no instruction to touch — and it already carries exactly this class
+of state: the kernel stack, the user page table root, the window save area. The
+current thread is the fourth of the same kind.
+
+`TRAP_TO_C` reads it before switching to the normal bank, carries it across in
+`%l6` (window registers are not banked), and installs it into `%g7` *after* the
+interrupted code's value has gone into the iframe — so the epilogue hands
+userspace its own `%g7` back and never leaks the kernel's.
+`arch_thread_set_current_thread()` publishes it, so the register and the block
+cannot drift.
+
+With that, `sparc_enter_userspace()` clears all seven globals. Zero for now
+because there is no thread local storage yet; when there is, the thread's TLS
+pointer goes in `%g7` there and nothing else changes. **That is the TLS blocker
+gone.**
+
+### What it turned up
+
+The interrupt global bank's `%g7` had never been initialised. UltraSPARC-IIi gives
+the interrupt traps a bank of their own selected by `PSTATE.IG` — §22's bug was a
+handler running on the wrong one because only `AG` was cleared — and
+`sparc_set_trap_globals()` wrote the MMU and alternate banks only. Nothing had
+ever *read* `%g7` there, so nothing noticed.
+
+The first interrupt after this change read a garbage pointer out of it and
+reported `thread -1 "?"` before taking an alignment fault. Fixed by setting all
+three banks, which is also what `sparc_restore_trap_globals()` should have been
+covering since §32.
 
 
 ## 5. The syscall path

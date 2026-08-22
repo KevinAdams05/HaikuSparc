@@ -243,18 +243,31 @@ FUNCTION(sparc_enter_userspace):
 	mov	%g4, %o0
 	mov	%g5, %o1
 
-	/*	The globals are not cleared, and %g7 is the reason: it holds the kernel's
-		thread pointer, and the trap handlers read it to find out which thread
-		took the trap. Zeroing it here would make the first trap out of userspace
-		dereference null.
+	/*	Hand userspace a clean set of globals.
 
-		So userspace can see it, and userspace changing it would make the next
-		trap read the wrong thread. That is a real hole and it is where thread
-		local storage will have to be dealt with -- SPARC userspace wants %g7 for
-		its own thread pointer, which is the same register for the same reason.
-		Noted rather than papered over; nothing runs in userspace yet that could
-		exploit it. See sparc-port/USERSPACE_DESIGN.md.
+		This used to be impossible. %g7 is the kernel's thread pointer, and the
+		trap handlers read it to find out which thread trapped -- so zeroing it
+		meant the first trap out of userspace dereferenced null, and leaving it
+		meant userspace could read it and, worse, write it and make the next trap
+		read the wrong thread.
+
+		TRAP_TO_C now loads the thread pointer from the trap data block instead,
+		through a register bank userspace cannot reach. So the register is
+		userspace's to own -- which is what SPARC wants anyway, since %g7 is where
+		it keeps the thread pointer for thread local storage.
+
+		Zero for now because there is no thread local storage yet. When there is,
+		this is where the thread's TLS pointer goes, and nothing else has to
+		change.
 	*/
+	clr	%g1
+	clr	%g2
+	clr	%g3
+	clr	%g4
+	clr	%g5
+	clr	%g6
+	clr	%g7
+
 	retry
 
 
