@@ -79,6 +79,7 @@
 #define TRAP_DATA_WINDOW_SAVE		0xd0
 #define TRAP_DATA_CURRENT_THREAD	0xd8
 #define TRAP_DATA_USER_SPILL_COUNT	0xe0
+#define TRAP_DATA_OTHER_SPILL_COUNT	0xe8
 #define TRAP_DATA_OFFSET_COUNT		21
 
 /*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
@@ -650,6 +651,11 @@ sparc_immu_miss_slow:
 	add	%g2, 1, %g2
 	stx	%g2, [%g1]
 
+	/* Counted for the same reason the other one is. */
+	ldx	[%g7 + TRAP_DATA_OTHER_SPILL_COUNT], %g2
+	inc	%g2
+	stx	%g2, [%g7 + TRAP_DATA_OTHER_SPILL_COUNT]
+
 	saved
 	retry
 .endm
@@ -996,6 +1002,24 @@ sparc_unhandled_trap_stop:
 	 */
 	wrpr	%g0, WSTATE_KERNEL, %wstate
 
+	/*	And the user's live windows become somebody else's, so that spilling one
+		of them selects the handler that knows not to write the user's stack from
+		trap level one.
+
+		Only for a trap out of userspace: CANRESTORE below a kernel trap counts
+		kernel windows, which the kernel handler is right to spill.
+
+		A move, so CANSAVE + CANRESTORE + OTHERWIN stays at NWINDOWS - 2. %g1 is
+		free here -- the stack choice above has finished with it.
+	 */
+	andcc	%g1, TSTATE_PRIV, %g0
+	bne,pt	%xcc, 6f
+	 nop
+	rdpr	%canrestore, %g1
+	wrpr	%g0, 0, %canrestore
+	wrpr	%g1, 0, %otherwin
+6:
+
 	/*	The thread pointer kernel C code must see, read while the trap's own
 		global bank is still selected -- the trap data block is reached through
 		*that* bank's %g7, and the normal bank's belongs to whoever was
@@ -1092,6 +1116,23 @@ sparc_unhandled_trap_stop:
 	call	\handler
 	 mov	%l7, %o0
 
+	/*	Anything the spill handler had to park in the save area goes to the user's
+		stack now, while the trap level is still zero and a fault there is an
+		ordinary page fault. See sparc_flush_user_windows().
+
+		Read from the frame rather than from %l0, because a handler is allowed to
+		change where the trap returns to -- that is how an unresolvable page fault
+		becomes a jump to the thread's fault handler -- and where it returns to is
+		what decides whether userspace is about to run.
+	 */
+	ldx	[%l7 + IFRAME_TSTATE], %l5
+	andcc	%l5, TSTATE_PRIV, %g0
+	bne,pt	%xcc, 5f
+	 nop
+	call	sparc_flush_user_windows
+	 nop
+5:
+
 	/* Back up to trap level 1: `retry` is meaningless below it, and %tpc and
 	 * friends do not exist to be written.
 	 */
@@ -1160,11 +1201,20 @@ sparc_unhandled_trap_stop:
 		`restore` below, which may itself trap to a fill. With WSTATE.NORMAL back
 		at 1 that fill reads the user's stack with the user's privilege, which is
 		what filling a user window should do.
+
+		And the windows the kernel took custody of go back: OTHERWIN into
+		CANRESTORE, so a `restore` of a window that is still live succeeds rather
+		than trapping to a fill for a window that was never spilled.
 	 */
 	andcc	%l0, TSTATE_PRIV, %g0
 	bne,pt	%xcc, 9f
 	 nop
+
 	wrpr	%g0, WSTATE_USER, %wstate
+
+	rdpr	%otherwin, %l6
+	wrpr	%g0, 0, %otherwin
+	wrpr	%l6, 0, %canrestore
 9:
 
 	rdpr	%cwp, %l6
@@ -1429,6 +1479,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (20 * 8)]
 	mov	TRAP_DATA_USER_SPILL_COUNT, %o1
 	stx	%o1, [%o0 + (21 * 8)]
+	mov	TRAP_DATA_OTHER_SPILL_COUNT, %o1
+	stx	%o1, [%o0 + (22 * 8)]
 	retl
 	 nop
 

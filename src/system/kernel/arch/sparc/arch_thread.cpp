@@ -46,8 +46,18 @@ arch_team_init_team_struct(Team *team, bool kernel)
 status_t
 arch_thread_init_thread_struct(Thread *thread)
 {
-	// set up an initial state (stack & fpu)
-	//memcpy(&thread->arch_info, &sInitialState, sizeof(struct arch_thread));
+	// A Thread comes out of the slab allocator uninitialised -- 0xcc bytes, in a
+	// debug build -- and arch_info has no constructor, so anything in it that is
+	// read before being written has to be set here. This function existed for
+	// exactly that and did nothing; the body was a commented-out memcpy.
+	//
+	// The window save area's count is such a field, and it is read by a spill
+	// handler at trap level one. Left as poison it says the area holds 0xcc...
+	// windows, the handler declines to write past the end -- correctly -- and
+	// reports; the report then needs a register window of its own, cannot get
+	// one because the spill it would take is the one that just failed, and the
+	// machine ends up alternating between two trap levels forever.
+	thread->arch_info.windowSave.count = 0;
 
 	return B_OK;
 }
@@ -147,6 +157,53 @@ arch_thread_init_kthread_stack(Thread* thread, void* _stack, void* _stackTop,
 	// enabled".
 	thread->arch_info.context.pstate = SPARC_PSTATE_PRIV | SPARC_PSTATE_PEF;
 	thread->arch_info.context.pil = 0;
+}
+
+
+/*!	Empties the window save area onto the user's stack.
+
+	Called from the trap return path when the trap is going back to userspace, and
+	the whole reason it is called from C rather than done in the spill handler is
+	the trap level. Here it is zero, so a store to the user's stack that faults is
+	an ordinary page fault -- pageable, killable, ordinary. In the spill handler it
+	is one or deeper, where the same fault nests toward the watchdog reset section
+	2.6 describes.
+
+	It has to happen before the return, not lazily. On the way out the kernel gives
+	CANRESTORE back from OTHERWIN, and a `restore` past the windows that are still
+	live traps to a fill -- which reads the user's stack, because that is where a
+	user window is supposed to be. If the copies were still sitting in here it
+	would read whatever the stack held instead.
+
+	Failure is reported and the slot dropped rather than retried. A user stack the
+	kernel cannot write is a thread that should die, and killing it belongs with
+	the signal work rather than here; losing the window is at least visible.
+*/
+extern "C" void
+sparc_flush_user_windows()
+{
+	Thread* thread = thread_get_current_thread();
+	if (thread == NULL)
+		return;
+
+	sparc_window_save& save = thread->arch_info.windowSave;
+	if (save.count == 0)
+		return;
+
+	for (uint64 slot = 0; slot < save.count; slot++) {
+		uint64* registers = save.slots[slot];
+		addr_t stackPointer
+			= (addr_t)registers[SPARC_WINDOW_SAVE_STACK_POINTER / sizeof(uint64)];
+
+		status_t status = user_memcpy((void*)(stackPointer + SPARC_STACK_BIAS),
+			registers, SPARC_WINDOW_SAVE_REGISTERS * sizeof(uint64));
+		if (status != B_OK) {
+			dprintf("sparc: could not flush a user window to %#" B_PRIxADDR
+				": %s\n", stackPointer + SPARC_STACK_BIAS, strerror(status));
+		}
+	}
+
+	save.count = 0;
 }
 
 

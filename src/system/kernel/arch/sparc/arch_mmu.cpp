@@ -985,6 +985,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, windowSave),
 		offsetof(sparc_trap_data, currentThread),
 		offsetof(sparc_trap_data, userSpillCount),
+		offsetof(sparc_trap_data, otherSpillCount),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1895,6 +1896,14 @@ uint64
 sparc_user_spill_count()
 {
 	return sTrapData.userSpillCount;
+}
+
+
+/*!	How many user windows the kernel has parked. See the header. */
+uint64
+sparc_other_spill_count()
+{
+	return sTrapData.otherSpillCount;
 }
 
 

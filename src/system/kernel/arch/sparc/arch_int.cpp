@@ -581,8 +581,9 @@ sparc_test_userspace()
 	sparc_switch_address_space(SPARC_KERNEL_CONTEXT, sparc_kernel_page_table());
 	restore_interrupts(interruptState);
 
-	dprintf("sparc_int: user-stack spills taken: %" B_PRIu64 "\n",
-		sparc_user_spill_count());
+	dprintf("sparc_int: window spills -- %" B_PRIu64 " to the user's stack, %"
+		B_PRIu64 " parked by the kernel\n", sparc_user_spill_count(),
+		sparc_other_spill_count());
 
 	dprintf("sparc_int: userspace returned %#" B_PRIx64 " of %#" B_PRIx64
 		" -- %s\n", sUserTestValue, kExpected,
