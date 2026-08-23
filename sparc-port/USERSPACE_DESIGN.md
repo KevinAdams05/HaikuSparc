@@ -355,18 +355,47 @@ C, where a fault is an ordinary page fault and can page the stack in or kill the
 thread. Linux calls this `fault_in_user_windows` and does it in its return path
 for exactly this reason. `thread_at_kernel_exit()` is the natural hook here.
 
-So the full piece is four parts, and only the first is written:
+So the full piece is four parts, and **all four are done**:
 
-1. **The `_other` handlers and the save area.** Done.
-2. `WSTATE` and the `OTHERWIN` transfer on kernel entry and exit.
-3. A user variant of the `_normal` spill and fill, storing through
+1. **The `_other` handlers and the save area.**
+2. **`WSTATE` and the `OTHERWIN` transfer** on kernel entry and exit.
+3. **A user variant of the `_normal` spill and fill**, storing through
    `ASI_AS_IF_USER_PRIMARY`.
-4. Flushing the save area to the user stack at TL=0 before returning to
-   userspace, and `OTHERWIN` and `WSTATE` preserved in `arch_context` across a
-   context switch — because the handler between entry and exit can block, and a
-   switch does `flushw`.
+4. **Flushing the save area to the user stack at TL=0** before returning to
+   userspace.
 
-Handlers first, reachability second, and the second with a clear head.
+Both spill paths are counted, so reachability is a measurement rather than an
+argument:
+
+```
+sparc_int: window spills -- 2 to the user's stack, 1 parked by the kernel
+sparc_int: userspace returned 0x5ac of 0x5ac -- ran in userspace
+```
+
+Two that userspace took itself, against a `CANSAVE` of six after eight nested
+saves; one the kernel took on userspace's behalf, parked and then flushed. The
+test still returns the value it chose, so the fill side works too.
+
+### One prediction this section got wrong
+
+It said `OTHERWIN` and `WSTATE` would have to live in `arch_context`, because the
+handler between entry and exit can block and a context switch does `flushw`.
+Neither does, and the reason is worth keeping.
+
+`WSTATE` never needs saving because a context switch always happens *inside* the
+kernel, so the value at switch time is always the kernel's, and the exit path sets
+the user's again on the way out. And `OTHERWIN` needs no saving because `flushw`
+is exactly what resolves it: with `OTHERWIN` non-zero those spills go to the save
+area, which is per-thread, and drain `OTHERWIN` to zero on the way. **The state
+that had to survive survives as data rather than as register contents** — which is
+what the save area was for in the first place.
+
+### What is still missing
+
+A fault *during* a spill or fill. Both new handlers can take one — an absent or
+unwritable user stack page — and neither is fixed up; they report through the
+unhandled-trap path. That is what Linux's `winfixup` exists for, and it is the
+next thing here rather than something to leave implicit.
 
 
 ### Where the save area lives

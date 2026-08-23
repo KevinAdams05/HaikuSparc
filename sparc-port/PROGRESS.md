@@ -2841,3 +2841,84 @@ error starting "/boot/system/servers/launch_daemon" error = -1
 
 No panics. That last line is correct rather than a failure: there is no userland on the volume to start.
 It is also the whole of what is left before Haiku runs something of its own.
+
+
+## 35. Register windows across the privilege boundary
+
+Done, in four parts, and each part is a measurement rather than an argument:
+
+```
+sparc_int: window spills -- 2 to the user's stack, 1 parked by the kernel
+sparc_int: userspace returned 0x5ac of 0x5ac -- ran in userspace
+```
+
+Two spills userspace took itself, against a `CANSAVE` of six after eight nested saves. One the kernel
+took on userspace's behalf. And the test still returns the value it chose, so the fill side works.
+
+### What each part is for
+
+**`WSTATE` selects the handler**, which is what the eight groups of each vector are for: the spill
+vector is `0x80 + 4 × WSTATE.NORMAL` when `OTHERWIN` is zero and `0xa0 + 4 × WSTATE.OTHER` when it is
+not. So the kernel runs at `NORMAL = 0` and userspace at `NORMAL = 1`, and group one stores through
+`ASI_AS_IF_USER_PRIMARY` — a user program spilling its own window writes its own stack with its own
+privilege, and faults if it may not, instead of the kernel doing it for them and hiding the problem.
+
+The ASI goes in `%asi` rather than being named per instruction, because the immediate-ASI form of
+`stxa` cannot use register-plus-offset addressing and sixteen extra `add`s would not fit the group.
+`%asi` is part of the trap state, so `retry` puts the interrupted value back.
+
+`WSTATE` is set to the kernel's value *after* `TRAP_TO_C`'s own `save`, not before. A trap out of
+userspace still has the user value there, so if that save spills, it spills a user window — and the
+user handler is the right one to do it.
+
+**The `OTHERWIN` transfer** is what makes the cross-privilege case reachable. On a trap out of
+userspace the user's live windows move from `CANRESTORE` into `OTHERWIN`, and the hardware then picks
+`spill_*_other` for any of them: the handler that parks a window in kernel memory instead of storing it
+to an address userspace chose, from trap level one, where a fault nests. The move preserves
+`CANSAVE + CANRESTORE + OTHERWIN = NWINDOWS - 2`, and it reverses on the way out so a `restore` of a
+window that is still live succeeds rather than trapping to a fill for a window that was never spilled.
+
+**The flush** empties the save area onto the user's stack from C, at trap level zero, where that store
+faulting is an ordinary page fault. It cannot be lazy: the return gives `CANRESTORE` back from
+`OTHERWIN`, and a `restore` past the live windows traps to a fill that reads the user's stack, so the
+copies have to be there by then. Called once from `TRAP_TO_C` rather than from each handler, and
+conditional on the *frame's* `TSTATE` rather than the entry's, because a handler is allowed to change
+where the trap returns to.
+
+### A prediction that was wrong, and why the answer is better
+
+§4 of the design said `OTHERWIN` and `WSTATE` would have to live in `arch_context`, because the handler
+between entry and exit can block and a context switch does `flushw`. Neither does.
+
+`WSTATE` never needs saving because a switch always happens *inside* the kernel — the value at switch
+time is always the kernel's, and the exit path sets the user's again. And `OTHERWIN` needs no saving
+because `flushw` is precisely what resolves it: with `OTHERWIN` non-zero those spills go to the save
+area, which is per-thread, and drain `OTHERWIN` to zero on the way out. **The state that had to survive
+a reschedule survives as data rather than as register contents** — which is what the save area was for.
+
+The hazard I was most careful about turned out to be answered by the design already in place. Worth
+noting in both directions: the caution was right to slow me down, and the thing it was guarding against
+had already been handled.
+
+### The bug, and it is the empty-stub hazard again
+
+`arch_thread_init_thread_struct()` existed for exactly this and did nothing — its body was a
+commented-out `memcpy`. A `Thread` comes out of the slab uninitialised and `arch_info` has no
+constructor, so the save area's count started as `0xcccccccccccccccc`.
+
+The spill handler read that, **correctly** declined to write past the end of an area it believed held
+0xcc… windows, and reported. The report then needed a register window of its own, could not get one
+because the spill it would have taken was the one that had just failed, and the machine alternated
+between two trap levels forever.
+
+Found in one pass with the monitor rather than by reading: `pc` at the first instruction of
+`sparc_report_unresolved_miss` with `cansave 0`, then the trap data block giving trap type `0xa0` and a
+save-area pointer whose count was slab poison. That is the third time this session the instrument has
+been faster than the reasoning, and the second time an empty stub with a commented-out body was the
+cause — §17's `arch_debug_serial_early_boot_message()` was the first.
+
+### Still missing
+
+A fault *during* a spill or fill. Both new handlers can take one, from an absent or unwritable user
+stack page, and neither is fixed up — they report. That is what Linux's `winfixup` exists for, and it is
+the next thing here.
