@@ -23,8 +23,11 @@ work.
 | 1 | MMU contexts, a TSB comparison that survives them, and a per-address-space page table root | **Done** |
 | 2 | The syscall trap, and entering userspace | **Done** — `ta 0x40`, and an instruction runs unprivileged |
 | 3 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
-| 4 | Signal frames and TLS. The `%g7` question is settled — §4b | Stubs |
+| 4 | TLS — **done**, §4b's decision made it three lines. Signal frames | `arch_setup_signal_frame` and friends are stubs |
 | 5 | A userland to run | `libroot`'s `syscalls.inc` emits no instructions at all; plus Phase 6's packaging gap |
+
+The system call path is no longer a stub either: `syscall_dispatcher()` is wired, and userspace has
+called `system_time()` and got a real answer.
 
 Items 1 and 2 are prerequisites for everything else and are independent of each other, so they can be
 built and tested in either order. Item 1 is testable without any of the others, which makes it the

@@ -2922,3 +2922,55 @@ cause — §17's `arch_debug_serial_early_boot_message()` was the first.
 A fault *during* a spill or fill. Both new handlers can take one, from an absent or unwritable user
 stack page, and neither is fixed up — they report. That is what Linux's `winfixup` exists for, and it is
 the next thing here.
+
+
+## 36. Thread local storage, and a real system call
+
+```
+sparc_int: window spills -- 2 to the user's stack, 1 parked by the kernel
+sparc_int: userspace called system_time() -> 63051727 (kernel says 63063155),
+           read %g7 as 0x715c0000 -- syscall dispatched, TLS delivered
+```
+
+Userspace calls into the actual kernel and gets a real answer back. The eleven milliseconds between
+the two readings is the gap between the call and the check.
+
+### TLS was three lines, because the hard part was a decision
+
+`arch_thread_init_tls()` was a `TODO`. What it does is what every architecture does — the block starts
+where the user stack ends, because `thread.cpp` carves `TLS_SIZE` off the top of the stack area and
+leaves `user_stack_size` excluding it. What differs per architecture is only *how userspace is told*.
+
+On SPARC the answer is `%g7`, and that was impossible until §4b: `%g7` was the kernel's thread pointer,
+so handing it to userspace meant the next trap followed a value userspace chose. With the trap entry
+reading the current thread out of the trap data block instead, the register is userspace's — which is
+what SPARC wanted for it all along.
+
+Worth noting what the test also demonstrates: the pointer survives eight nested `save`s, three window
+spills across two different handlers, and two trap round trips. The globals come through the window
+machinery intact.
+
+### The system call path is real now
+
+`sparc_syscall()` hands anything below `kSyscallCount` to `syscall_dispatcher()`. The work is in the
+argument list, because the dispatcher wants one contiguous array and SPARC splits them: six in
+registers, the rest on the caller's stack at the offset the V9 ABI reserves — 176 bytes into the frame,
+past the sixteen-word register save area and the six slots a varargs callee would spill its register
+arguments into. The stack half is user memory, so `user_memcpy()` reads it and a bad pointer is a failed
+call rather than a fault in the kernel.
+
+That needed the user's stack pointer, which the iframe was not capturing: `out` grows from six entries
+to eight, since `%o6` is the stack pointer and `%o7` comes along for the same price. Neither is restored
+on the way out — they are the trapped window's frame pointer and return address, and the closing
+`restore` brings those back from the register file or the stack. Writing them from the frame would
+replace a correct value with a copy.
+
+### A note on test design
+
+The user program is a hand-assembled blob copied into a page, so anything baked into it has to survive
+the numbers moving. The system call index is therefore handed to it as an *argument* rather than
+assembled in, and it carries two values home through the exit call — the kernel's answer and whatever
+it found in `%g7` — so one excursion checks two things and a failure says which.
+
+The plausibility check on the returned time is bounded at both ends. A lower bound alone would let a
+mangled return value pass as a small number; `now - 1000000 < value <= now` will not.
