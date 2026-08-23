@@ -180,7 +180,7 @@ FUNCTION_END(sparc_context_offsets)
 /*	Drops into userspace, and does not come back.
 
 	void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
-		uint64 arg1, uint64 arg2);
+		uint64 arg1, uint64 arg2, addr_t tlsPointer);
 
 	The stack pointer is biased -- SPARC V9 keeps %sp at the frame address minus
 	2047 -- because that is the form the hardware wants and the caller is the one
@@ -194,6 +194,7 @@ FUNCTION(sparc_enter_userspace):
 	mov	%o1, %g2			// stack pointer, biased
 	mov	%o2, %g4			// arg1
 	mov	%o3, %g5			// arg2
+	mov	%o4, %g6			// thread local storage
 
 	/*	Nothing of the kernel's may be left in a register window.
 
@@ -239,15 +240,15 @@ FUNCTION(sparc_enter_userspace):
 	andn	%g3, PSTATE_PRIV, %g3
 	or	%g3, PSTATE_PEF, %g3
 	sllx	%g3, 8, %g3
-	rdpr	%cwp, %g6
-	or	%g3, %g6, %g3
+	rdpr	%cwp, %g7
+	or	%g3, %g7, %g3
 	wrpr	%g3, 0, %tstate
 
 	mov	%g2, %sp
 	mov	%g4, %o0
 	mov	%g5, %o1
 
-	/*	Hand userspace a clean set of globals.
+	/*	Hand userspace a clean set of globals, and its thread local storage.
 
 		This used to be impossible. %g7 is the kernel's thread pointer, and the
 		trap handlers read it to find out which thread trapped -- so zeroing it
@@ -255,22 +256,23 @@ FUNCTION(sparc_enter_userspace):
 		meant userspace could read it and, worse, write it and make the next trap
 		read the wrong thread.
 
-		TRAP_TO_C now loads the thread pointer from the trap data block instead,
+		TRAP_TO_C loads the thread pointer from the trap data block instead,
 		through a register bank userspace cannot reach. So the register is
-		userspace's to own -- which is what SPARC wants anyway, since %g7 is where
-		it keeps the thread pointer for thread local storage.
+		userspace's to own -- which is what SPARC wants anyway, since %g7 is
+		exactly where it keeps the thread pointer for thread local storage. That
+		is what goes in it here.
 
-		Zero for now because there is no thread local storage yet. When there is,
-		this is where the thread's TLS pointer goes, and nothing else has to
-		change.
+		Everything else is cleared rather than left: whatever the kernel had in a
+		global is no business of userspace's.
 	*/
+	mov	%g6, %g7
+
 	clr	%g1
 	clr	%g2
 	clr	%g3
 	clr	%g4
 	clr	%g5
 	clr	%g6
-	clr	%g7
 
 	/*	And userspace spills its own windows itself, to its own stack, with its
 		own privilege. WSTATE.NORMAL selects which of the eight spill handlers a
@@ -295,12 +297,12 @@ FUNCTION(sparc_enter_userspace):
 	trap number lands on an unhandled vector and the wrong index falls through to
 	the "unimplemented call" path, and either way the test does not pass.
 
-	It reports a value the kernel did not choose, so that "the trap happened"
-	and "the trap happened where I meant it to" are distinguishable.
+	It reports what it finds in %g7 rather than a constant, so the test proves
+	two things at once: that userspace ran, and that its thread local storage
+	pointer arrived in the register the platform keeps one in.
 */
 #define USER_TEST_SYSCALL_TRAP		0x40
 #define USER_TEST_SYSCALL_EXIT		0x555
-#define USER_TEST_MAGIC			0x5ac
 
 FUNCTION(sparc_user_test_program):
 	/*	Nest deeply enough to force a spill.
@@ -336,7 +338,7 @@ FUNCTION(sparc_user_test_program):
 	restore
 
 	mov	USER_TEST_SYSCALL_EXIT, %g1
-	mov	USER_TEST_MAGIC, %o0
+	mov	%g7, %o0
 	ta	USER_TEST_SYSCALL_TRAP
 
 	/*	Not reached: the handler does not return here. Spinning rather than

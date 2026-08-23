@@ -22,7 +22,7 @@ extern "C" void sparc_context_switch(struct arch_context *from,
 extern "C" void sparc_thread_entry();
 extern "C" void sparc_context_offsets(uint64 *out);
 extern "C" void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
-	addr_t arg1, addr_t arg2);
+	addr_t arg1, addr_t arg2, addr_t tlsPointer);
 
 
 status_t
@@ -207,10 +207,22 @@ sparc_flush_user_windows()
 }
 
 
+/*!	Says where this thread's thread local storage lives.
+
+	The block itself is not ours: thread.cpp carves TLS_SIZE off the top of the
+	user stack area and leaves user_stack_size excluding it, so the block starts
+	exactly where the stack ends. Every architecture computes the same address;
+	what differs is how userspace is told about it.
+
+	On SPARC it is told in %g7, which is where the platform keeps a thread pointer
+	and which the kernel gave up needing when the trap entry started reading the
+	current thread out of the trap data block instead. See sparc_enter_userspace().
+*/
 status_t
 arch_thread_init_tls(Thread *thread)
 {
-	// TODO: Implement!
+	thread->user_local_storage
+		= thread->user_stack_base + thread->user_stack_size;
 	return B_OK;
 }
 
@@ -279,7 +291,7 @@ arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1, void *arg2
 	addr_t frame = ROUNDDOWN(stackTop - SPARC_MINIMUM_FRAME_SIZE, 16);
 
 	sparc_enter_userspace(entry, frame - SPARC_STACK_BIAS, (addr_t)arg1,
-		(addr_t)arg2);
+		(addr_t)arg2, thread->user_local_storage);
 
 	// sparc_enter_userspace() does not return: it leaves through `done`.
 	panic("arch_thread_enter_userspace: returned from userspace entry");

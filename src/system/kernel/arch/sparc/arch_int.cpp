@@ -33,7 +33,7 @@
 
 extern "C" void sparc_iframe_offsets(uint64 *out);
 extern "C" void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
-	addr_t arg1, addr_t arg2);
+	addr_t arg1, addr_t arg2, addr_t tlsPointer);
 extern "C" uint32 sparc_user_test_program[];
 extern "C" uint32 sparc_user_test_program_end[];
 
@@ -491,7 +491,10 @@ sparc_test_userspace()
 {
 	const addr_t kCodeAddress = 0x20000000;
 	const addr_t kStackAddress = 0x20100000;
-	const uint64 kExpected = 0x5ac;
+	// Handed to userspace as its thread local storage pointer, and reported back
+	// out of %g7 -- so a right answer means the register arrived, and a wrong one
+	// distinguishes "userspace did not run" from "TLS did not reach it".
+	const uint64 kExpected = 0x715c0000;
 
 	// The stack the trap out of userspace lands on. See above.
 	static uint8 sTrapStack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
@@ -566,7 +569,8 @@ sparc_test_userspace()
 	if (setjmp(sUserTestReturn) == 0) {
 		addr_t frame = ROUNDDOWN(kStackAddress + B_PAGE_SIZE
 			- SPARC_MINIMUM_FRAME_SIZE, 16);
-		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS, 0, 0);
+		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS, 0, 0,
+			(addr_t)kExpected);
 	}
 
 	// Back here through longjmp() from the system call handler.
@@ -585,9 +589,10 @@ sparc_test_userspace()
 		B_PRIu64 " parked by the kernel\n", sparc_user_spill_count(),
 		sparc_other_spill_count());
 
-	dprintf("sparc_int: userspace returned %#" B_PRIx64 " of %#" B_PRIx64
+	dprintf("sparc_int: userspace read %%g7 as %#" B_PRIx64 " of %#" B_PRIx64
 		" -- %s\n", sUserTestValue, kExpected,
-		sUserTestValue == kExpected ? "ran in userspace" : "WRONG");
+		sUserTestValue == kExpected
+			? "ran in userspace, with its TLS pointer" : "WRONG");
 
 	if (sUserTestValue != kExpected) {
 		panic("sparc: the userspace test reported %#" B_PRIx64 ", wanted %#"
