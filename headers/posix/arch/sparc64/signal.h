@@ -46,6 +46,19 @@ struct vregs
 	ulong i5;
 	ulong fp;
 	ulong i7;
+
+	// Where to resume, and both halves of it: SPARC needs the next program
+	// counter as well as the current one, because an interrupted instruction can
+	// be in a delay slot and the following instruction is then not pc + 4.
+	ulong pc;
+	ulong npc;
+
+	// The condition codes and the multiply/divide register, which are part of
+	// the interrupted computation. Taken from TSTATE rather than exposing TSTATE
+	// itself, which also carries privileged fields no signal handler should see.
+	ulong ccr;
+	ulong y;
+
 	// TODO: sparc: Fix floats in vregs
 };
 

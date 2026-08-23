@@ -203,6 +203,12 @@ struct iframe {
 #define TSTATE_PRIV			(0x004 << TSTATE_PSTATE_SHIFT)
 #define TSTATE_IE			(0x002 << TSTATE_PSTATE_SHIFT)
 
+// The condition codes live in TSTATE bits 39:32 -- the two four-bit sets, xcc
+// above icc. Everything a signal handler is allowed to see of TSTATE, and
+// nothing it is not.
+#define TSTATE_CCR_SHIFT		32
+#define TSTATE_CCR_MASK			0xffULL
+
 static inline void
 arch_int_enable_interrupts_inline(void)
 {

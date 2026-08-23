@@ -9,7 +9,9 @@
 #include <arch_cpu.h>
 #include <arch/thread.h>
 #include <boot/stage2.h>
+#include <commpage.h>
 #include <kernel.h>
+#include <ksignal.h>
 #include <thread.h>
 #include <vm/vm_types.h>
 #include <vm/VMAddressSpace.h>
@@ -305,25 +307,204 @@ arch_thread_enter_userspace(Thread *thread, addr_t entry, void *arg1, void *arg2
 }
 
 
+/*!	Whether the thread is already running on its alternate signal stack.
+
+	Asked so that a nested signal does not restart the alternate stack from the
+	top and overwrite the frame the outer handler is still using. The stack
+	pointer comes from the interrupted frame rather than from anything current,
+	because "the thread" here is not the one running this code in the general
+	case.
+*/
 bool
 arch_on_signal_stack(Thread *thread)
 {
-	return false;
+	iframe_stack* frames = &thread->arch_info.iframes;
+	if (frames->index <= 0)
+		return false;
+
+	addr_t stackPointer = (addr_t)frames->frames[frames->index - 1]->out[6]
+		+ SPARC_STACK_BIAS;
+
+	return stackPointer >= thread->signal_stack_base
+		&& stackPointer < thread->signal_stack_base + thread->signal_stack_size;
 }
 
 
+/*!	Where a signal frame goes: the alternate stack if the handler asked for one
+	and the thread is not already on it, otherwise below the interrupted frame.
+
+	The frame address is what has to be 16-byte aligned, not the biased stack
+	pointer, which is why the rounding happens before the bias is taken off.
+*/
+static uint8*
+get_signal_stack(Thread* thread, struct iframe* frame, struct sigaction* action,
+	size_t spaceNeeded)
+{
+	addr_t stackPointer = (addr_t)frame->out[6] + SPARC_STACK_BIAS;
+
+	if (thread->signal_stack_enabled && (action->sa_flags & SA_ONSTACK) != 0
+		&& (stackPointer < thread->signal_stack_base
+			|| stackPointer >= thread->signal_stack_base
+				+ thread->signal_stack_size)) {
+		addr_t stackTop = thread->signal_stack_base
+			+ thread->signal_stack_size;
+		return (uint8*)ROUNDDOWN(stackTop - spaceNeeded, 16);
+	}
+
+	return (uint8*)ROUNDDOWN(stackPointer - spaceNeeded, 16);
+}
+
+
+/*!	Arranges for the thread to run a signal handler when it next reaches
+	userspace.
+
+	The context saved here is the current register window plus the globals, and
+	that is enough because of what the trap return already does: every user window
+	has been flushed to the user's stack by then, so the frames below this one are
+	in memory where the handler's own `restore` can find them. Only the window the
+	trap interrupted lives in registers, and that is what the iframe holds.
+
+	Both program counters are saved. An interrupted instruction can be in a delay
+	slot, in which case the next one is not four bytes further on, and a context
+	that recorded only one of them would resume a delayed branch incorrectly.
+
+	The condition codes come out of TSTATE, masked to just the two four-bit sets.
+	The rest of TSTATE is privileged state and no business of a signal handler's.
+*/
 status_t
 arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
 	struct signal_frame_data *signalFrameData)
 {
-	return B_ERROR;
+	iframe_stack* frames = &thread->arch_info.iframes;
+	if (frames->index <= 0) {
+		panic("arch_setup_signal_frame: no interrupt frame for thread %"
+			B_PRId32, thread->id);
+		return B_ERROR;
+	}
+
+	struct iframe* frame = frames->frames[frames->index - 1];
+	vregs& registers = signalFrameData->context.uc_mcontext;
+
+	registers.g1 = frame->g1;
+	registers.g2 = frame->g2;
+	registers.g3 = frame->g3;
+	registers.g4 = frame->g4;
+	registers.g5 = frame->g5;
+	registers.g6 = frame->g6;
+	registers.g7 = frame->g7;
+
+	registers.o0 = frame->out[0];
+	registers.o1 = frame->out[1];
+	registers.o2 = frame->out[2];
+	registers.o3 = frame->out[3];
+	registers.o4 = frame->out[4];
+	registers.o5 = frame->out[5];
+	registers.sp = frame->out[6];
+	registers.o7 = frame->out[7];
+
+	registers.pc = frame->tpc;
+	registers.npc = frame->tnpc;
+	registers.y = frame->y;
+	registers.ccr = (frame->tstate >> TSTATE_CCR_SHIFT) & TSTATE_CCR_MASK;
+
+	// The locals and ins of the interrupted window are not in the iframe: the
+	// trap's own `save` left them where they were, and the trap return brings
+	// them back. They are on the user's stack as well, because every user window
+	// is flushed there before the return -- so a handler that walks its own
+	// frames finds them, and zeroing them here would be a lie rather than an
+	// omission.
+	memset(&registers.l0, 0, offsetof(vregs, pc) - offsetof(vregs, l0));
+
+	signalFrameData->syscall_restart_return_value = frame->out[0];
+
+	signal_get_user_stack((addr_t)frame->out[6] + SPARC_STACK_BIAS,
+		&signalFrameData->context.uc_stack);
+
+	uint8* userStack = get_signal_stack(thread, frame, sa,
+		sizeof(*signalFrameData));
+	status_t status = user_memcpy(userStack, signalFrameData,
+		sizeof(*signalFrameData));
+	if (status != B_OK)
+		return status;
+
+	// Where the handler returns through. The commpage holds an offset rather than
+	// an address, because it is mapped at a different place in every team.
+	addr_t commpage = (addr_t)thread->team->commpage_address;
+	addr_t handlerOffset;
+	status = user_memcpy(&handlerOffset,
+		&((addr_t*)commpage)[COMMPAGE_ENTRY_SPARC_SIGNAL_HANDLER],
+		sizeof(handlerOffset));
+	if (status != B_OK)
+		return status;
+
+	// A minimum frame below the signal frame, because the trampoline is an
+	// ordinary C function and the first thing it does is `save`.
+	addr_t trampolineFrame = ROUNDDOWN((addr_t)userStack
+		- SPARC_MINIMUM_FRAME_SIZE, 16);
+
+	frame->tpc = commpage + handlerOffset;
+	frame->tnpc = frame->tpc + 4;
+	frame->out[0] = (uint64)(addr_t)userStack;
+	frame->out[6] = (uint64)(trampolineFrame - SPARC_STACK_BIAS);
+
+	return B_OK;
 }
 
 
+/*!	Puts the interrupted context back, after a signal handler has returned.
+
+	Reached through _kern_restore_signal_frame(), which the commpage trampoline
+	calls, so the frame this writes into is the trap that syscall took -- not the
+	one the signal interrupted. Writing it is what makes the trap return land back
+	where the signal arrived.
+
+	The return value is what the interrupted system call should hand back, which
+	the setup saved before overwriting %o0 with the handler's argument. Returning
+	it here rather than assigning it is the contract: the generic code puts it
+	where the trap return will find it.
+*/
 int64
 arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
 {
-	return 0;
+	Thread* thread = thread_get_current_thread();
+	iframe_stack* frames = &thread->arch_info.iframes;
+	if (frames->index <= 0) {
+		panic("arch_restore_signal_frame: no interrupt frame");
+		return B_ERROR;
+	}
+
+	struct iframe* frame = frames->frames[frames->index - 1];
+	const vregs& registers = signalFrameData->context.uc_mcontext;
+
+	frame->g1 = registers.g1;
+	frame->g2 = registers.g2;
+	frame->g3 = registers.g3;
+	frame->g4 = registers.g4;
+	frame->g5 = registers.g5;
+	frame->g6 = registers.g6;
+	frame->g7 = registers.g7;
+
+	frame->out[0] = registers.o0;
+	frame->out[1] = registers.o1;
+	frame->out[2] = registers.o2;
+	frame->out[3] = registers.o3;
+	frame->out[4] = registers.o4;
+	frame->out[5] = registers.o5;
+	frame->out[6] = registers.sp;
+	frame->out[7] = registers.o7;
+
+	frame->tpc = registers.pc;
+	frame->tnpc = registers.npc;
+	frame->y = registers.y;
+
+	// Only the condition codes go back, and only into the field they came from.
+	// A handler that scribbled on the rest of the context must not be able to
+	// hand itself privileged state -- so TSTATE keeps everything else it had.
+	frame->tstate = (frame->tstate
+			& ~(TSTATE_CCR_MASK << TSTATE_CCR_SHIFT))
+		| ((registers.ccr & TSTATE_CCR_MASK) << TSTATE_CCR_SHIFT);
+
+	return (int64)signalFrameData->syscall_restart_return_value;
 }
 
 

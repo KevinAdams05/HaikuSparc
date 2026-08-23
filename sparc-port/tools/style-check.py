@@ -152,6 +152,14 @@ POINTER_RE = re.compile(r"(?<=[A-Za-z0-9_]) [*&](?=[A-Za-z_])")
 CAST_SPACE_RE = re.compile(r"(?<!new)\((?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*\s*"
     r"\*?\)\s+(?=[A-Za-z_(])")
 OPERATOR_EOL_RE = re.compile(r"(?:\|\||&&|[-+*/%|&^<>=!]=?|\?)\s*$")
+
+# A declaration whose type ends in a star is not a wrapped multiplication. Haiku
+# puts a function's return type on its own line, so "static uint8*" and
+# "const vregs*" are the normal shape of a definition rather than a line that
+# broke after an operator.
+DECLARATION_EOL_RE = re.compile(
+    r"^(?:static\s+|const\s+|extern\s+|inline\s+|virtual\s+|struct\s+"
+    r"|class\s+|unsigned\s+|signed\s+)*[A-Za-z_][\w:]*\s*\**\s*$")
 STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 CHAR_RE = re.compile(r"'(?:[^'\\]|\\.)*'")
 
@@ -385,7 +393,8 @@ def check_file(path, wanted_lines, findings):
             report(index, "pointer-style")
         if CAST_SPACE_RE.search(code_stripped):
             report(index, "cast-space")
-        if OPERATOR_EOL_RE.search(code_stripped.rstrip()):
+        if OPERATOR_EOL_RE.search(code_stripped.rstrip()) \
+                and not DECLARATION_EOL_RE.match(code_stripped.strip()):
             report(index, "operator-eol")
         if code_stripped.strip() == "else" and index >= 2 \
                 and lines[index - 2].rstrip().endswith("}"):
@@ -420,6 +429,12 @@ SELF_TEST_CASES = [
     ("a.cpp", "a = b *c;\n", "pointer-style"),
     ("a.cpp", "int x = 1; \n", "trailing-space"),
     ("a.cpp", "value = one +\n", "operator-eol"),
+    # A return type on its own line ends in a star and is not a wrapped
+    # multiplication. This fired on real Haiku-style code before the rule learned
+    # the difference.
+    ("a.cpp", "static uint8*\nget_signal_stack(Thread* thread)\n{\n}\n", None),
+    ("a.cpp", "const vregs*\nregisters()\n{\n}\n", None),
+    ("a.cpp", "total = width *\n", "operator-eol"),
     # A directive is not an expression: this ends in '>', not an operator.
     ("a.cpp", "#include <string.h>\n", None),
     # A one-line block comment ends in '/', which is not a trailing operator.
