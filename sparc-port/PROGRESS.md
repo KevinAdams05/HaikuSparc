@@ -2974,3 +2974,69 @@ it found in `%g7` — so one excursion checks two things and a failure says whic
 
 The plausibility check on the returned time is bounded at both ends. A lower bound alone would let a
 mangled return value pass as a small number; `now - 1000000 < value <= now` will not.
+
+
+## 37. Signals, and the last of libroot's missing instructions
+
+Three pieces this session, in the order the dependencies forced rather than the order they were planned.
+
+### The interrupt frame stack, which nothing was keeping
+
+`struct arch_thread` has had an `iframe_stack` since the port started and nothing ever pushed to it.
+Harmless while no caller existed, and not harmless at signals: signal delivery and the user debugger
+both need the frame of the trap they are reacting to, and neither runs *from* the handler — they run
+later, from generic code on the way back to userspace.
+
+`IFrameScope` does it with a constructor and destructor in the three handlers `TRAP_TO_C` calls. Four
+deep, which is the structure's limit and more than this port permits anyway; deeper than that the frame
+is dropped rather than written past the end, because a lost backtrace beats a corrupted thread.
+
+And the index was initialised, which matters: it is **the same bug as §35's window save count, from the
+same allocator.** A `Thread` comes out of the slab as poison and `arch_info` has no constructor, so an
+index nobody had ever read was `0xcccccccc` — and the first thing to read it would have indexed off the
+end of a four-entry array. Two fields, one lesson: in this port, anything in `arch_info` that is read
+before being written has to be set in `arch_thread_init_thread_struct()`, which is the function that
+exists for it and whose body was a commented-out `memcpy` until §35.
+
+### libroot's system calls existed as labels
+
+`syscalls.inc` was a placeholder — `/* TODO actuall syscalls? */` — whose macro expanded to a label and
+nothing else. So all 288 of libroot's system call entry points were symbols that fell straight through
+into whichever function the linker put next.
+
+The stub is four instructions, and it is short because the convention was picked to make it short: the
+index in `%g1`, six arguments already in `%o0`-`%o5` where the C calling convention put them, anything
+further already on the stack where the kernel reads it, and the result already in `%o0` — which for a
+leaf function is its caller's. Nothing to marshal in either direction.
+
+`retl`, not `ret`, and that is not a detail: it is the mistake that made `setjmp` a wild control
+transfer for five phases, and it broke KDL, the debug allocator and semaphore bookkeeping on the way.
+`set` rather than `mov` for the index, verified both ways, so it survives the call count outgrowing a
+13-bit immediate.
+
+### Signal frames
+
+The three stubs are implemented, plus the two things they needed. `struct vregs` could not describe a
+resume point — it had every general register and no program counter — so it gains `pc` *and* `npc`,
+because an interrupted instruction can sit in a delay slot and the next one is then not four bytes on.
+
+The trampoline userspace returns through is C copied into the commpage, which is how every other
+architecture does it and is the safer choice for a reason worth stating: this code runs unprivileged, at
+an address the kernel chose, with no relocations applied. It may not name a kernel symbol, call anything
+absolute, or touch memory it was not handed. A C function that calls through a pointer it was given and
+then traps satisfies all three; assembly that appears to has to be read carefully to be sure.
+
+So it was checked by disassembly rather than trusted: indirect `call %g1`, both branches relative and
+internal, `mov 0x42, %g1; ta 0x40`, and **no `__sparc_get_pc_thunk` call and no GOT access** — either of
+which would have jumped out of userspace into the kernel at the first signal.
+
+Two decisions in the context worth recording. The condition codes come out of `TSTATE` masked to the two
+four-bit sets and go back into exactly that field, because a handler that scribbles on its own context
+must not be able to hand itself a mode change. And the interrupted window's locals and ins are
+deliberately zeroed rather than filled: the trap return flushes every user window to the user's stack,
+so a handler walking its frames finds them in memory, and the only window still in registers is the one
+the iframe holds.
+
+**Not tested end to end.** Nothing registers a handler until there is a userland. What is tested is that
+the commpage entry is built and registered at boot, that the trampoline is position independent, and
+that none of it disturbed anything.
