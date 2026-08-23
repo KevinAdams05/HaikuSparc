@@ -984,6 +984,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, kernelStackTop),
 		offsetof(sparc_trap_data, windowSave),
 		offsetof(sparc_trap_data, currentThread),
+		offsetof(sparc_trap_data, userSpillCount),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1886,6 +1887,14 @@ void
 sparc_set_kernel_stack(addr_t stackTop)
 {
 	sTrapData.kernelStackTop = stackTop - SPARC_STACK_BIAS;
+}
+
+
+/*!	How many user windows have gone to the user's own stack. See the header. */
+uint64
+sparc_user_spill_count()
+{
+	return sTrapData.userSpillCount;
 }
 
 

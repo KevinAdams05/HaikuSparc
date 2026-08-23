@@ -78,6 +78,7 @@
 #define TRAP_DATA_KERNEL_STACK		0xc8
 #define TRAP_DATA_WINDOW_SAVE		0xd0
 #define TRAP_DATA_CURRENT_THREAD	0xd8
+#define TRAP_DATA_USER_SPILL_COUNT	0xe0
 #define TRAP_DATA_OFFSET_COUNT		21
 
 /*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
@@ -135,6 +136,27 @@
 #define PT_VA_HOLE_SHIFT		43
 
 #define ASI_PHYS_USE_EC			0x14
+
+/*	Primary address space, but with the *user's* privilege.
+ *
+ *	What a spill of a user window to the user's own stack has to use. A plain
+ *	store from a trap handler carries kernel privilege and would write a page the
+ *	user cannot, which is the user's own window data going somewhere the user was
+ *	not allowed to put it -- and it hides a bug rather than reporting one.
+ */
+#define ASI_AS_IF_USER_PRIMARY		0x10
+
+/*	WSTATE selects *which* spill and fill handler a trap uses: the vector is
+ *	0x80 + 4 * WSTATE.NORMAL when OTHERWIN is zero, and 0xa0 + 4 * WSTATE.OTHER
+ *	when it is not. Bits 2:0 are NORMAL, bits 5:3 OTHER.
+ *
+ *	So the kernel runs with NORMAL = 0, group zero, the handler that stores with
+ *	kernel privilege to a kernel stack; and userspace runs with NORMAL = 1, group
+ *	one, the handler that stores through ASI_AS_IF_USER_PRIMARY. OTHER stays 0 in
+ *	both, because the cross-privilege case has one answer.
+ */
+#define WSTATE_KERNEL			0
+#define WSTATE_USER			1
 
 // TTE_SOFT_ACCESSED, from arch_mmu.h.
 #define TTE_SOFT_ACCESSED_BIT		0x200
@@ -683,6 +705,87 @@ sparc_immu_miss_slow:
 .endm
 
 
+/*	Spill a user window to the user's own stack, with the user's privilege.
+
+	Used while userspace is running: it nests deeply, runs out of windows, and the
+	oldest one has to go to the frame it names. That frame is the user's, and so
+	is the privilege the store should carry.
+
+	The ASI goes in %asi rather than being named on each instruction, because the
+	immediate-ASI form of `stxa` cannot use a register-plus-offset address and
+	sixteen `add`s would not fit the group. %asi is part of the trap state, so
+	`retry` puts the interrupted code's value back.
+
+	A fault here is not handled yet: an unwritable or absent user stack page
+	reports through the unhandled-trap path instead of being silently written by
+	the kernel. Wrong, but wrong in the direction that says so.
+*/
+.macro SPILL_USER_STACK_WINDOW
+	/*	Counted, because "is this handler reached at all" is the question the
+		window work keeps raising and three instructions answer it for good.
+	*/
+	ldx	[%g7 + TRAP_DATA_USER_SPILL_COUNT], %g1
+	inc	%g1
+	stx	%g1, [%g7 + TRAP_DATA_USER_SPILL_COUNT]
+
+	wr	%g0, ASI_AS_IF_USER_PRIMARY, %asi
+
+	stxa	%l0, [%sp + BIAS + (0 * 8)] %asi
+	stxa	%l1, [%sp + BIAS + (1 * 8)] %asi
+	stxa	%l2, [%sp + BIAS + (2 * 8)] %asi
+	stxa	%l3, [%sp + BIAS + (3 * 8)] %asi
+	stxa	%l4, [%sp + BIAS + (4 * 8)] %asi
+	stxa	%l5, [%sp + BIAS + (5 * 8)] %asi
+	stxa	%l6, [%sp + BIAS + (6 * 8)] %asi
+	stxa	%l7, [%sp + BIAS + (7 * 8)] %asi
+	stxa	%i0, [%sp + BIAS + (8 * 8)] %asi
+	stxa	%i1, [%sp + BIAS + (9 * 8)] %asi
+	stxa	%i2, [%sp + BIAS + (10 * 8)] %asi
+	stxa	%i3, [%sp + BIAS + (11 * 8)] %asi
+	stxa	%i4, [%sp + BIAS + (12 * 8)] %asi
+	stxa	%i5, [%sp + BIAS + (13 * 8)] %asi
+	stxa	%i6, [%sp + BIAS + (14 * 8)] %asi
+	stxa	%i7, [%sp + BIAS + (15 * 8)] %asi
+
+	saved
+	retry
+.endm
+
+
+/*	And back, with the same privilege for the same reason. */
+.macro FILL_USER_STACK_WINDOW
+	wr	%g0, ASI_AS_IF_USER_PRIMARY, %asi
+
+	ldxa	[%sp + BIAS + (0 * 8)] %asi, %l0
+	ldxa	[%sp + BIAS + (1 * 8)] %asi, %l1
+	ldxa	[%sp + BIAS + (2 * 8)] %asi, %l2
+	ldxa	[%sp + BIAS + (3 * 8)] %asi, %l3
+	ldxa	[%sp + BIAS + (4 * 8)] %asi, %l4
+	ldxa	[%sp + BIAS + (5 * 8)] %asi, %l5
+	ldxa	[%sp + BIAS + (6 * 8)] %asi, %l6
+	ldxa	[%sp + BIAS + (7 * 8)] %asi, %l7
+	ldxa	[%sp + BIAS + (8 * 8)] %asi, %i0
+	ldxa	[%sp + BIAS + (9 * 8)] %asi, %i1
+	ldxa	[%sp + BIAS + (10 * 8)] %asi, %i2
+	ldxa	[%sp + BIAS + (11 * 8)] %asi, %i3
+	ldxa	[%sp + BIAS + (12 * 8)] %asi, %i4
+	ldxa	[%sp + BIAS + (13 * 8)] %asi, %i5
+	ldxa	[%sp + BIAS + (14 * 8)] %asi, %i6
+	ldxa	[%sp + BIAS + (15 * 8)] %asi, %i7
+
+	restored
+	retry
+.endm
+
+
+FUNCTION(sparc_spill_user_stack):
+	SPILL_USER_STACK_WINDOW
+
+
+FUNCTION(sparc_fill_user_stack):
+	FILL_USER_STACK_WINDOW
+
+
 FUNCTION(sparc_spill_user):
 	SPILL_USER_WINDOW
 
@@ -883,6 +986,16 @@ sparc_unhandled_trap_stop:
 	 * which is worse than not switching at all: the handler would save one
 	 * bank's globals and restore them into another.
 	 */
+	/*	Spills from here on are the kernel's own business, so they use the
+		handler that stores with kernel privilege to a kernel stack.
+
+		The `save` above ran with whatever WSTATE the interrupted code had, and
+		that is deliberate: a trap out of userspace still has WSTATE.NORMAL at 1
+		there, so if that save spills, it spills a *user* window and the user
+		handler is the right one to do it.
+	 */
+	wrpr	%g0, WSTATE_KERNEL, %wstate
+
 	/*	The thread pointer kernel C code must see, read while the trap's own
 		global bank is still selected -- the trap data block is reached through
 		*that* bank's %g7, and the normal bank's belongs to whoever was
@@ -1043,6 +1156,17 @@ sparc_unhandled_trap_stop:
 	 * NWINDOWS is 8, so the arithmetic wraps with a mask of 7; CWP is TSTATE
 	 * bits 4:0.
 	 */
+	/*	If this returns to userspace, its spills are its own again -- and so is the
+		`restore` below, which may itself trap to a fill. With WSTATE.NORMAL back
+		at 1 that fill reads the user's stack with the user's privilege, which is
+		what filling a user window should do.
+	 */
+	andcc	%l0, TSTATE_PRIV, %g0
+	bne,pt	%xcc, 9f
+	 nop
+	wrpr	%g0, WSTATE_USER, %wstate
+9:
+
 	rdpr	%cwp, %l6
 	sub	%l6, 1, %l6
 	and	%l6, 7, %l6
@@ -1303,6 +1427,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (19 * 8)]
 	mov	TRAP_DATA_CURRENT_THREAD, %o1
 	stx	%o1, [%o0 + (20 * 8)]
+	mov	TRAP_DATA_USER_SPILL_COUNT, %o1
+	stx	%o1, [%o0 + (21 * 8)]
 	retl
 	 nop
 
@@ -1437,6 +1563,27 @@ FUNCTION(sparc_read_trap_page_table):
 .macro TRAP_GROUP_SPILL_USER
 8:	SPILL_USER_WINDOW
 	.org 8b + 128
+.endm
+
+
+.macro TRAP_GROUP_SPILL_USER_STACK
+8:	SPILL_USER_STACK_WINDOW
+	.org 8b + 128
+.endm
+
+
+.macro TRAP_GROUP_FILL_USER_STACK
+8:	FILL_USER_STACK_WINDOW
+	.org 8b + 128
+.endm
+
+
+/*	A whole four-entry group of unhandled, for a WSTATE value nothing sets. */
+.macro TRAP_GROUP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
+	TRAP_UNHANDLED
 .endm
 
 
@@ -1578,21 +1725,29 @@ FUNCTION(sparc_read_trap_page_table):
 	 * 0x0a0-0x0bf: spill_0_other through spill_7_other -- a user window, which
 	 * the kernel must not store to the address userspace chose.
 	 */
-	.rept 8
-	TRAP_GROUP_SPILL
+	TRAP_GROUP_SPILL		/* WSTATE.NORMAL 0: a kernel window */
+	TRAP_GROUP_SPILL_USER_STACK	/* WSTATE.NORMAL 1: userspace's own */
+	.rept 6
+	TRAP_GROUP_UNHANDLED
 	.endr
-	.rept 8
-	TRAP_GROUP_SPILL_USER
+
+	TRAP_GROUP_SPILL_USER		/* WSTATE.OTHER 0: the save area */
+	.rept 7
+	TRAP_GROUP_UNHANDLED
 	.endr
 
 	/* 0x0c0-0x0df: fill_0_normal through fill_7_normal.
 	 * 0x0e0-0x0ff: fill_0_other through fill_7_other.
 	 */
-	.rept 8
-	TRAP_GROUP_FILL
+	TRAP_GROUP_FILL			/* WSTATE.NORMAL 0 */
+	TRAP_GROUP_FILL_USER_STACK	/* WSTATE.NORMAL 1 */
+	.rept 6
+	TRAP_GROUP_UNHANDLED
 	.endr
-	.rept 8
-	TRAP_GROUP_FILL_USER
+
+	TRAP_GROUP_FILL_USER		/* WSTATE.OTHER 0 */
+	.rept 7
+	TRAP_GROUP_UNHANDLED
 	.endr
 
 	/* 0x100-0x13f: software traps below the system call vector.

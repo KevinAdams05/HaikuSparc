@@ -162,6 +162,14 @@ extern void sparc_set_window_save(void* area);
 */
 extern void sparc_set_current_thread(void* thread);
 
+/*!	How many user windows have been spilled to the user's own stack.
+
+	Cheap, and it answers the question the window work keeps raising: whether a
+	handler is reached at all. Three instructions on a path that only userspace
+	takes.
+*/
+extern uint64 sparc_user_spill_count();
+
 /*!	Removes every trace of a context, for reuse by a different team.
 
 	Both caches, because they fail differently. A stale TLB entry is removed by
@@ -265,7 +273,8 @@ struct sparc_trap_data {
 	uint64	kernelStackTop;		// 0xc8  biased, for a trap out of userspace
 	uint64	windowSave;			// 0xd0  this thread's user window save area
 	uint64	currentThread;		// 0xd8  what %g7 must be for kernel C code
-	uint64	reserved[4];		// pad to 256 bytes
+	uint64	userSpillCount;		// 0xe0  user windows spilled to the user's stack
+	uint64	reserved[3];		// pad to 256 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -287,6 +296,7 @@ struct sparc_trap_data {
 #define TRAP_DATA_KERNEL_STACK		0xc8
 #define TRAP_DATA_WINDOW_SAVE		0xd0
 #define TRAP_DATA_CURRENT_THREAD	0xd8
+#define TRAP_DATA_USER_SPILL_COUNT	0xe0
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
@@ -319,7 +329,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		21
+#define TRAP_DATA_OFFSET_COUNT		22
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

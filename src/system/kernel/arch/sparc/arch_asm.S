@@ -19,6 +19,10 @@
 #define PSTATE_PRIV			0x004
 #define PSTATE_PEF			0x010
 
+// WSTATE.NORMAL for userspace: the spill handler that stores with the user's own
+// privilege. From arch_traps.S, which owns the trap table this selects into.
+#define WSTATE_USER			1
+
 
 /*	%g2 and %g3 are the SPARC V9 "application" globals and %g6/%g7 are reserved
  *	for system software, so the assembler insists they be declared before use.
@@ -267,6 +271,14 @@ FUNCTION(sparc_enter_userspace):
 	clr	%g5
 	clr	%g6
 	clr	%g7
+
+	/*	And userspace spills its own windows itself, to its own stack, with its
+		own privilege. WSTATE.NORMAL selects which of the eight spill handlers a
+		trap uses; group one is the one that stores through
+		ASI_AS_IF_USER_PRIMARY. The kernel runs with group zero and the trap entry
+		puts it back.
+	*/
+	wrpr	%g0, WSTATE_USER, %wstate
 
 	retry
 
