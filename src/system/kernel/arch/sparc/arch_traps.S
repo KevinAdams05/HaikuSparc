@@ -114,7 +114,7 @@
 #define IFRAME_SFAR			0x70
 #define IFRAME_TAG_ACCESS		0x78
 #define IFRAME_OUT			0x80
-#define IFRAME_SIZEOF			0xb0
+#define IFRAME_SIZEOF			0xc0
 
 // The data MMU's fault status and address registers.
 #define MMU_SFSR			0x18
@@ -1106,6 +1106,8 @@ sparc_unhandled_trap_stop:
 	stx	%i3, [%l7 + IFRAME_OUT + (3 * 8)]
 	stx	%i4, [%l7 + IFRAME_OUT + (4 * 8)]
 	stx	%i5, [%l7 + IFRAME_OUT + (5 * 8)]
+	stx	%i6, [%l7 + IFRAME_OUT + (6 * 8)]
+	stx	%i7, [%l7 + IFRAME_OUT + (7 * 8)]
 .endif
 
 	/* Down to trap level zero, so the handler runs like ordinary kernel code.
@@ -1162,6 +1164,14 @@ sparc_unhandled_trap_stop:
 	ldx	[%l7 + IFRAME_OUT + (3 * 8)], %i3
 	ldx	[%l7 + IFRAME_OUT + (4 * 8)], %i4
 	ldx	[%l7 + IFRAME_OUT + (5 * 8)], %i5
+
+	/*	%i6 and %i7 are deliberately not restored. They are the trapped window's
+		frame pointer and return address, which the `restore` below brings back
+		from the register file or the stack -- writing them here would overwrite a
+		correct value with a copy, and a stale one if a handler moved the stack.
+		They are captured on the way in only so a system call can find its
+		arguments.
+	 */
 .endif
 
 	/* Reload the trap state from the frame rather than from this window's

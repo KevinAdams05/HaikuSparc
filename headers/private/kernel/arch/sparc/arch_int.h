@@ -60,8 +60,8 @@ struct iframe {
 		// of those -- the "fast" in fast_data_access_protection means it skips
 		// the fault status registers -- so SFAR says nothing about it and this
 		// is the only place its address appears.
-	uint64	out[6];
-		// The trapped code's %o0-%o5, and only for the traps that ask for them.
+	uint64	out[8];
+		// The trapped code's %o0-%o7, and only for the traps that ask for them.
 		//
 		// A trap does not rotate CWP, so the handler's `save` makes the trapped
 		// window the previous one and its outs become the handler's ins -- which
@@ -73,11 +73,15 @@ struct iframe {
 		// putting them here is what lets the handler be written in C. Restored
 		// on the way out, so writing out[0] sets what the caller sees.
 		//
+		// All eight rather than the six the arguments use, because %o6 is the
+		// stack pointer and a system call with more than six arguments has to
+		// read the rest off the caller's stack.
+		//
 		// Filled only when TRAP_TO_C is told to, because the interrupt path
 		// takes tens of thousands of traps a boot and has no use for them.
 };
 
-#define IFRAME_SIZEOF	176
+#define IFRAME_SIZEOF	192
 	// sizeof(struct iframe) rounded up to a 16-byte multiple, which is what
 	// stack frames have to be aligned to.
 

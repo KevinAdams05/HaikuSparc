@@ -297,9 +297,10 @@ FUNCTION(sparc_enter_userspace):
 	trap number lands on an unhandled vector and the wrong index falls through to
 	the "unimplemented call" path, and either way the test does not pass.
 
-	It reports what it finds in %g7 rather than a constant, so the test proves
-	two things at once: that userspace ran, and that its thread local storage
-	pointer arrived in the register the platform keeps one in.
+	It makes a real system call -- the index is handed to it in %o0, so this blob
+	does not have to be rebuilt when the numbers move -- and then reports two
+	values through the exit call: what the kernel returned, and what it found in
+	%g7. Two assertions in one excursion, and a failure says which.
 */
 #define USER_TEST_SYSCALL_TRAP		0x40
 #define USER_TEST_SYSCALL_EXIT		0x555
@@ -337,8 +338,17 @@ FUNCTION(sparc_user_test_program):
 	restore
 	restore
 
+	/*	A real system call. The index arrived in %o0 as this program's first
+		argument, and the result comes back there.
+	*/
+	mov	%o0, %g1
+	ta	USER_TEST_SYSCALL_TRAP
+
+	/*	And out, carrying the result in %o0 and the thread local storage pointer
+		in %o1.
+	*/
+	mov	%g7, %o1
 	mov	USER_TEST_SYSCALL_EXIT, %g1
-	mov	%g7, %o0
 	ta	USER_TEST_SYSCALL_TRAP
 
 	/*	Not reached: the handler does not return here. Spinning rather than

@@ -19,7 +19,10 @@
 #include <thread.h>
 #include <timer.h>
 #include <arch_mmu.h>
+#include <arch_thread_types.h>
 #include <kernel.h>
+#include <ksyscalls.h>
+#include <syscall_numbers.h>
 #include <vm/vm.h>
 #include <vm/vm_page.h>
 #include <vm/vm_priv.h>
@@ -41,6 +44,7 @@ extern "C" uint32 sparc_user_test_program_end[];
 static jmp_buf sUserTestReturn;
 static bool sUserTestActive = false;
 static uint64 sUserTestValue = 0;
+static uint64 sUserTestTls = 0;
 
 // Defined below sparc_interrupt(), which is where it is easiest to read, and
 // called from both of the paths that reach it.
@@ -491,10 +495,9 @@ sparc_test_userspace()
 {
 	const addr_t kCodeAddress = 0x20000000;
 	const addr_t kStackAddress = 0x20100000;
-	// Handed to userspace as its thread local storage pointer, and reported back
-	// out of %g7 -- so a right answer means the register arrived, and a wrong one
-	// distinguishes "userspace did not run" from "TLS did not reach it".
-	const uint64 kExpected = 0x715c0000;
+	// Handed to userspace as its thread local storage pointer and reported back
+	// out of %g7, so the two assertions below stay separable.
+	const uint64 kTlsPointer = 0x715c0000;
 
 	// The stack the trap out of userspace lands on. See above.
 	static uint8 sTrapStack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
@@ -569,8 +572,10 @@ sparc_test_userspace()
 	if (setjmp(sUserTestReturn) == 0) {
 		addr_t frame = ROUNDDOWN(kStackAddress + B_PAGE_SIZE
 			- SPARC_MINIMUM_FRAME_SIZE, 16);
-		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS, 0, 0,
-			(addr_t)kExpected);
+		// The system call index goes in as the first argument, so the hand-written
+		// program does not have to be rebuilt when the numbers move.
+		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS,
+			SYSCALL_SYSTEM_TIME, 0, (addr_t)kTlsPointer);
 	}
 
 	// Back here through longjmp() from the system call handler.
@@ -589,14 +594,24 @@ sparc_test_userspace()
 		B_PRIu64 " parked by the kernel\n", sparc_user_spill_count(),
 		sparc_other_spill_count());
 
-	dprintf("sparc_int: userspace read %%g7 as %#" B_PRIx64 " of %#" B_PRIx64
-		" -- %s\n", sUserTestValue, kExpected,
-		sUserTestValue == kExpected
-			? "ran in userspace, with its TLS pointer" : "WRONG");
+	// A plausible system_time(): after this much boot it is well past zero, and
+	// it must not be absurd either -- a wrong argument or a mangled return value
+	// shows up as a wild number rather than as a small one.
+	bigtime_t now = system_time();
+	bool timeOk = sUserTestValue > 0 && sUserTestValue <= (uint64)now
+		&& sUserTestValue > (uint64)now - 1000000;
+	bool tlsOk = sUserTestTls == kTlsPointer;
 
-	if (sUserTestValue != kExpected) {
-		panic("sparc: the userspace test reported %#" B_PRIx64 ", wanted %#"
-			B_PRIx64, sUserTestValue, kExpected);
+	dprintf("sparc_int: userspace called system_time() -> %" B_PRIu64
+		" (kernel says %" B_PRIdBIGTIME "), read %%g7 as %#" B_PRIx64
+		" -- syscall %s, TLS %s\n", sUserTestValue, now, sUserTestTls,
+		timeOk ? "dispatched" : "WRONG", tlsOk ? "delivered" : "WRONG");
+
+	if (!timeOk || !tlsOk) {
+		panic("sparc: userspace got %" B_PRIu64 " from system_time() and %#"
+			B_PRIx64 " in %%g7; the kernel says the time is %" B_PRIdBIGTIME
+			" and the TLS pointer is %#" B_PRIx64, sUserTestValue, sUserTestTls,
+			now, kTlsPointer);
 	}
 }
 
@@ -796,6 +811,57 @@ sparc_test_preemption()
 	the case that matters -- which is exactly what the checks below handle
 	instead.
 */
+/*!	Hands a system call to the kernel's dispatcher.
+
+	The dispatcher wants one contiguous argument list. SPARC hands over the first
+	six in registers and the rest on the caller's stack, at the offset the V9 ABI
+	reserves for them -- past the sixteen-word register save area and the six
+	argument slots that a varargs callee would spill its register arguments into.
+
+	Those stack arguments are user memory, so they are read with user_memcpy() and
+	a bad pointer becomes a failed call rather than a fault in the kernel. The
+	register half needs no such care: it arrived in registers.
+
+	Interrupts go back on before dispatching. A system call blocks -- that is most
+	of what they do -- and a thread that blocks with interrupts disabled never
+	gets the CPU back, because the timer that would preempt whoever it is waiting
+	for cannot fire.
+*/
+static void
+sparc_dispatch_syscall(struct iframe* frame, uint32 index)
+{
+	// The ABI's stack argument area: the register save area is 128 bytes and the
+	// six argument slots another 48, so anything beyond the sixth argument starts
+	// 176 bytes into the frame.
+	const size_t kStackArgumentOffset = 176;
+	const uint32 kRegisterArguments = 6;
+
+	uint64 arguments[20];
+	uint32 count = kExtendedSyscallInfos[index].parameter_count;
+
+	memcpy(arguments, frame->out,
+		sizeof(uint64) * min_c(count, kRegisterArguments));
+
+	if (count > kRegisterArguments) {
+		addr_t stack = (addr_t)frame->out[6] + SPARC_STACK_BIAS
+			+ kStackArgumentOffset;
+		status_t status = user_memcpy(&arguments[kRegisterArguments],
+			(const void*)stack,
+			sizeof(uint64) * (count - kRegisterArguments));
+		if (status != B_OK) {
+			frame->out[0] = (uint64)status;
+			return;
+		}
+	}
+
+	enable_interrupts();
+
+	uint64 returnValue = 0;
+	syscall_dispatcher(index, arguments, &returnValue);
+	frame->out[0] = returnValue;
+}
+
+
 /*!	The system call trap.
 
 	Reached by `ta SPARC_SYSCALL_TRAP` from either privilege level, with the index
@@ -826,6 +892,12 @@ sparc_syscall(struct iframe *frame)
 	frame->tpc = frame->tnpc;
 	frame->tnpc = frame->tpc + 4;
 
+	// A real call, if it is one the kernel knows.
+	if (index < (uint64)kSyscallCount) {
+		sparc_dispatch_syscall(frame, (uint32)index);
+		return;
+	}
+
 	static bool sReported = false;
 	if (!sReported) {
 		sReported = true;
@@ -840,6 +912,7 @@ sparc_syscall(struct iframe *frame)
 			if (sUserTestActive) {
 				sUserTestActive = false;
 				sUserTestValue = frame->out[0];
+				sUserTestTls = frame->out[1];
 
 				// Straight back to the test rather than to a userspace with
 				// nothing left to do. This abandons the trap return, which is
