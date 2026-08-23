@@ -59,6 +59,12 @@ arch_thread_init_thread_struct(Thread *thread)
 	// machine ends up alternating between two trap levels forever.
 	thread->arch_info.windowSave.count = 0;
 
+	// Same reasoning, same allocator. Nothing pushed an interrupt frame before
+	// this port started keeping the stack, so nobody noticed the index started as
+	// poison; anything that reads it -- signal frames, the user debugger -- would
+	// index off the end of a four-entry array.
+	thread->arch_info.iframes.index = 0;
+
 	return B_OK;
 }
 

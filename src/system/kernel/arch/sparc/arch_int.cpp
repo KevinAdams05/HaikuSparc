@@ -40,6 +40,44 @@ extern "C" void sparc_enter_userspace(addr_t entry, addr_t stackPointer,
 extern "C" uint32 sparc_user_test_program[];
 extern "C" uint32 sparc_user_test_program_end[];
 
+/*!	Makes the trap's frame findable for as long as the handler runs.
+
+	Signal delivery and the user debugger both need the interrupt frame of the
+	trap they are reacting to, and neither is called from the handler -- they run
+	later, from the generic code on the way back to userspace. So the frame has to
+	be published somewhere per-thread while the handler is on the stack, which is
+	what iframe_stack is for.
+
+	Four deep, which is what the structure allows and more than the nesting this
+	port permits: a trap from userspace, a page fault inside the handler, and that
+	is the end of it. Deeper than that and the frame is dropped rather than
+	written past the end -- a lost backtrace beats a corrupted thread.
+*/
+class IFrameScope {
+public:
+	IFrameScope(struct iframe* frame)
+	{
+		Thread* thread = thread_get_current_thread();
+		fStack = thread != NULL ? &thread->arch_info.iframes : NULL;
+
+		if (fStack != NULL && fStack->index >= 0
+			&& fStack->index < IFRAME_TRACE_DEPTH) {
+			fStack->frames[fStack->index++] = frame;
+		} else
+			fStack = NULL;
+	}
+
+	~IFrameScope()
+	{
+		if (fStack != NULL)
+			fStack->index--;
+	}
+
+private:
+	iframe_stack*	fStack;
+};
+
+
 // Set up by sparc_test_userspace(), read by sparc_syscall().
 static jmp_buf sUserTestReturn;
 static bool sUserTestActive = false;
@@ -317,6 +355,8 @@ sparc_verify_iframe_layout()
 extern "C" void
 sparc_interrupt(struct iframe *frame)
 {
+	IFrameScope frameScope(frame);
+
 	if (frame->tt == TRAP_INTERRUPT_VECTOR) {
 		sparc_interrupt_vector();
 		sparc_interrupt_epilogue();
@@ -577,6 +617,12 @@ sparc_test_userspace()
 		sparc_enter_userspace(kCodeAddress, frame - SPARC_STACK_BIAS,
 			SYSCALL_SYSTEM_TIME, 0, (addr_t)kTlsPointer);
 	}
+
+	// Back here through longjmp() from the system call handler, which skipped the
+	// handler's own unwinding -- including the IFrameScope that had pushed the
+	// trap's frame. Put the index back rather than leaving this thread one deep
+	// forever.
+	thread->arch_info.iframes.index = 0;
 
 	// Back here through longjmp() from the system call handler.
 	//
@@ -883,6 +929,8 @@ sparc_dispatch_syscall(struct iframe* frame, uint32 index)
 extern "C" void
 sparc_syscall(struct iframe *frame)
 {
+	IFrameScope frameScope(frame);
+
 	uint64 index = frame->g1;
 	bool isUser = (frame->tstate & TSTATE_PRIV) == 0;
 
@@ -943,6 +991,8 @@ sparc_syscall(struct iframe *frame)
 extern "C" void
 sparc_page_fault(struct iframe *frame)
 {
+	IFrameScope frameScope(frame);
+
 	uint64 trap = frame->tt;
 	bool isInstructionMiss = (trap & ~3) == TRAP_INSTRUCTION_MMU_MISS;
 	bool isDataMiss = (trap & ~3) == TRAP_DATA_MMU_MISS;
