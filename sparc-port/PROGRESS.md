@@ -3040,3 +3040,71 @@ the iframe holds.
 **Not tested end to end.** Nothing registers a handler until there is a userland. What is tested is that
 the commpage entry is built and registered at boot, that the trampoline is position independent, and
 that none of it disturbed anything.
+
+
+## 38. A review, before going further
+
+Four days of fast work, so a pass over it before adding more. Two findings needed fixing, two did not,
+and one thing is still untested and should be said plainly rather than left implied.
+
+### I added the exact hazard this port has machinery to catch
+
+`SPARC_SYSCALL_TRAP` had **four independent copies** — `arch_int.h`, a local define in `arch_asm.S`, a
+literal in `libroot`'s `syscalls.inc`, a literal in the commpage trampoline's inline asm — and a fifth
+encoding as a *position* in the trap table. Any two disagreeing sends system calls to a vector that
+reports an unhandled trap; the libroot copy would take every userland call with it, the commpage copy
+every signal return.
+
+`WSTATE_KERNEL`/`WSTATE_USER` had two copies, set in different files: the trap entry puts the kernel's
+back, `sparc_enter_userspace()` hands the user's over. Drift there routes a spill through a handler the
+other side did not intend, *silently*, because both work for a program whose stack happens to be present
+and writable.
+
+This is the same class as the constants `sparc_mmu_defines()` and `sparc_trap_data_offsets()` exist to
+check, and I shipped six copies without checks. Four of the five syscall copies are now one definition
+in `<arch_syscall_defs.h>`, and the WSTATE pair one in `<arch_asm_defs.h>`.
+
+`<asm_defs.h>` was the obvious home for the syscall number and is unusable: it defines `SYMBOL`, and so
+does `elf_priv.h`, so including it from C++ is an error. Hence a header holding nothing else.
+
+The fifth coupling cannot be shared, because a position is not a definition — so it gets a check that
+decodes the branch at trap type `0x100 + SPARC_SYSCALL_TRAP` and confirms where it lands.
+
+### Writing that check walked into the hazard this file warns about twice
+
+Making the entry `.global` so C could name it turned the table's `ba,a` into a relocation this kernel
+leaves unresolved, and the vector assembled as `b,a` **to its own address**. Every system call would have
+spun forever.
+
+Two names for one address now: global for the check, local for the branch, and a comment saying what
+happens if they are collapsed again. The new check would have caught it at boot; disassembling the vector
+caught it first, which is cheaper, and is the habit to keep for anything touching the trap table.
+
+### One of my own handlers is unreachable
+
+`FILL_USER_WINDOW` never runs: `save-area fills 0`. The trap return moves `OTHERWIN` into `CANRESTORE`
+before its `restore`, so a fill never selects the `_other` vector, and by then the save area has been
+emptied onto the user's stack where the `_normal` handler reads from.
+
+Normally a deletion. It is a **count** instead, because that argument is a chain of four invariants and
+two of this week's invariants were wrong — the claim that `OTHERWIN` would need saving in `arch_context`,
+and the claim that a mutex holder could only change if something wrote it. Three instructions on a path
+nothing takes turn "is this reachable" from something to re-derive into something to read off a boot log.
+
+### Two things that needed no change
+
+**Boot time.** The volume mounts at 65.16 s against §30's 65.2 s baseline, despite roughly fifteen extra
+instructions on every trap entry — stack switch, WSTATE, the `OTHERWIN` transfer, the thread pointer
+load, the flush check.
+
+**The locked handler region.** 2652 bytes of its 8 KB page, and `sparc_lock_trap_pages()` sizes itself
+from the symbols, so growth past a page is covered rather than assumed. Worth watching: it was 1564
+bytes four days ago.
+
+### What is still untested, said plainly
+
+Signal delivery, end to end. The frame setup, the restore, the commpage trampoline and its
+position-independence are all in place and individually checked, and **no signal has ever been
+delivered** — nothing registers a handler until there is a userland. `sparc_flush_user_windows()`'s
+failure path is likewise unexercised, and so is context id recycling, which needs 8191 live teams to
+reach.
