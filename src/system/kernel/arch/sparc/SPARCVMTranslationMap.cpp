@@ -868,7 +868,12 @@ SPARCVMTranslationMap::ClearAccessedAndModified(VMArea* area, addr_t address,
 		InvalidateCaches(address);
 		fMapCount--;
 
-		locker.Unlock();
+		// Detached rather than unlocked: UnaccessedPageUnmapped() releases fLock
+		// itself, on every one of its paths. Unlocking here and calling it would
+		// unlock twice, and the second one is by a thread that no longer holds
+		// it -- which is a panic in the page daemon, minutes after boot, the
+		// first time anything ages a page.
+		locker.Detach();
 		UnaccessedPageUnmapped(area, (tte & TTE_PA_MASK) / B_PAGE_SIZE);
 		return false;
 	}
