@@ -3208,3 +3208,96 @@ into `libroot`'s stubs.
 Still untested: **signal delivery end to end** — nothing registers a handler yet. Context id recycling
 still needs 8191 live teams. And `winfixup` — a fault *during* a spill — remains unwritten; the design
 constraint from §35 stands, that a faulted spill cannot be resumed.
+
+
+## 40. A signal is delivered
+
+```
+usertest sig
+usertest ok
+```
+
+Two lines, in that order, and the order is the result. A handler this program registered ran at an
+address the kernel computed, printed through a system call of its own, returned through the commpage
+trampoline, and left the interrupted context intact enough for the next instruction to run. Everything
+written blind in §37 has now run.
+
+It needed three things that were missing, and the first one is the reason none of the rest had ever been
+reached.
+
+### Nothing called `thread_at_kernel_exit()`
+
+Haiku delivers signals on the way out of the kernel, from `thread_at_kernel_exit()`, which each
+architecture calls on its own trap-return path. **This port called neither that nor
+`thread_at_kernel_entry()`.** So the signal frame, the trampoline and `_kern_restore_signal_frame()` were
+not untested for want of a userland — they were unreachable. Nothing would have delivered a signal on
+this port however many programs asked for one.
+
+Both are now in one place each: entry in `IFrameScope`'s constructor, which every trap that runs C
+already goes through, and exit in a new `sparc_kernel_exit()` that replaces the bare call to
+`sparc_flush_user_windows()`. The flush stays first, because the flush is what makes
+`arch_setup_signal_frame()`'s claim true — it deliberately leaves the interrupted window's locals and ins
+out of the context on the grounds that a handler walking its frames finds them in memory, and this is
+what puts them there.
+
+Time accounting came along for free, and had the same hole: a boundary counted on the way out but not on
+the way in charges the whole trap to userspace.
+
+### The frame was popped one call too early
+
+`arch_setup_signal_frame()` is reached through Haiku's generic `handle_signals()`, which passes no frame,
+so an architecture's only way to say *which* trap is being interrupted is to leave the frame somewhere
+the thread can be asked for. This port has the iframe stack for exactly that — and the handler's
+`IFrameScope` pops it when the handler returns, which is before the exit path runs.
+
+    PANIC: arch_setup_signal_frame: no interrupt frame for thread 37
+
+So the very first signal ever delivered here panicked, and the panic was accurate: there was no frame.
+`sparc_kernel_exit()` now pushes it again for its own duration. Servicing the trap is not over when the
+handler returns.
+
+### `%o0` and `%o6` had to survive the trap return
+
+`arch_setup_signal_frame()` hands the trampoline its argument in `out[0]` and its stack in `out[6]`, and
+the trap return wrote back neither: `out[0..5]` only for a system call, `out[6]` never. Both are now
+written back on the userspace-return path, after the argument reload so that a signal interrupting a
+system call's *return* runs the handler instead of returning — the result is not lost, since
+`_kern_restore_signal_frame()` puts the whole context back.
+
+Writing `%i6` reaches the trapped window's `%o6` because a trap does not rotate CWP: this window's ins
+and that window's outs are the same registers. Its **locals and ins** are not, and that is the sharp
+edge — if the window was spilled, the `restore` that ends the trap traps to a fill which reads sixteen
+words from the *new* stack pointer. The values do not matter (the trampoline reads only `%o0` and `%sp`
+and overwrites the rest with its own `save`); whether the read faults does, because a fault inside a
+fill is `winfixup` and `winfixup` does not exist. So `arch_setup_signal_frame()` zeroes that save area
+before returning — at trap level zero, where a first-touch fault on a fresh stack page is an ordinary
+page fault, and the fill is handed a page it can read rather than one it would have to fault on.
+
+### And the test program was aligned by luck
+
+`.text` in a freestanding file has `sh_addralign` 1, so the linker places it wherever `.dynstr` ends —
+and `.dynstr`'s length is the length of the symbol names. The first version landed on `0x1a8` and ran.
+Adding one symbol moved the entry point to `0x1cf`, and an instruction fetch from an address that is not
+a multiple of four is trap 0x34 on the first instruction, before anything can report anything. One
+`.align 8`, and a comment saying why it is not decoration.
+
+### Syscall restart, implemented and not yet tested
+
+A signal interrupting a restartable system call has to send the thread back to the `ta` with the
+arguments it started with — and by the time anything knows to do that, `sparc_syscall()` has stepped
+past the instruction and the dispatcher has written the result over the first argument. Neither is
+recoverable by arithmetic: `%tpc - 4` is wrong for a `ta` in a delay slot, which is the same reason the
+step past it is a copy rather than an addition.
+
+So `struct iframe` gained `syscallTpc`, `syscallTnpc` and `syscallArg0`, in the frame rather than in
+`arch_thread` because system calls nest — a handler interrupting a restartable call can make calls of its
+own, and the outer call's restart is decided only after they have returned. `IFRAME_SIZEOF` is 224.
+
+**Untested.** It needs a signal arriving while a thread is blocked in an interruptible call, which this
+program cannot arrange. Written now because the alternative was leaving `THREAD_FLAGS_RESTART_SYSCALL`
+silently ignored.
+
+### Unmoved
+
+Boot to a mounted volume: 65.60 s against 65.56 s without any of this. Every in-kernel self-test byte for
+byte identical.

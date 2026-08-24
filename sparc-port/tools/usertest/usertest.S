@@ -26,9 +26,28 @@
 
 #define SYSCALL_TRAP			0x40
 #define SYSCALL_EXIT_TEAM		41
+#define SYSCALL_SEND_SIGNAL		91
+#define SYSCALL_SIGACTION		93
 #define SYSCALL_DEBUG_OUTPUT		254
 
 #define FRAME				176
+
+/*	Roomier than the minimum, so that scratch past the sixteen-word save area
+ *	still fits inside the frame. 176 leaves 48 bytes there; 256 leaves 128.
+ */
+#define SIGNAL_FRAME			256
+
+/*	struct sigaction, from <signal.h>, laid out for a 64-bit big-endian target:
+ *	an 8-byte handler pointer, an 8-byte sigset_t mask, a 4-byte flag word with
+ *	4 bytes of padding behind it, and an 8-byte userdata pointer.
+ */
+#define SIGACTION_HANDLER		0
+#define SIGACTION_MASK			8
+#define SIGACTION_FLAGS			16
+#define SIGACTION_USERDATA		24
+#define SIGACTION_SIZE			32
+
+#define SIGUSR1				18
 
 
 /*	The message is built on the stack rather than kept in .rodata, and that is
@@ -44,6 +63,9 @@
  */
 #define MESSAGE_HIGH			0x7573657274657374	/* "usertest" */
 #define MESSAGE_LOW			0x206f6b0a00000000	/* " ok\n\0"    */
+
+#define SIGNAL_HIGH			0x7573657274657374	/* "usertest" */
+#define SIGNAL_LOW			0x207369670a000000	/* " sig\n\0"   */
 
 /*	Scratch inside this frame, past the sixteen words a spill of this window
  *	writes -- so building the message cannot be undone by the spill that the
@@ -62,6 +84,20 @@
 
 
 	.text
+
+	/*	Not decoration. This section carries no alignment of its own -- gas gives
+	 *	a bare `.text` in a freestanding file sh_addralign 1 -- so the linker puts
+	 *	it wherever the section before it ends, and the section before it is
+	 *	`.dynstr`, whose length is the length of the symbol names.
+	 *
+	 *	Which means the entry point's alignment depends on how many characters are
+	 *	in this program's symbols. The first version of it landed on 0x1a8 and ran;
+	 *	adding one symbol moved it to 0x1cf, and an instruction fetch from an
+	 *	address that is not a multiple of four is trap 0x34, on the first
+	 *	instruction, before anything can report anything.
+	 */
+	.align	8
+
 	.global _start
 	.type _start, %function
 _start:
@@ -93,9 +129,64 @@ _start:
 	restore
 	restore
 
+	/*	Then a signal, to itself, with a handler of its own.
+	 *
+	 *	This is the piece the kernel could not test on its own: nothing registers a
+	 *	handler until there is a userland, so the signal frame, the commpage
+	 *	trampoline and _kern_restore_signal_frame() were all written and never run.
+	 *	Sending one here exercises the whole path -- delivery on the way out of a
+	 *	trap, the handler entered at an address the kernel computed, and the return
+	 *	landing back on the instruction after the call that raised it.
+	 *
+	 *	Deliberately raised BEFORE the success message. If the handler runs but the
+	 *	return does not, the log says "usertest sig" and stops -- which is a
+	 *	different and much more useful failure than silence.
+	 */
+	/*	In a frame of its own, and not by shifting %sp by the size of the struct.
+	 *
+	 *	Scratch has to live past the sixteen words at %sp + BIAS, because that is
+	 *	where a window spill writes -- and both calls below can provoke one. Moving
+	 *	%sp down by 32 bytes would put the struct exactly in the region the next
+	 *	spill overwrites, which works right up until the window state happens to
+	 *	be one save short.
+	 */
+	save	%sp, -SIGNAL_FRAME, %sp
+
+	/*	The handler's address, computed rather than named. `call` records the
+	 *	address of the call instruction itself in %o7, so the label two
+	 *	instructions later is %o7 + 8 -- and the difference between two labels in
+	 *	one section is a constant the assembler folds, needing no relocation. Which
+	 *	is the whole constraint this program runs under.
+	 */
+	call	1f
+	 nop
+1:	add	%o7, signal_handler - 1b + 8, %g3
+	stx	%g3, [%sp + SCRATCH + SIGACTION_HANDLER]
+	stx	%g0, [%sp + SCRATCH + SIGACTION_MASK]
+	st	%g0, [%sp + SCRATCH + SIGACTION_FLAGS]
+	stx	%g0, [%sp + SCRATCH + SIGACTION_USERDATA]
+
+	mov	SIGUSR1, %o0
+	add	%sp, SCRATCH, %o1
+	clr	%o2
+	set	SYSCALL_SIGACTION, %g1
+	ta	SYSCALL_TRAP
+
+	/*	And raise it. Team zero is this one, so kill() semantics deliver it here;
+	 *	no thread id is needed and none can be obtained without another call.
+	 */
+	clr	%o0
+	mov	SIGUSR1, %o1
+	clr	%o2
+	clr	%o3
+	set	SYSCALL_SEND_SIGNAL, %g1
+	ta	SYSCALL_TRAP
+
+	restore
+
 	/*	Say so, on the same serial console the kernel prints to. Reached only if
-		all eight spills and fills above worked, which is why nothing is printed
-		before them.
+		all eight spills and fills above worked, and the signal went out and came
+		back, which is why nothing is printed before them.
 	 */
 	setx	MESSAGE_HIGH, %g2, %g3
 	stx	%g3, [%sp + SCRATCH]
@@ -115,6 +206,43 @@ _start:
 		next, so a failure to exit looks like a hang at a known address instead of
 		executing rodata.
 	 */
-1:	ba,a	1b
+2:	ba,a	2b
 	 nop
 	.size _start, . - _start
+
+
+/*	The signal handler: void signal_handler(int signal, void* userData,
+ *	vregs* registers).
+ *
+ *	An ordinary C-convention function, because that is how the commpage
+ *	trampoline calls it -- three arguments in %o0-%o2, its own frame to make. It
+ *	prints and returns; the interesting part is entirely in what has to work for
+ *	those two things to happen.
+ *
+ *	It does `save` deliberately rather than running as a leaf. A leaf would prove
+ *	less: the kernel has to have handed the trampoline a stack pointer that a
+ *	`save` beneath it can use, and if it has not then the fault is here rather
+ *	than somewhere later and harder to attribute.
+ */
+	.global signal_handler
+	.type signal_handler, %function
+signal_handler:
+	save	%sp, -FRAME, %sp
+
+	setx	SIGNAL_HIGH, %g2, %g3
+	stx	%g3, [%sp + SCRATCH]
+	setx	SIGNAL_LOW, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 8]
+
+	add	%sp, SCRATCH, %o0
+	set	SYSCALL_DEBUG_OUTPUT, %g1
+	ta	SYSCALL_TRAP
+
+	/*	Back to the trampoline, which traps to _kern_restore_signal_frame() and
+	 *	does not return. `ret; restore` is the ordinary pair: the return address
+	 *	is this window's %i7, and the restore gives the trampoline its own window
+	 *	back.
+	 */
+	ret
+	 restore
+	.size signal_handler, . - signal_handler
