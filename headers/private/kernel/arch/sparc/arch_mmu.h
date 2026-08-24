@@ -174,6 +174,21 @@ extern uint64 sparc_user_spill_count();
 	writing to the user's stack from a trap handler. */
 extern uint64 sparc_other_spill_count();
 
+/*!	How many times the save-area *fill* handler has been entered.
+
+	Expected to be zero, and reported anyway. The trap return moves OTHERWIN back
+	into CANRESTORE before its `restore`, so a fill never selects the _other
+	vector -- and by then the save area has been emptied onto the user's stack,
+	which is where the _normal handler reads from. So the handler exists for a
+	case the current design does not produce.
+
+	Counted rather than deleted because that argument is a chain of four
+	invariants, and this port has had two of those turn out to be wrong in a week.
+	Three instructions on a path nothing takes turn "is it reachable" from
+	something to reason about into something to read off a boot log.
+*/
+extern uint64 sparc_other_fill_count();
+
 /*!	Removes every trace of a context, for reuse by a different team.
 
 	Both caches, because they fail differently. A stale TLB entry is removed by
@@ -279,7 +294,8 @@ struct sparc_trap_data {
 	uint64	currentThread;		// 0xd8  what %g7 must be for kernel C code
 	uint64	userSpillCount;		// 0xe0  user windows spilled to the user's stack
 	uint64	otherSpillCount;	// 0xe8  user windows the kernel parked for later
-	uint64	reserved[2];		// pad to 256 bytes
+	uint64	otherFillCount;		// 0xf0  arrivals in the save-area fill handler
+	uint64	reserved[1];		// pad to 256 bytes
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -303,6 +319,7 @@ struct sparc_trap_data {
 #define TRAP_DATA_CURRENT_THREAD	0xd8
 #define TRAP_DATA_USER_SPILL_COUNT	0xe0
 #define TRAP_DATA_OTHER_SPILL_COUNT	0xe8
+#define TRAP_DATA_OTHER_FILL_COUNT	0xf0
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
@@ -335,7 +352,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		23
+#define TRAP_DATA_OFFSET_COUNT		24
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

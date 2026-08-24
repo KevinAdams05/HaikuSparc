@@ -83,6 +83,7 @@
 #define TRAP_DATA_CURRENT_THREAD	0xd8
 #define TRAP_DATA_USER_SPILL_COUNT	0xe0
 #define TRAP_DATA_OTHER_SPILL_COUNT	0xe8
+#define TRAP_DATA_OTHER_FILL_COUNT	0xf0
 #define TRAP_DATA_OFFSET_COUNT		21
 
 /*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
@@ -678,6 +679,17 @@ sparc_immu_miss_slow:
 */
 .macro FILL_USER_WINDOW
 	ldx	[%g7 + TRAP_DATA_WINDOW_SAVE], %g1
+
+	/*	Every arrival, counted before the checks below decide what to do with it.
+
+		This handler is not expected to run at all -- see sparc_other_fill_count()
+		-- so the count is the evidence for that rather than an argument, and it
+		sits after the first instruction so the trap table verification still
+		recognises the entry.
+	 */
+	ldx	[%g7 + TRAP_DATA_OTHER_FILL_COUNT], %g2
+	inc	%g2
+	stx	%g2, [%g7 + TRAP_DATA_OTHER_FILL_COUNT]
 	ldx	[%g1], %g2
 
 	brz,pn	%g2, sparc_unhandled_trap
@@ -1508,6 +1520,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (21 * 8)]
 	mov	TRAP_DATA_OTHER_SPILL_COUNT, %o1
 	stx	%o1, [%o0 + (22 * 8)]
+	mov	TRAP_DATA_OTHER_FILL_COUNT, %o1
+	stx	%o1, [%o0 + (23 * 8)]
 	retl
 	 nop
 

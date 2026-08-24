@@ -637,8 +637,9 @@ sparc_test_userspace()
 	restore_interrupts(interruptState);
 
 	dprintf("sparc_int: window spills -- %" B_PRIu64 " to the user's stack, %"
-		B_PRIu64 " parked by the kernel\n", sparc_user_spill_count(),
-		sparc_other_spill_count());
+		B_PRIu64 " parked by the kernel; save-area fills %" B_PRIu64 "\n",
+		sparc_user_spill_count(), sparc_other_spill_count(),
+		sparc_other_fill_count());
 
 	// A plausible system_time(): after this much boot it is well past zero, and
 	// it must not be absurd either -- a wrong argument or a mangled return value

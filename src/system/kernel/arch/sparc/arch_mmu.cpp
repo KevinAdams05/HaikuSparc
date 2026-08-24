@@ -1014,6 +1014,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, currentThread),
 		offsetof(sparc_trap_data, userSpillCount),
 		offsetof(sparc_trap_data, otherSpillCount),
+		offsetof(sparc_trap_data, otherFillCount),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1924,6 +1925,14 @@ uint64
 sparc_user_spill_count()
 {
 	return sTrapData.userSpillCount;
+}
+
+
+/*!	Arrivals in the save-area fill handler. See the header. */
+uint64
+sparc_other_fill_count()
+{
+	return sTrapData.otherFillCount;
 }
 
 
