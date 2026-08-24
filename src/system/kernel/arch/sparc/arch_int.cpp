@@ -1040,6 +1040,56 @@ sparc_syscall(struct iframe *frame)
 }
 
 
+/*!	Whether the instruction at \a pc writes to memory.
+
+	Asked because the hardware will not say. SFSR's W bit is the documented
+	answer, and the "fast" MMU traps are fast precisely because they skip the
+	fault status registers -- so on a fast_data_access_MMU_miss it holds whatever
+	the last trap that did write it left behind. Every fault this port reported
+	for months printed the same `sfsr 0xd`, W bit included, and nobody looked.
+
+	Two simpler answers were tried and both are wrong. Trusting SFSR calls every
+	miss a write, and the first *read* of an untouched read-only page is refused --
+	which is how the first dynamically linked program died, on the kernel fetching
+	an area name out of runtime_loader's .rodata. Calling every miss a read is
+	worse: this port has no modified tracking, so it marks pages writable in the
+	page table up front, and a store that faulted as a read gets a writable
+	mapping of the shared zero page and *silently writes into it*. That one does
+	not fail, it loses data.
+
+	So the instruction is decoded. SPARC V9 puts load and store in op = 3, and
+	within it op3 bit 2 separates the two in every group -- integer, floating
+	point, alternate-space and atomic alike (manual TABLE A-2). The
+	read-modify-write instructions land on the store side of that bit, which is
+	where they belong.
+
+	Reading it is done through user_memcpy() when the address is userspace's, and
+	that is not caution for its own sake: "it faulted, so it was fetched, so its
+	page is mapped" is false for an instruction fault, where %tpc is the address
+	that could *not* be fetched. Reading it directly panicked the kernel with
+	interrupts disabled and no fault handler. A failed read answers "not a write",
+	which is the safe direction: a genuine write then takes the protection trap,
+	which is unambiguous.
+*/
+static bool
+sparc_instruction_writes_memory(uint64 pc)
+{
+	uint32 instruction;
+
+	if ((addr_t)pc >= KERNEL_BASE) {
+		instruction = *(uint32*)(addr_t)pc;
+	} else if (user_memcpy(&instruction, (void*)(addr_t)pc,
+			sizeof(instruction)) != B_OK) {
+		return false;
+	}
+
+	if ((instruction >> 30) != 3)
+		return false;
+
+	return (((instruction >> 19) & 0x3f) & 0x04) != 0;
+}
+
+
 extern "C" void
 sparc_page_fault(struct iframe *frame)
 {
@@ -1083,15 +1133,43 @@ sparc_page_fault(struct iframe *frame)
 		address = (addr_t)frame->sfar;
 	}
 
-	// A protection trap is a write by definition -- it is what the hardware
-	// raises when a store finds a read-only entry. Otherwise SFSR says, and it
-	// is written for TLB misses too: SFSR's fault type has a bit for exactly
-	// that case.
-	//
-	// Except that SFSR is also the D-MMU's, so for an instruction fault it says
-	// nothing about this fault. An instruction fetch is never a write.
+	/*	Whether this was a write, which the hardware will only sometimes say.
+	 *
+	 *	A protection trap is a write by definition -- it is what the hardware
+	 *	raises when a store finds a read-only entry -- so that one is certain.
+	 *
+	 *	For everything else the answer is supposed to be SFSR's W bit. But SFSR is
+	 *	the *D-MMU's* status register and the "fast" MMU traps are fast precisely
+	 *	because they skip the fault status registers: a fast_data_access_MMU_miss
+	 *	leaves SFSR holding whatever the last trap that did write it left there.
+	 *	Reading it produces not a wrong answer but a *stale* one, and the giveaway
+	 *	was that every fault this port ever reported printed the same `sfsr 0xd` --
+	 *	including the W bit, on every single data miss.
+	 *
+	 *	That was invisible for as long as the only faulting data accesses were
+	 *	writes: a thread growing its stack is writing, so calling it a write was
+	 *	right by luck. The first *read* of a page that had never been touched --
+	 *	the kernel fetching an area name out of runtime_loader's .rodata, on the
+	 *	way through _kern_create_area -- was refused as a write to read-only
+	 *	memory, and the userland died before it could load anything.
+	 *
+	 *	So a miss is reported as a read, and that is not a guess. A TLB miss does
+	 *	not need to know the direction: the page is absent and the VM's job is to
+	 *	make it present. If the access really was a write to something read-only,
+	 *	the retried instruction takes fast_data_access_protection instead, which is
+	 *	the trap that *does* mean write, and it is handled above. One extra trap in
+	 *	the case where a write finds a copy-on-write page, and a correct answer in
+	 *	every case.
+	 *
+	 *	Decoding the instruction at %tpc would answer it in one trap, and needs the
+	 *	handler to read user memory it has not established is readable. Not worth
+	 *	it for a fault that has already cost thousands of cycles.
+	 */
+	/*	An instruction fetch is never a write, and asking about the instruction at
+		an address that could not be fetched is the question that panics.
+	 */
 	bool isWrite = !isExecute
-		&& (isProtection || (frame->sfsr & SFSR_WRITE) != 0);
+		&& (isProtection || sparc_instruction_writes_memory(frame->tpc));
 
 	Thread *thread = thread_get_current_thread();
 
