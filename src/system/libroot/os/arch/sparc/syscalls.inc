@@ -20,20 +20,23 @@
  *	somebody else's frame. That mistake is what made setjmp fail for five phases
  *	-- see sparc-port/PROGRESS.md section 21.
  *
- *	The trap number must match SPARC_SYSCALL_TRAP in
- *	headers/private/kernel/arch/sparc/arch_int.h. A mismatch is not subtle: every
- *	system call in the system lands on a vector that reports an unhandled trap.
+ *	The trap number is SPARC_SYSCALL_TRAP from <arch_syscall_defs.h>, which is where it
+ *	lives precisely so this file and the kernel's trap table cannot disagree about
+ *	it -- a mismatch would send every system call in the system to a vector that
+ *	reports an unhandled trap.
  *
  *	`set` rather than `mov` for the index, so the stub keeps working when the
  *	number of system calls passes what a 13-bit immediate holds.
  */
+#include <arch_syscall_defs.h>
+
 #define _SYSCALL(name, n) \
 .globl name; \
 .type name,%function; \
 .align 4; \
 name: \
 	set n, %g1; \
-	ta 0x40; \
+	ta SPARC_SYSCALL_TRAP; \
 	retl; \
 	 nop; \
 .size name, .-name

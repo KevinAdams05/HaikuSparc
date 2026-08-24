@@ -5,6 +5,8 @@
 
 
 #include <asm_defs.h>
+#include <arch_asm_defs.h>
+#include <arch_syscall_defs.h>
 
 
 /*	Duplicated from arch_thread_types.h, which the assembler cannot read.
@@ -19,9 +21,8 @@
 #define PSTATE_PRIV			0x004
 #define PSTATE_PEF			0x010
 
-// WSTATE.NORMAL for userspace: the spill handler that stores with the user's own
-// privilege. From arch_traps.S, which owns the trap table this selects into.
-#define WSTATE_USER			1
+// WSTATE_USER comes from <arch_asm_defs.h>, shared with the trap entry that puts
+// the kernel's value back.
 
 
 /*	%g2 and %g3 are the SPARC V9 "application" globals and %g6/%g7 are reserved
@@ -302,7 +303,6 @@ FUNCTION(sparc_enter_userspace):
 	values through the exit call: what the kernel returned, and what it found in
 	%g7. Two assertions in one excursion, and a failure says which.
 */
-#define USER_TEST_SYSCALL_TRAP		0x40
 #define USER_TEST_SYSCALL_EXIT		0x555
 
 FUNCTION(sparc_user_test_program):
@@ -342,14 +342,14 @@ FUNCTION(sparc_user_test_program):
 		argument, and the result comes back there.
 	*/
 	mov	%o0, %g1
-	ta	USER_TEST_SYSCALL_TRAP
+	ta	SPARC_SYSCALL_TRAP
 
 	/*	And out, carrying the result in %o0 and the thread local storage pointer
 		in %o1.
 	*/
 	mov	%g7, %o1
 	mov	USER_TEST_SYSCALL_EXIT, %g1
-	ta	USER_TEST_SYSCALL_TRAP
+	ta	SPARC_SYSCALL_TRAP
 
 	/*	Not reached: the handler does not return here. Spinning rather than
 		falling through, because what follows in the page is whatever the page

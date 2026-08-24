@@ -12,6 +12,9 @@
 
 #include <SupportDefs.h>
 
+#include <arch_asm_defs.h>
+#include <arch_syscall_defs.h>
+
 #define NUM_IO_VECTORS	256
 
 
@@ -96,6 +99,9 @@ struct iframe {
 	hand-written stub or a compiler is most likely to emit by accident, and it
 	should land on an entry that reports rather than on this one.
 
+	The number itself lives in <asm_defs.h>, because libroot's stubs need it too
+	and they are assembly. This file only derives the trap type from it.
+
 	The calling convention is the ABI's own, which is what makes it cheap: the
 	index in %g1, up to six arguments in %o0-%o5, the result in %o0. A trap does
 	not rotate CWP, so the handler's `save` makes those registers its %i's and
@@ -103,7 +109,6 @@ struct iframe {
 	beyond six live where the ABI puts them, on the caller's stack, which the
 	kernel reaches with user_memcpy() like any other user pointer.
 */
-#define SPARC_SYSCALL_TRAP			0x40
 #define TRAP_SYSCALL				(0x100 + SPARC_SYSCALL_TRAP)
 
 // A call index the kernel answers itself, for testing the trap path before there

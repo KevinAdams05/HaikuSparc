@@ -12,6 +12,7 @@
 
 #include <cpu.h>
 #include <elf.h>
+#include <arch_syscall_defs.h>
 #include <ksignal.h>
 #include <smp.h>
 
@@ -29,8 +30,8 @@
 	looks like it satisfies them has to be read carefully to be sure.
 
 	The system call at the end is the same convention libroot's stubs use: the
-	index in %g1, the argument in %o0, `ta` with the number
-	headers/private/kernel/arch/sparc/arch_int.h calls SPARC_SYSCALL_TRAP. It does
+	index in %g1, the argument in %o0, and SPARC_SYSCALL_TRAP from <arch_syscall_defs.h>,
+	which is the one definition all three callers share. It does
 	not return, because _kern_restore_signal_frame() puts the interrupted context
 	back and returns to that instead.
 */
@@ -51,10 +52,11 @@ sparc_user_signal_handler(signal_frame_data* data)
 	asm volatile(
 		"mov	%[data], %%o0\n\t"
 		"mov	%[index], %%g1\n\t"
-		"ta	0x40"
+		"ta	%[trap]"
 		:
 		: [data] "r"(data),
-		  [index] "r"((unsigned long)SYSCALL_RESTORE_SIGNAL_FRAME)
+		  [index] "r"((unsigned long)SYSCALL_RESTORE_SIGNAL_FRAME),
+		  [trap] "i"(SPARC_SYSCALL_TRAP)
 		: "g1", "o0", "memory");
 
 	__builtin_unreachable();

@@ -775,6 +775,34 @@ sparc_verify_trap_table()
 		return B_ERROR;
 	}
 
+	// The system call vector is checked differently, because a shared header
+	// cannot cover it. The other four callers of SPARC_SYSCALL_TRAP now use one
+	// definition, but the trap table encodes the number as a *position* -- the
+	// handler is placed after that many unhandled entries -- and a position
+	// cannot include a header. So decode the branch and see where it goes.
+	extern char sparc_syscall_entry[];
+
+	uint32 instruction = ((uint32*)base)[TRAP_SYSCALL * 8];
+	if ((instruction & 0xffc00000) != 0x30800000) {
+		panic("sparc trap table: trap type %#x is not the branch to the system "
+			"call entry, it is %#" B_PRIx32 " -- SPARC_SYSCALL_TRAP and the "
+			"table disagree", TRAP_SYSCALL, instruction);
+		return B_ERROR;
+	}
+
+	// ba,a is a 22-bit word displacement, signed, from the branch itself.
+	int32 displacement = (int32)(instruction << 10) >> 10;
+	addr_t target = base + TRAP_SYSCALL * 32 + (addr_t)(displacement * 4);
+	if (target != (addr_t)sparc_syscall_entry) {
+		panic("sparc trap table: trap type %#x branches to %#" B_PRIxADDR
+			", but sparc_syscall_entry is at %p", TRAP_SYSCALL, target,
+			sparc_syscall_entry);
+		return B_ERROR;
+	}
+
+	dprintf("sparc_mmu: system call vector %#x branches to sparc_syscall_entry "
+		"at %p\n", TRAP_SYSCALL, sparc_syscall_entry);
+
 	// Each entry is 32 bytes, so the first instruction of trap type t sits at
 	// t * 8 words. Masks ignore the register and immediate fields and keep only
 	// enough opcode to tell the handlers apart.

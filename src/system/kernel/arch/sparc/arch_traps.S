@@ -28,6 +28,9 @@
  *	which is the only sane way to write code that runs with no stack.
  */
 
+#include <arch_asm_defs.h>
+#include <arch_syscall_defs.h>
+
 #define FUNCTION(x) .global x; .type x,@function; x
 
 /* ASIs, from Table 6-10 of the UltraSPARC-IIi User's Manual. */
@@ -156,8 +159,8 @@
  *	one, the handler that stores through ASI_AS_IF_USER_PRIMARY. OTHER stays 0 in
  *	both, because the cross-privilege case has one answer.
  */
-#define WSTATE_KERNEL			0
-#define WSTATE_USER			1
+// WSTATE_KERNEL and WSTATE_USER come from <arch_asm_defs.h>, so the trap entry
+// and sparc_enter_userspace() cannot disagree about them.
 
 // TTE_SOFT_ACCESSED, from arch_mmu.h.
 #define TTE_SOFT_ACCESSED_BIT		0x200
@@ -1286,7 +1289,21 @@ sparc_fault_entry:
  *	frame on the way out, so advancing past the `ta` is one assignment in the
  *	handler rather than a second return path.
  */
-sparc_syscall_entry:
+/*	Two names for one address, and the reason is the hazard this file warns about
+ *	twice already: a branch to a .global symbol goes through a load-time
+ *	relocation that this kernel leaves unresolved, so `ba,a` to a global name
+ *	assembles with a displacement of zero -- a branch to itself, silently.
+ *
+ *	The global name exists only so sparc_verify_trap_table() can check that the
+ *	table's system call vector really does point here, which is the one coupling
+ *	SPARC_SYSCALL_TRAP has that a shared header cannot cover: the table encodes
+ *	the number as a *position*. The table branches to the local alias.
+ *
+ *	Making the entry itself global was tried, and produced exactly the documented
+ *	failure -- `b,a` to its own address at trap type 0x140.
+ */
+FUNCTION(sparc_syscall_entry):
+sparc_syscall_entry_local:
 	TRAP_TO_C sparc_syscall, 0, 1
 
 
@@ -1826,7 +1843,7 @@ FUNCTION(sparc_read_trap_page_table):
 	/* 0x140: `ta 0x40`, the system call. One entry, so .org asserts the size
 	 * the way the four-entry groups above do.
 	 */
-8:	ba,a	sparc_syscall_entry
+8:	ba,a	sparc_syscall_entry_local
 	 nop
 	.org 8b + 32
 
