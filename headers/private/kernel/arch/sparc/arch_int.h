@@ -64,24 +64,31 @@ struct iframe {
 		// the fault status registers -- so SFAR says nothing about it and this
 		// is the only place its address appears.
 	uint64	out[8];
-		// The trapped code's %o0-%o7, and only for the traps that ask for them.
+		// The trapped code's %o0-%o7.
 		//
 		// A trap does not rotate CWP, so the handler's `save` makes the trapped
 		// window the previous one and its outs become the handler's ins -- which
-		// is why nothing else here needs them, and why C cannot see them: they
-		// are register-window state, not memory.
+		// is why C cannot see them without this: they are register-window state,
+		// not memory.
 		//
-		// A system call needs them. Its arguments arrive in %o0-%o5 and its
-		// result goes back in %o0, so those registers are the interface, and
-		// putting them here is what lets the handler be written in C. Restored
-		// on the way out, so writing out[0] sets what the caller sees.
-		//
-		// All eight rather than the six the arguments use, because %o6 is the
-		// stack pointer and a system call with more than six arguments has to
-		// read the rest off the caller's stack.
-		//
-		// Filled only when TRAP_TO_C is told to, because the interrupt path
+		// out[0..5] are filled only for a system call, whose arguments arrive in
+		// %o0-%o5 and whose result goes back in %o0. Those six are the calling
+		// interface, and copying them here is what lets the handler be written
+		// in C. They are restored on the way out, so writing out[0] sets what
+		// the caller sees. Every other trap skips them: the interrupt path alone
 		// takes tens of thousands of traps a boot and has no use for them.
+		//
+		// out[6] and out[7] are filled for *every* trap and restored for none.
+		//
+		// out[6] is the trapped code's stack pointer -- biased, as %sp always is
+		// on V9, so it is 2047 below the frame it points at. Two things need it,
+		// and only one of them is a system call. A call with more than six
+		// arguments reads the rest off the caller's stack; and signal delivery,
+		// which happens on the way out of whichever trap the thread was in when
+		// the signal arrived, has to decide where to put the signal frame. That
+		// is nearly always a timer interrupt and nearly never a system call, so
+		// filling this one conditionally makes it poison exactly when it
+		// matters. out[7] is the return address, for backtraces across a trap.
 };
 
 #define IFRAME_SIZEOF	192

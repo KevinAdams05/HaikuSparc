@@ -1112,8 +1112,8 @@ sparc_unhandled_trap_stop:
 
 .if \save_outs
 	/* The trapped code's outs, which the `save` above turned into this window's
-	 * ins. Only a system call wants them, and only because its arguments and its
-	 * result live there -- see the note on iframe::out.
+	 * ins. Only a system call wants the argument registers, and only because its
+	 * arguments and its result live there -- see the note on iframe::out.
 	 */
 	stx	%i0, [%l7 + IFRAME_OUT + (0 * 8)]
 	stx	%i1, [%l7 + IFRAME_OUT + (1 * 8)]
@@ -1121,9 +1121,26 @@ sparc_unhandled_trap_stop:
 	stx	%i3, [%l7 + IFRAME_OUT + (3 * 8)]
 	stx	%i4, [%l7 + IFRAME_OUT + (4 * 8)]
 	stx	%i5, [%l7 + IFRAME_OUT + (5 * 8)]
+.endif
+
+/*	%o6 and %o7 are saved for every trap, not just for system calls.
+ *
+ *	%o6 is the trapped code's stack pointer, and a signal is delivered on the way
+ *	out of whatever trap the thread happened to be in -- a timer interrupt, most
+ *	of the time, never a system call. arch_setup_signal_frame() has to put the
+ *	frame somewhere, and where it goes is below the interrupted stack pointer, or
+ *	on the alternate stack if the thread is not already on it; both questions are
+ *	%o6. Saving it only for system calls means every real signal reads whatever
+ *	the last handler left on the kernel stack, which arrives as a 0xcccccccc
+ *	slab-poison address rather than as a wrong answer.
+ *
+ *	%o7 is the trapped code's return address, which costs one more store and is
+ *	what a backtrace across a trap needs.
+ *
+ *	Neither is restored on the way out -- see the note at the matching reload.
+ */
 	stx	%i6, [%l7 + IFRAME_OUT + (6 * 8)]
 	stx	%i7, [%l7 + IFRAME_OUT + (7 * 8)]
-.endif
 
 	/* Down to trap level zero, so the handler runs like ordinary kernel code.
 	 * Interrupts stay disabled -- PSTATE.IE is still clear -- so nothing nests.
@@ -1146,8 +1163,35 @@ sparc_unhandled_trap_stop:
 	andcc	%l5, TSTATE_PRIV, %g0
 	bne,pt	%xcc, 5f
 	 nop
+
+	/*	Interrupts on for the copy, and only for the copy.
+	 *
+	 *	Trap level zero is necessary for the flush to be able to fault, and it is
+	 *	not sufficient. sparc_page_fault() refuses to page anything in when it
+	 *	finds PSTATE.IE clear in the faulting frame, because a fault with
+	 *	interrupts disabled cannot block and so cannot be resolved -- it takes
+	 *	the thread's fault handler instead. user_memcpy() has one installed, so
+	 *	the copy does not crash: it returns B_BAD_ADDRESS, the flush reports that
+	 *	it could not write the window, and the thread returns to userspace with a
+	 *	frame that was never stored. Which is silent, and wrong, and exactly what
+	 *	the first userland on this port did -- its stack pages had never been
+	 *	touched, so every one of them was a first-touch fault the flush was not
+	 *	allowed to take.
+	 *
+	 *	PIL is left alone. It gates device interrupts; a page fault is
+	 *	synchronous and arrives regardless, which is the whole point.
+	 *
+	 *	wrpr writes rs1 XOR rs2, and IE is known clear here -- PSTATE.IE has been
+	 *	off since the trap was taken -- so the two toggles are a set and a clear.
+	 */
+	rdpr	%pstate, %l5
+	wrpr	%l5, PSTATE_IE, %pstate
+
 	call	sparc_flush_user_windows
 	 nop
+
+	rdpr	%pstate, %l5
+	wrpr	%l5, PSTATE_IE, %pstate
 5:
 
 	/* Back up to trap level 1: `retry` is meaningless below it, and %tpc and
@@ -1180,14 +1224,15 @@ sparc_unhandled_trap_stop:
 	ldx	[%l7 + IFRAME_OUT + (4 * 8)], %i4
 	ldx	[%l7 + IFRAME_OUT + (5 * 8)], %i5
 
-	/*	%i6 and %i7 are deliberately not restored. They are the trapped window's
-		frame pointer and return address, which the `restore` below brings back
-		from the register file or the stack -- writing them here would overwrite a
-		correct value with a copy, and a stale one if a handler moved the stack.
-		They are captured on the way in only so a system call can find its
-		arguments.
-	 */
 .endif
+
+	/*	%i6 and %i7 are deliberately not restored, for either kind of trap. They
+		are the trapped window's stack pointer and return address, which the
+		`restore` below brings back from the register file or the stack --
+		writing them here would overwrite a correct value with a copy, and a
+		stale one if a handler moved the stack. They are captured on the way in
+		to be read, not to be written back.
+	 */
 
 	/* Reload the trap state from the frame rather than from this window's
 	 * locals, so that a handler can change where the trap returns to. That is

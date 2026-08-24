@@ -446,10 +446,37 @@ arch_int_init(kernel_args *args)
 }
 
 
+/*!	Claims the interrupt vectors this architecture can deliver.
+
+	Not optional, and not merely bookkeeping. Reserving a vector is what gives it
+	an `irq_assignment`, and `update_int_load()` dereferences that unconditionally
+	the moment a vector's computed load changes:
+
+		if (oldLoad != sVectors[i].load)
+			atomic_add(&sVectors[i].assigned_cpu->load, ...);
+
+	So a port that never reserves anything does not fail at boot, or on the first
+	interrupt, or visibly at all -- it runs until some vector has taken enough
+	interrupts over enough time for `compute_load()` to return a different number,
+	and then takes a null read inside `io_interrupt_handler` with interrupts
+	disabled. Which presents as an unrelated page fault at address 0x0, minutes
+	into a boot, in whatever happened to be running. This port did exactly that.
+
+	Reserved here rather than in arch_int_init(), which is where the other ports
+	do it, because interrupts_init_post_vm() walks the whole vector array setting
+	`type` back to INTERRUPT_TYPE_UNKNOWN and only then calls us. Reserving before
+	that loop leaves the vectors correctly assigned but wrongly typed -- it does
+	not crash, since the loop leaves `assigned_cpu` alone, which is why nobody has
+	noticed. Doing it after costs nothing and gets both fields right.
+
+	The count is the INO space: six bits, so 64 vectors, all of them device
+	interrupts. See the INR discussion in arch_int.h.
+*/
 status_t
 arch_int_init_post_vm(kernel_args *args)
 {
-	return B_OK;
+	return reserve_io_interrupt_vectors(INR_INO_MASK + 1, 0,
+		INTERRUPT_TYPE_IRQ);
 }
 
 
@@ -1006,12 +1033,28 @@ sparc_page_fault(struct iframe *frame)
 	// rather than in a fault address register, which is most of what makes them
 	// fast.
 	addr_t address;
-	if (isDataMiss || isInstructionMiss || isProtection) {
-		address = (addr_t)(frame->tagAccess & ~(uint64)0x1fff);
-	} else if (trap == TRAP_INSTRUCTION_ACCESS) {
-		// An instruction fetch has no address register of its own; it faulted on
-		// the address it was fetching from.
+	if (isExecute) {
+		/*	An instruction fetch faulted on the address it was fetching from,
+			which is %tpc. There is a register that says so as well -- but it is
+			the *I-MMU's* Tag Access, and the trap entry records the D-MMU's,
+			because that is the one the other five fault traps need and reading
+			both on every trap costs an ASI access nobody else uses.
+
+			Taking it from %tpc instead is not a workaround for that. It is the
+			better answer: Tag Access holds the virtual page, %tpc holds the
+			instruction, and vm_page_fault() is given an address rather than a
+			page number.
+
+			Getting this wrong is quiet. Reading the D-MMU register for an
+			instruction miss returns whatever the last data access left there,
+			so the fault is reported at a plausible, page-aligned, completely
+			unrelated address -- and the first userland this port ran appeared
+			to die touching the top of its own stack when it was really failing
+			to fetch an instruction two hundred megabytes away.
+		 */
 		address = (addr_t)frame->tpc;
+	} else if (isDataMiss || isProtection) {
+		address = (addr_t)(frame->tagAccess & ~(uint64)0x1fff);
 	} else {
 		address = (addr_t)frame->sfar;
 	}
@@ -1020,7 +1063,11 @@ sparc_page_fault(struct iframe *frame)
 	// raises when a store finds a read-only entry. Otherwise SFSR says, and it
 	// is written for TLB misses too: SFSR's fault type has a bit for exactly
 	// that case.
-	bool isWrite = isProtection || (frame->sfsr & SFSR_WRITE) != 0;
+	//
+	// Except that SFSR is also the D-MMU's, so for an instruction fault it says
+	// nothing about this fault. An instruction fetch is never a write.
+	bool isWrite = !isExecute
+		&& (isProtection || (frame->sfsr & SFSR_WRITE) != 0);
 
 	Thread *thread = thread_get_current_thread();
 
@@ -1061,6 +1108,30 @@ sparc_page_fault(struct iframe *frame)
 	}
 
 	enable_interrupts();
+
+	/*	Report the first few faults taken from userspace.
+
+		Not diagnostics for their own sake. A user fault that the VM cannot
+		resolve becomes a SIGSEGV, and the normal way to find out what it was is
+		the debug server -- which reads the report over a port and is a userland
+		program. On a port that is only just able to run a userland program,
+		asking the debug server what went wrong is circular: the log says
+		"Failed to install debugger: Bad port ID" and nothing else, and the
+		fault address, which is the one fact worth having, is never printed by
+		anybody.
+
+		Bounded because a genuine stack-growth fault storm would bury the log,
+		and the first few are the ones that say where a new userland died.
+	*/
+	static int32 sUserFaultsReported = 0;
+	if (isUser && atomic_add(&sUserFaultsReported, 1) < 8) {
+		dprintf("sparc: user fault at %#" B_PRIxADDR " from pc %#" B_PRIx64
+			" (%s, %s, trap %#" B_PRIx64 ", sfsr %#" B_PRIx64 ", sp %#" B_PRIx64
+			"), thread %" B_PRId32 "\n", address, frame->tpc,
+			isWrite ? "write" : "read", isExecute ? "exec" : "data", frame->tt,
+			frame->sfsr, frame->out[6] + SPARC_STACK_BIAS,
+			thread != NULL ? thread->id : -1);
+	}
 
 	addr_t newInstructionPointer = 0;
 	vm_page_fault(address, (addr_t)frame->tpc, isWrite, isExecute, isUser,
