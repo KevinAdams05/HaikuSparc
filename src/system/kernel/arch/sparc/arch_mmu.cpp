@@ -871,6 +871,11 @@ sparc_verify_trap_table()
 */
 static sparc_trap_data sTrapData __attribute__((aligned(TRAP_DATA_SIZE)));
 
+static_assert(sizeof(sparc_trap_data) == TRAP_DATA_SIZE,
+	"the trap data block must be exactly as large as it is aligned, or it can "
+	"straddle a page boundary and leave part of itself outside the locked TLB "
+	"entry -- see TRAP_DATA_SIZE");
+
 
 /*!	Reports a trap the kernel could not handle, from TL=0.
 
@@ -1015,6 +1020,9 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, userSpillCount),
 		offsetof(sparc_trap_data, otherSpillCount),
 		offsetof(sparc_trap_data, otherFillCount),
+		offsetof(sparc_trap_data, winfixupAddress),
+		offsetof(sparc_trap_data, winfixupTrapType),
+		offsetof(sparc_trap_data, winfixupCount),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {
@@ -1933,6 +1941,30 @@ uint64
 sparc_other_fill_count()
 {
 	return sTrapData.otherFillCount;
+}
+
+
+/*!	The address a faulted spill or fill wanted. See the header. */
+uint64
+sparc_winfixup_address()
+{
+	return sTrapData.winfixupAddress;
+}
+
+
+/*!	And which window trap was abandoned to get it. See the header. */
+uint64
+sparc_winfixup_trap_type()
+{
+	return sTrapData.winfixupTrapType;
+}
+
+
+/*!	How many have been abandoned and re-run. See the header. */
+uint64
+sparc_winfixup_count()
+{
+	return sTrapData.winfixupCount;
 }
 
 

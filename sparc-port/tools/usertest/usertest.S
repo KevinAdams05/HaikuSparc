@@ -37,6 +37,13 @@
  */
 #define SIGNAL_FRAME			256
 
+/*	Deep enough to cross several 8 KB stack pages: DEPTH frames of FRAME bytes
+ *	is about 53 KB, which is six pages and change. Well inside the stack area
+ *	Haiku gives a main thread, and far past the one page the kernel touched
+ *	setting the program up.
+ */
+#define DEPTH				300
+
 /*	struct sigaction, from <signal.h>, laid out for a 64-bit big-endian target:
  *	an 8-byte handler pointer, an 8-byte sigset_t mask, a 4-byte flag word with
  *	4 bytes of padding behind it, and an 8-byte userdata pointer.
@@ -77,7 +84,10 @@
 
 /*	%g2 and %g3 are the SPARC V9 application globals, so the assembler wants them
  *	declared before use. Scratch is exactly what they are here: this program has
- *	no other code to share them with.
+ *	no other code to share them with. %g4 needs no such declaration -- .register
+ *	only accepts %g2, %g3, %g6 and %g7 -- and needs no protection either: a trap
+ *	runs on the alternate global bank, so the window handlers' scratch registers
+ *	are a different register file from this program's.
  */
 	.register %g2, #scratch
 	.register %g3, #scratch
@@ -128,6 +138,36 @@ _start:
 	restore
 	restore
 	restore
+
+	/*	Then nest far enough that the spills land on stack pages that do not
+	 *	exist yet, which is the case the kernel could not survive until winfixup.
+	 *
+	 *	Nothing here writes to the stack. A `save` only moves the stack pointer, so
+	 *	the *first* thing to touch each new page is the spill handler's own store
+	 *	-- at trap level one, where a fault nests one deeper and cannot be paged in
+	 *	where it happens. Which is the entire point: a program does not have to do
+	 *	anything unusual to provoke it, only recurse on a stack it has not used
+	 *	before, and every program does that.
+	 *
+	 *	DEPTH frames of FRAME bytes crosses several 8 KB pages, so this is not one
+	 *	fixup but a run of them, and the unwind exercises the fill side against the
+	 *	pages the spills created.
+	 *
+	 *	The counter is a global because it has to outlive the window: %l and %i
+	 *	registers are what `save` and `restore` rotate, so a loop counter in one
+	 *	would be a different register on every iteration.
+	 */
+	set	DEPTH, %g4
+1:	save	%sp, -FRAME, %sp
+	deccc	%g4
+	bne	1b
+	 nop
+
+	set	DEPTH, %g4
+2:	restore
+	deccc	%g4
+	bne	2b
+	 nop
 
 	/*	Then a signal, to itself, with a handler of its own.
 	 *
@@ -197,7 +237,21 @@ _start:
 	set	SYSCALL_DEBUG_OUTPUT, %g1
 	ta	SYSCALL_TRAP
 
-	/* And out. _kern_exit_team() does not return. */
+	/*	And out. _kern_exit_team() does not return.
+	 *
+	 *	The boot log then says
+	 *
+	 *	  error starting "/boot/system/servers/launch_daemon" error = -1
+	 *
+	 *	and that is this program being honest about what it is. load_image() waits
+	 *	on a condition the loaded image signals once it has finished loading the
+	 *	program, and team_loading_info::result starts at B_ERROR. The real
+	 *	runtime_loader signals it; this one exits instead, so the launcher is told
+	 *	the load failed -- which it did, in the sense that no program was loaded.
+	 *
+	 *	It appears only when the exit wins the race against the launcher, so it
+	 *	comes and goes with how long this program takes.
+	 */
 	clr	%o0
 	set	SYSCALL_EXIT_TEAM, %g1
 	ta	SYSCALL_TRAP

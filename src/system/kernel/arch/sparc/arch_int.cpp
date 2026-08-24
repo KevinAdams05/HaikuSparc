@@ -1170,6 +1170,70 @@ sparc_page_fault(struct iframe *frame)
 }
 
 
+/*!	The fault a register window spill or fill took, once it has been reduced to
+	an ordinary one.
+
+	Reached only from sparc_winfixup in arch_traps.S, which has already thrown
+	away the trap levels above this one, put CWP back to the window the user
+	instruction was in, and recorded the address -- so by the time this runs the
+	frame describes a userspace instruction that faults, and the only thing that
+	makes it different from any other page fault is where the address comes from.
+
+	It cannot come from the MMU registers. Those described a fault two trap levels
+	up, at an address inside a handler, and that trap no longer exists; SFAR and
+	Tag Access have also had every access sparc_winfixup itself made written over
+	them. The recorded copy is the only surviving record.
+
+	The frame's own %tpc is the `save`, `restore` or trap instruction to be run
+	again -- not the faulting store -- so it is the right thing to hand
+	vm_page_fault() as the instruction pointer and the wrong thing to take the
+	address from. That asymmetry is the whole function.
+*/
+extern "C" void
+sparc_window_fault(struct iframe* frame)
+{
+	IFrameScope frameScope(frame);
+
+	addr_t address = (addr_t)sparc_winfixup_address();
+	uint64 windowTrap = sparc_winfixup_trap_type();
+
+	/*	A spill writes and a fill reads, and the trap type says which with no
+		ambiguity: spill vectors are 0x80 to 0xbf, fill vectors 0xc0 to 0xff. The
+		D-MMU's SFSR would have said so too, for the fault two levels up, before
+		sparc_winfixup's own accesses to the trap data block went through it.
+	 */
+	bool isWrite = windowTrap < 0xc0;
+
+	static int32 sReported = 0;
+	if (atomic_add(&sReported, 1) < 8) {
+		dprintf("sparc: winfixup -- %s trap %#" B_PRIx64 " abandoned at %#"
+			B_PRIxADDR ", re-running pc %#" B_PRIx64 ", thread %" B_PRId32 "\n",
+			isWrite ? "spill" : "fill", windowTrap, address, frame->tpc,
+			thread_get_current_thread_id());
+	}
+
+	/*	Interrupts on, for the same reason the ordinary fault path turns them on:
+		resolving this may have to block, and the entry left them off.
+	 */
+	enable_interrupts();
+
+	/*	No newInstructionPointer, deliberately. The thread's fault handler is for
+		kernel code that expects to fail -- user_memcpy() and the rest -- and this
+		fault belongs to userspace, whose remedy for an address that cannot be
+		paged in is SIGSEGV. vm_page_fault() raises it, which is also what stops
+		this from looping: every pass either makes the page present or ends the
+		thread.
+
+		isExecute is false. A window trap moves sixteen registers to or from
+		memory; nothing about it is an instruction fetch.
+	 */
+	addr_t ignored = 0;
+	vm_page_fault(address, (addr_t)frame->tpc, isWrite, false, true, &ignored);
+
+	disable_interrupts();
+}
+
+
 // #pragma mark - the user memory test
 
 

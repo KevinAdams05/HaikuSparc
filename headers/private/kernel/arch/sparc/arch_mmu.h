@@ -189,6 +189,20 @@ extern uint64 sparc_other_spill_count();
 */
 extern uint64 sparc_other_fill_count();
 
+/*!	The address a spill or fill faulted on, and the window trap that was
+	abandoned to deal with it. Written by sparc_winfixup in arch_traps.S, which
+	cannot pass an argument: it is about to change trap level and window, so a
+	register that survives both is a register some other handler owns.
+*/
+extern uint64 sparc_winfixup_address();
+extern uint64 sparc_winfixup_trap_type();
+
+/*!	How many spills and fills have been abandoned and re-run. Zero on a machine
+	whose userland never grew a stack; non-zero the first time one does, which is
+	the only evidence that the fixup path works rather than merely exists.
+*/
+extern uint64 sparc_winfixup_count();
+
 /*!	Removes every trace of a context, for reuse by a different team.
 
 	Both caches, because they fail differently. A stale TLB entry is removed by
@@ -295,7 +309,10 @@ struct sparc_trap_data {
 	uint64	userSpillCount;		// 0xe0  user windows spilled to the user's stack
 	uint64	otherSpillCount;	// 0xe8  user windows the kernel parked for later
 	uint64	otherFillCount;		// 0xf0  arrivals in the save-area fill handler
-	uint64	reserved[1];		// pad to 256 bytes
+	uint64	winfixupAddress;	// 0xf8  address a faulted spill or fill wanted
+	uint64	winfixupTrapType;	// 0x100 the window trap that was abandoned
+	uint64	winfixupCount;		// 0x108 spills and fills abandoned since boot
+	uint64	reserved[30];		// pad to TRAP_DATA_SIZE
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -320,11 +337,24 @@ struct sparc_trap_data {
 #define TRAP_DATA_USER_SPILL_COUNT	0xe0
 #define TRAP_DATA_OTHER_SPILL_COUNT	0xe8
 #define TRAP_DATA_OTHER_FILL_COUNT	0xf0
+#define TRAP_DATA_WINFIXUP_ADDRESS	0xf8
+#define TRAP_DATA_WINFIXUP_TRAP		0x100
+#define TRAP_DATA_WINFIXUP_COUNT	0x108
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
 #define SPARC_TRAP_UNHANDLED		1
-#define TRAP_DATA_SIZE				0x100
+// Both the size of the block and the alignment it is declared with, and the two
+// have to be the same number for a reason that is not obvious: the block lives
+// in one locked D-TLB entry, and an object whose size exceeds its alignment can
+// straddle a page boundary. A 320-byte block aligned to 256 that lands 256 bytes
+// below the end of its page has its last 64 bytes in the *next* page, which
+// nothing locked -- so a handler reading a field near the end would take a TLB
+// miss at trap level one, in the code whose whole purpose is to service those.
+//
+// Equal size and alignment makes that impossible, since the page size is a
+// multiple of it. Grow this rather than the padding when the block runs out.
+#define TRAP_DATA_SIZE				0x200
 
 // Which global bank sparc_read_trap_globals() should be asked about.
 #define SPARC_GLOBALS_MMU			0
@@ -352,7 +382,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		24
+#define TRAP_DATA_OFFSET_COUNT		27
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */

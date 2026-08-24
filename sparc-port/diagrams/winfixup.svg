@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1010" viewBox="0 0 1120 1010" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1120" height="1010" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1119" height="1009" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">winfixup — a fault inside a register window spill</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">The one fault in the machine that cannot be handled where it happens. The answer is not to resume it; it is to abandon it and re-run the user's instruction.</text>
+
+  <!-- ============ A. how it arises ============ -->
+  <text x="56" y="106" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">HOW IT ARISES — NOTHING UNUSUAL IS REQUIRED</text>
+
+  <rect x="56" y="118" width="1008" height="128" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="146" font-size="12.5" fill="#404752">A <tspan font-family="monospace">save</tspan> only moves the stack pointer. It writes nothing. So when a program recurses onto a stack page it has not used before,</text>
+  <text x="76" y="166" font-size="12.5" fill="#404752">the <tspan font-style="italic">first</tspan> thing to touch that page is the spill handler's own store — and the spill handler runs at trap level one.</text>
+  <text x="76" y="196" font-size="12.5" fill="#146638">Every program does this. A 300-deep recursion crosses six 8 KB pages and takes six of these faults, measured.</text>
+  <text x="76" y="224" font-size="12" font-family="monospace" fill="#8a5200">sparc: winfixup -- spill trap 0x84 abandoned at 0x7a4e4000, re-running pc 0x5e4f4214, thread 37</text>
+
+  <!-- ============ B. the trap levels ============ -->
+  <text x="56" y="288" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">WHY IT CANNOT BE HANDLED IN PLACE</text>
+
+  <!-- level stack -->
+  <rect x="56" y="300" width="470" height="60" rx="6" fill="#fdecec" stroke="#b02a2a"/>
+  <text x="76" y="324" font-size="13" font-weight="600" fill="#8f2020">TL = 2 — the fault</text>
+  <text x="76" y="344" font-size="12" fill="#8f2020">an unmapped page under the spill's store</text>
+
+  <rect x="56" y="368" width="470" height="60" rx="6" fill="#fdf3e3" stroke="#b26a00"/>
+  <text x="76" y="392" font-size="13" font-weight="600" fill="#8a5200">TL = 1 — the spill, still owed a <tspan font-family="monospace">retry</tspan></text>
+  <text x="76" y="412" font-size="12" fill="#8a5200">%tpc holds the user's <tspan font-family="monospace">save</tspan>; CWP moved by the hardware</text>
+
+  <rect x="56" y="436" width="470" height="60" rx="6" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="76" y="460" font-size="13" font-weight="600" fill="#146638">TL = 0 — userspace</text>
+  <text x="76" y="480" font-size="12" fill="#146638">where the C fault handler has to run</text>
+
+  <rect x="550" y="300" width="514" height="196" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="570" y="326" font-size="14" font-weight="600" fill="#1a1d24">The trap registers are stacked per level</text>
+  <text x="570" y="352" font-size="12" fill="#404752">Handling a fault means reaching trap level zero, because C</text>
+  <text x="570" y="370" font-size="12" fill="#404752">must be able to take its own TLB misses. But dropping to zero</text>
+  <text x="570" y="388" font-size="12" fill="#404752">from here throws level one away — and level one is the only</text>
+  <text x="570" y="406" font-size="12" fill="#404752">record of where userspace was.</text>
+  <text x="570" y="436" font-size="12" fill="#8f2020">Nesting instead is worse: four levels reaches MAXTL and the</text>
+  <text x="570" y="454" font-size="12" fill="#8f2020">machine takes a watchdog reset, silently.</text>
+  <text x="570" y="482" font-size="12" font-weight="600" fill="#146638">So the spill is not resumed. It is abandoned.</text>
+
+  <!-- ============ C. why abandoning is free ============ -->
+  <text x="56" y="540" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">AND ABANDONING COSTS NOTHING, BECAUSE OF WHAT A SPILL TRAP ALREADY IS</text>
+
+  <rect x="56" y="552" width="1008" height="120" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="580" font-size="12.5" fill="#404752">A spill trap is taken <tspan font-style="italic">instead of</tspan> completing a <tspan font-family="monospace">save</tspan>, and its handler ends in <tspan font-family="monospace">retry</tspan> — which re-executes that same <tspan font-family="monospace">save</tspan>,</text>
+  <text x="76" y="600" font-size="12.5" fill="#404752">whereupon a window is free and it succeeds. Re-running the user's instruction is not a workaround; it is the normal path.</text>
+  <text x="76" y="630" font-size="12.5" fill="#404752">And nothing needs undoing. <tspan font-family="monospace">saved</tspan> and <tspan font-family="monospace">restored</tspan> are the instructions that move the window accounting, and a handler</text>
+  <text x="76" y="650" font-size="12.5" fill="#404752">that faulted before reaching them changed only CWP — which the hardware moved, and which TSTATE still records.</text>
+
+  <!-- ============ D. the sequence ============ -->
+  <text x="56" y="714" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">THE FIXUP</text>
+
+  <rect x="56" y="726" width="196" height="118" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="750" font-size="12.5" font-weight="600" fill="#1a1d24">1. Record</text>
+  <text x="76" y="772" font-size="11.5" fill="#404752">the address, from Tag</text>
+  <text x="76" y="789" font-size="11.5" fill="#404752">Access — with the context</text>
+  <text x="76" y="806" font-size="11.5" fill="#404752">shifted off, since that</text>
+  <text x="76" y="823" font-size="11.5" fill="#404752">register is not an address.</text>
+
+  <rect x="268" y="726" width="196" height="118" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="288" y="750" font-size="12.5" font-weight="600" fill="#1a1d24">2. Drop to TL = 1</text>
+  <text x="288" y="772" font-size="11.5" fill="#404752">discarding the fault. The</text>
+  <text x="288" y="789" font-size="11.5" fill="#404752">window trap's registers are</text>
+  <text x="288" y="806" font-size="11.5" fill="#404752">untouched and describe a</text>
+  <text x="288" y="823" font-size="11.5" fill="#404752">user instruction.</text>
+
+  <rect x="480" y="726" width="196" height="118" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="500" y="750" font-size="12.5" font-weight="600" fill="#1a1d24">3. Restore CWP</text>
+  <text x="500" y="772" font-size="11.5" fill="#404752">from TSTATE bits 4:0, to</text>
+  <text x="500" y="789" font-size="11.5" fill="#404752">the window the user's</text>
+  <text x="500" y="806" font-size="11.5" fill="#404752">instruction ran in. Safe</text>
+  <text x="500" y="823" font-size="11.5" fill="#404752">because nothing else moved.</text>
+
+  <rect x="692" y="726" width="196" height="118" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="712" y="750" font-size="12.5" font-weight="600" fill="#1a1d24">4. Ordinary fault</text>
+  <text x="712" y="772" font-size="11.5" fill="#404752">The machine is now</text>
+  <text x="712" y="789" font-size="11.5" fill="#404752">indistinguishable from one</text>
+  <text x="712" y="806" font-size="11.5" fill="#404752">that took a data fault out</text>
+  <text x="712" y="823" font-size="11.5" fill="#404752">of userspace. C runs.</text>
+
+  <rect x="904" y="726" width="160" height="118" rx="7" fill="#e6f4ec" stroke="#1f8b4d"/>
+  <text x="924" y="750" font-size="12.5" font-weight="600" fill="#146638">5. <tspan font-family="monospace">retry</tspan></text>
+  <text x="924" y="772" font-size="11.5" fill="#146638">re-runs the user's</text>
+  <text x="924" y="789" font-size="11.5" fill="#146638"><tspan font-family="monospace">save</tspan>. The spill</text>
+  <text x="924" y="806" font-size="11.5" fill="#146638">happens again, against</text>
+  <text x="924" y="823" font-size="11.5" fill="#146638">a page that is there.</text>
+
+  <!-- ============ E. the two things that make it terminate ============ -->
+  <rect x="56" y="866" width="496" height="94" rx="7" fill="#f2f4f8" stroke="#c3c9d4"/>
+  <text x="76" y="892" font-size="13" font-weight="600" fill="#1a1d24">Why it cannot loop</text>
+  <text x="76" y="915" font-size="12" fill="#404752">An address that cannot be paged in raises SIGSEGV and the</text>
+  <text x="76" y="933" font-size="12" fill="#404752">thread dies. Every pass either makes the page present or</text>
+  <text x="76" y="951" font-size="12" fill="#404752">ends the thread.</text>
+
+  <rect x="568" y="866" width="496" height="94" rx="7" fill="#f2f4f8" stroke="#c3c9d4"/>
+  <text x="588" y="892" font-size="13" font-weight="600" fill="#1a1d24">Why it cannot recurse</text>
+  <text x="588" y="915" font-size="12" fill="#404752">Step 4's own <tspan font-family="monospace">save</tspan> could spill — and used to spill to the</text>
+  <text x="588" y="933" font-size="12" fill="#404752">user's stack, at the same address. The trap entry now hands</text>
+  <text x="588" y="951" font-size="12" fill="#404752">the user's windows over <tspan font-style="italic">before</tspan> that save, so it cannot.</text>
+
+  <text x="56" y="990" font-size="11.5" fill="#8a93a3">Trap level and window-state rules from the UltraSPARC-IIi User's Manual, chapters 5 and 6. Shape from Linux's <tspan font-family="monospace">arch/sparc/kernel/winfixup.S</tspan> — behaviour only, no code; see THIRD_PARTY.md.</text>
+</svg>

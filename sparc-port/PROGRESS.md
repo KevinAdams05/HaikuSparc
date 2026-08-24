@@ -3301,3 +3301,97 @@ silently ignored.
 
 Boot to a mounted volume: 65.60 s against 65.56 s without any of this. Every in-kernel self-test byte for
 byte identical.
+
+
+## 41. winfixup
+
+A fault taken *inside* a register window spill — the one fault in the machine that cannot be handled
+where it happens, and the last thing standing between this port and a userland that recurses.
+
+![winfixup](diagrams/winfixup.svg)
+
+### Nothing unusual provokes it
+
+A `save` only moves the stack pointer. It writes nothing. So when a program recurses onto a stack page
+it has not used before, the *first* thing to touch that page is the spill handler's own store — and the
+spill handler runs at trap level one, where a fault nests one level deeper and the C code that would
+page it in cannot be reached without throwing away the trap that is still owed a return.
+
+Every program does this. The measurement is six fixups for a 300-deep recursion, one per 8 KB page:
+
+```
+sparc: winfixup -- spill trap 0x84 abandoned at 0x7a4e4000, re-running pc 0x5e4f4214, thread 37
+sparc: winfixup -- spill trap 0x84 abandoned at 0x7a4e2000, re-running pc 0x5e4f4214, thread 37
+sparc: winfixup -- spill trap 0x84 abandoned at 0x7a4e0000, re-running pc 0x5e4f4214, thread 37
+```
+
+Descending by exactly `0x2000` each time, all from the same instruction. That is a program walking down
+its own stack a page at a time, which is the shape the mechanism predicts.
+
+### The answer is not to resume the spill
+
+§35 established that you cannot: dropping from trap level two to zero to page something in discards
+level one, and level one is the only record of where userspace was. What §35 did not say is how cheap
+the alternative is.
+
+A spill trap is taken *instead of* completing a `save`, and its handler ends in `retry` — which
+re-executes that same `save`, whereupon a window is free and it succeeds. **Re-running the user's
+instruction is not a workaround; it is the normal path.** And nothing needs undoing, because `saved`
+and `restored` are the instructions that move the window accounting, and a handler that faulted before
+reaching them changed only CWP — which the hardware moved and TSTATE still records.
+
+So: record the address, drop to trap level one, put CWP back, and the machine is indistinguishable from
+one that has just taken an ordinary data fault out of userspace. The ordinary fault path runs, pages the
+address in, and `retry` re-executes the `save`. The spill happens again against memory that is there.
+
+It cannot loop: an address that cannot be paged in raises SIGSEGV and the thread dies, so every pass
+either makes the page present or ends the thread.
+
+### The recursion that had to be closed first, and the bug in doing so
+
+Step four's own `save` can spill. And it spilled **to the user's stack**, at the same address that
+brought us there — so the fixup would fault, fix up, fault again, for ever.
+
+The cause was in `TRAP_TO_C`, and it was a deliberate decision that turned out to be half right. The
+entry handed the user's live windows to the kernel — CANRESTORE into OTHERWIN, which is what routes a
+spill to the save area instead of the user's stack — *after* its own `save`. The comment explained why:
+a trap out of userspace still has `WSTATE.NORMAL` at 1 there, so a spill would use the handler that
+stores with the user's privilege, and the window being spilled does belong to userspace. True, and
+beside the point. That store is to an address userspace chose, from trap level one. **Avoiding exactly
+that is why the save area exists, and the trap entry was walking past it on every trap.**
+
+Moving the hand-over before the save fixed the recursion and broke the accounting, twice, in ways worth
+recording because both were silent:
+
+**First, the hand-over has to happen twice.** `save` adds a window to CANRESTORE, and that window is the
+one the trap came from — so it is the *user's*, and leaving it in CANRESTORE means a later spill inside
+the handler treats a user window as a kernel one. The transfer before the save protects the save; the
+transfer after it classifies the trapped window. Only the second one used to exist, which is why the
+first looked unnecessary and the second looked redundant. They protect different instructions.
+
+**Second, the reversal on the way out has to add, not move.** It was `CANRESTORE = OTHERWIN`, and that
+was exact only because the old ordering folded the handler's own window into OTHERWIN along with the
+user's. With the handler's window left in CANRESTORE where it belongs, overwriting drops it on the
+floor and `CANSAVE + CANRESTORE + OTHERWIN` comes out one short — on every trap. The symptom was the
+in-kernel userspace test stopping mid-flight with no output and no trap, because the state drifted by
+one per round trip until a `restore` found nothing to restore.
+
+### A block that could straddle its own locked page
+
+The trap data block gained three fields and grew past 256 bytes. `TRAP_DATA_SIZE` was 256 and was used
+as the *alignment*, which is fine only while the size does not exceed it: a 320-byte block aligned to
+256, landing 256 bytes below the end of its page, has its last 64 bytes in the next page — which
+nothing locked. A handler reading a field near the end would take a TLB miss at trap level one, inside
+the code whose purpose is to service those.
+
+Now 512, equal to the padded size, with a `static_assert` saying the two must agree and why.
+
+### What is tested and what is not
+
+The **spill** side is exercised on every boot with `--user-test`, six times. The **fill** side shares
+every instruction except the write/read flag, and is not: reaching it needs a page to disappear between
+a spill and the matching fill, which under this workload does not happen. Said plainly rather than
+implied.
+
+Also unchanged, and checked: every in-kernel self-test is byte for byte identical to the boot before
+this, including the window-spill counts.
