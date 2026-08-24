@@ -118,7 +118,7 @@
 #define IFRAME_SFAR			0x70
 #define IFRAME_TAG_ACCESS		0x78
 #define IFRAME_OUT			0x80
-#define IFRAME_SIZEOF			0xc0
+#define IFRAME_SIZEOF			0xe0
 
 // The data MMU's fault status and address registers.
 #define MMU_SFSR			0x18
@@ -1111,11 +1111,10 @@ sparc_unhandled_trap_stop:
 	stx	%l4, [%l7 + IFRAME_Y]
 
 .if \save_outs
-	/* The trapped code's outs, which the `save` above turned into this window's
-	 * ins. Only a system call wants the argument registers, and only because its
-	 * arguments and its result live there -- see the note on iframe::out.
+	/* The trapped code's argument registers, which the `save` above turned into
+	 * this window's ins. Only a system call wants these, and only because its
+	 * arguments live there -- see the note on iframe::out.
 	 */
-	stx	%i0, [%l7 + IFRAME_OUT + (0 * 8)]
 	stx	%i1, [%l7 + IFRAME_OUT + (1 * 8)]
 	stx	%i2, [%l7 + IFRAME_OUT + (2 * 8)]
 	stx	%i3, [%l7 + IFRAME_OUT + (3 * 8)]
@@ -1123,7 +1122,13 @@ sparc_unhandled_trap_stop:
 	stx	%i5, [%l7 + IFRAME_OUT + (5 * 8)]
 .endif
 
-/*	%o6 and %o7 are saved for every trap, not just for system calls.
+/*	%o0, %o6 and %o7 are saved for every trap, not just for system calls.
+ *
+ *	%o0 because the trap return may have to write it -- signal delivery hands the
+ *	trampoline its frame pointer there -- and a slot that is written on the way out
+ *	but filled only sometimes hands userspace kernel-stack poison in the cases it
+ *	was not. A system call's result goes in the same place, which is why it is not
+ *	saved twice.
  *
  *	%o6 is the trapped code's stack pointer, and a signal is delivered on the way
  *	out of whatever trap the thread happened to be in -- a timer interrupt, most
@@ -1137,8 +1142,9 @@ sparc_unhandled_trap_stop:
  *	%o7 is the trapped code's return address, which costs one more store and is
  *	what a backtrace across a trap needs.
  *
- *	Neither is restored on the way out -- see the note at the matching reload.
+ *	%o7 is never restored on the way out -- see the note at the matching reload.
  */
+	stx	%i0, [%l7 + IFRAME_OUT + (0 * 8)]
 	stx	%i6, [%l7 + IFRAME_OUT + (6 * 8)]
 	stx	%i7, [%l7 + IFRAME_OUT + (7 * 8)]
 
@@ -1150,21 +1156,23 @@ sparc_unhandled_trap_stop:
 	call	\handler
 	 mov	%l7, %o0
 
-	/*	Anything the spill handler had to park in the save area goes to the user's
-		stack now, while the trap level is still zero and a fault there is an
-		ordinary page fault. See sparc_flush_user_windows().
+	/*	Everything the kernel owes userspace before letting it run again: the
+		parked register windows go to the user's stack, and then the signals,
+		debugger stops and time accounting that Haiku expects at this boundary.
+		Both live in sparc_kernel_exit(), in that order, because the signal
+		handler's view of its own call chain is the windows this flush writes.
 
-		Read from the frame rather than from %l0, because a handler is allowed to
-		change where the trap returns to -- that is how an unresolvable page fault
-		becomes a jump to the thread's fault handler -- and where it returns to is
-		what decides whether userspace is about to run.
+		Read TSTATE from the frame rather than from %l0, because a handler is
+		allowed to change where the trap returns to -- that is how an unresolvable
+		page fault becomes a jump to the thread's fault handler -- and where it
+		returns to is what decides whether userspace is about to run.
 	 */
 	ldx	[%l7 + IFRAME_TSTATE], %l5
 	andcc	%l5, TSTATE_PRIV, %g0
 	bne,pt	%xcc, 5f
 	 nop
 
-	/*	Interrupts on for the copy, and only for the copy.
+	/*	Interrupts on for it, and off again afterwards.
 	 *
 	 *	Trap level zero is necessary for the flush to be able to fault, and it is
 	 *	not sufficient. sparc_page_fault() refuses to page anything in when it
@@ -1178,20 +1186,27 @@ sparc_unhandled_trap_stop:
 	 *	touched, so every one of them was a first-touch fault the flush was not
 	 *	allowed to take.
 	 *
+	 *	thread_at_kernel_exit() requires them on for its own reasons, and turns
+	 *	them off itself; sparc_kernel_exit() therefore returns with them off,
+	 *	and the toggle below is what makes that true on the path where no signal
+	 *	work happened.
+	 *
 	 *	PIL is left alone. It gates device interrupts; a page fault is
 	 *	synchronous and arrives regardless, which is the whole point.
 	 *
 	 *	wrpr writes rs1 XOR rs2, and IE is known clear here -- PSTATE.IE has been
-	 *	off since the trap was taken -- so the two toggles are a set and a clear.
+	 *	off since the trap was taken -- so this is a set, and the ANDN below is a
+	 *	clear that does not care whether the callee already did it.
 	 */
 	rdpr	%pstate, %l5
 	wrpr	%l5, PSTATE_IE, %pstate
 
-	call	sparc_flush_user_windows
-	 nop
+	call	sparc_kernel_exit
+	 mov	%l7, %o0
 
 	rdpr	%pstate, %l5
-	wrpr	%l5, PSTATE_IE, %pstate
+	andn	%l5, PSTATE_IE, %l5
+	wrpr	%l5, 0, %pstate
 5:
 
 	/* Back up to trap level 1: `retry` is meaningless below it, and %tpc and
@@ -1224,15 +1239,48 @@ sparc_unhandled_trap_stop:
 	ldx	[%l7 + IFRAME_OUT + (4 * 8)], %i4
 	ldx	[%l7 + IFRAME_OUT + (5 * 8)], %i5
 
+	/*	out[0] again below for a return to userspace, and that is not redundant:
+		a system call taken from kernel mode reaches only this one, and a signal
+		delivered on the way out of any trap reaches only that one.
+	 */
 .endif
 
-	/*	%i6 and %i7 are deliberately not restored, for either kind of trap. They
-		are the trapped window's stack pointer and return address, which the
-		`restore` below brings back from the register file or the stack --
-		writing them here would overwrite a correct value with a copy, and a
-		stale one if a handler moved the stack. They are captured on the way in
-		to be read, not to be written back.
+	/*	%o0 and %o6 come back on the way to userspace, whatever the trap was.
+	 *
+	 *	Because a signal changes both, and a signal is delivered on the way out of
+	 *	whichever trap the thread was in. sparc_kernel_exit() has just run, and if
+	 *	it queued a handler then arch_setup_signal_frame() put the frame pointer
+	 *	the trampoline expects in out[0] and the stack it runs on in out[6]. A
+	 *	handler that changed neither wrote back what the entry saved, so this is a
+	 *	no-op in every other case -- which is the reason out[0] is now saved
+	 *	unconditionally.
+	 *
+	 *	After the argument reload, not before: when a system call's return is the
+	 *	thing being interrupted, the handler runs *instead* of the call returning,
+	 *	so the signal's out[0] has to win over the call's result. The result is not
+	 *	lost -- _kern_restore_signal_frame() puts the whole context back.
+	 *
+	 *	Writing %i6 reaches the trapped window's %o6 because a trap does not rotate
+	 *	CWP: this window's ins and that window's outs are the same registers. Its
+	 *	%l and %i registers are a different matter -- if it was spilled, the
+	 *	`restore` below traps to a fill that reads them from the *new* stack
+	 *	pointer. Harmless, because the trampoline is a C function that reads only
+	 *	%o0 and %sp and overwrites the rest with its own `save`, and because
+	 *	arch_setup_signal_frame() zeroes that save area so the read is of memory it
+	 *	has already touched rather than of a page the fill would have to fault on.
+	 *	A fault in a fill is winfixup, and winfixup does not exist yet.
+	 *
+	 *	%o7 is still never restored: it is the trapped window's return address,
+	 *	which the `restore` brings back correctly on its own, and nothing on this
+	 *	path has a reason to change it.
 	 */
+	ldx	[%l7 + IFRAME_TSTATE], %l5
+	andcc	%l5, TSTATE_PRIV, %g0
+	bne,pt	%xcc, 6f
+	 nop
+	ldx	[%l7 + IFRAME_OUT + (0 * 8)], %i0
+	ldx	[%l7 + IFRAME_OUT + (6 * 8)], %i6
+6:
 
 	/* Reload the trap state from the frame rather than from this window's
 	 * locals, so that a handler can change where the trap returns to. That is

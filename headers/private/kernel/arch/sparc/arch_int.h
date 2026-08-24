@@ -89,9 +89,33 @@ struct iframe {
 		// is nearly always a timer interrupt and nearly never a system call, so
 		// filling this one conditionally makes it poison exactly when it
 		// matters. out[7] is the return address, for backtraces across a trap.
+	uint64	syscallTpc;
+	uint64	syscallTnpc;
+	uint64	syscallArg0;
+		// What a system call needs in order to be able to run twice.
+		//
+		// A signal arriving while a thread is blocked in an interruptible system
+		// call makes the call return B_INTERRUPTED, and if the handler was
+		// installed with SA_RESTART the kernel runs the call again rather than
+		// reporting that. Running it again means going back to the `ta` -- and by
+		// the time anything knows to do that, sparc_syscall() has copied %tnpc
+		// over %tpc to step past it and the dispatcher has written the result
+		// over the first argument.
+		//
+		// Neither is recoverable by arithmetic. %tpc is not %tpc - 4, for the
+		// same reason the step past the `ta` is a copy rather than an addition:
+		// a `ta` in a delay slot does not follow that rule.
+		//
+		// Kept in the frame rather than in arch_thread because system calls
+		// nest. A handler interrupting a restartable call can make calls of its
+		// own, and the outer call's restart is decided only after they have
+		// returned; one copy per thread would be overwritten by the inner call.
+		//
+		// Written only by sparc_syscall(), read only when the thread is flagged
+		// for a restart.
 };
 
-#define IFRAME_SIZEOF	192
+#define IFRAME_SIZEOF	224
 	// sizeof(struct iframe) rounded up to a 16-byte multiple, which is what
 	// stack frames have to be aligned to.
 

@@ -215,6 +215,99 @@ sparc_flush_user_windows()
 }
 
 
+/*!	Everything the kernel owes userspace before letting it run again.
+
+	Called from TRAP_TO_C on the return path of any trap that came from
+	userspace, at trap level zero, with interrupts enabled. Returns with them
+	disabled, because thread_at_kernel_exit() does that and the trap return needs
+	it anyway.
+
+	The order is the interesting part. The windows are flushed first because a
+	signal handler's view of its own call chain is the frames this flush writes:
+	arch_setup_signal_frame() deliberately leaves the interrupted window's locals
+	and ins out of the context it hands over, on the grounds that a handler
+	walking its frames will find them in memory. That is only true if they have
+	been put there, and this is where.
+
+	The signal work is second and may not return -- a deadly signal ends the
+	thread here rather than going back through the trap.
+*/
+extern "C" void
+sparc_kernel_exit(struct iframe* frame)
+{
+	sparc_flush_user_windows();
+
+	Thread* thread = thread_get_current_thread();
+
+	/*	Put the frame back on the thread's iframe stack for the duration.
+	 *
+	 *	It was pushed by the handler and popped when the handler returned, which
+	 *	is one call too early: this runs after the handler and is still part of
+	 *	servicing the same trap. And the signal path needs to find it --
+	 *	arch_setup_signal_frame() is reached through Haiku's generic
+	 *	handle_signals(), which passes no frame, so the only way an architecture
+	 *	can say "the trap you are interrupting is this one" is to leave it
+	 *	somewhere the thread can be asked for.
+	 *
+	 *	Not fixed by moving the handler's pop later, because the pop is a C
+	 *	destructor in the handler and this is a separate call from the assembly.
+	 *	Pushing again says what is actually true, in the place that needs it.
+	 *
+	 *	No matching pop when a deadly signal ends the thread here. An index left
+	 *	high on a thread that is being destroyed costs nothing.
+	 */
+	iframe_stack* frames = &thread->arch_info.iframes;
+	bool pushed = frames->index >= 0 && frames->index < IFRAME_TRACE_DEPTH;
+	if (pushed)
+		frames->frames[frames->index++] = frame;
+
+	/*	Haiku's own division of this boundary: the full version handles signals
+		and debugger stops and needs interrupts enabled, the quick one only
+		accounts for time and needs them disabled. Reading the flags is the
+		decision, and it is read with interrupts off so that a signal arriving
+		between the test and the call cannot be missed -- it stays pending and is
+		taken on the next crossing, which is a delay rather than a loss.
+	 */
+	disable_interrupts();
+
+	atomic_and(&thread->flags, ~(int32)THREAD_FLAGS_SYSCALL_RESTARTED);
+
+	if ((thread->flags & (THREAD_FLAGS_SIGNALS_PENDING
+			| THREAD_FLAGS_DEBUG_THREAD
+			| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
+		enable_interrupts();
+		thread_at_kernel_exit();
+	} else
+		thread_at_kernel_exit_no_signals();
+
+	/*	And if a signal interrupted a restartable system call, put the call back.
+
+		handle_signals() sets this when the handler was installed with SA_RESTART
+		and the call it interrupted is one that may be run again. Restarting means
+		returning to the `ta` rather than past it, with the arguments the caller
+		passed rather than the B_INTERRUPTED the dispatcher wrote over the first
+		of them -- which is why sparc_syscall() keeps all three.
+
+		THREAD_FLAGS_SYSCALL_RESTARTED, cleared above, is how the call itself
+		finds out it is running for the second time; some of them care.
+
+		Checked after the signal work rather than before, because the signal work
+		is what sets it.
+	 */
+	if ((thread->flags & THREAD_FLAGS_RESTART_SYSCALL) != 0) {
+		atomic_and(&thread->flags, ~(int32)THREAD_FLAGS_RESTART_SYSCALL);
+		atomic_or(&thread->flags, THREAD_FLAGS_SYSCALL_RESTARTED);
+
+		frame->tpc = frame->syscallTpc;
+		frame->tnpc = frame->syscallTnpc;
+		frame->out[0] = frame->syscallArg0;
+	}
+
+	if (pushed)
+		frames->index--;
+}
+
+
 /*!	Says where this thread's thread local storage lives.
 
 	The block itself is not ours: thread.cpp carves TLS_SIZE off the top of the
@@ -441,6 +534,25 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
 	// ordinary C function and the first thing it does is `save`.
 	addr_t trampolineFrame = ROUNDDOWN((addr_t)userStack
 		- SPARC_MINIMUM_FRAME_SIZE, 16);
+
+	/*	Zeroed, and the reason is the trap return rather than the trampoline.
+
+		Changing the stack pointer for the handler changes it for the interrupted
+		window too -- they are the same register -- so if that window was spilled,
+		the `restore` that ends the trap traps to a fill which reads its sixteen
+		saved registers from *here*. The values do not matter: the trampoline
+		reads only its frame pointer and its argument, and overwrites the rest
+		with its own `save`. Whether the read faults does matter, because a fault
+		inside a fill is winfixup and winfixup does not exist yet.
+
+		So touch it now, at trap level zero, where a first-touch fault on a fresh
+		stack page is an ordinary page fault -- and hand the fill a page it can
+		read instead of one it would have to fault on.
+	 */
+	status = user_memset((void*)trampolineFrame, 0,
+		SPARC_WINDOW_SAVE_REGISTERS * sizeof(uint64));
+	if (status != B_OK)
+		return status;
 
 	frame->tpc = commpage + handlerOffset;
 	frame->tnpc = frame->tpc + 4;

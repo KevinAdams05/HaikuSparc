@@ -65,6 +65,22 @@ public:
 			fStack->frames[fStack->index++] = frame;
 		} else
 			fStack = NULL;
+
+		/*	The other half of the kernel boundary, and the reason this is in the
+			constructor rather than in each handler: every trap that runs C goes
+			through here, and a boundary crossing that is counted on the way out
+			but not on the way in charges the whole trap to userspace.
+
+			Only for traps from userspace. A trap taken in the kernel is not a
+			crossing -- and calling this for one would mark a thread already in
+			the kernel as entering it, which the exit path then unwinds twice.
+
+			Interrupts are still off here. That is what thread_at_kernel_entry()
+			wants: it takes the thread's time lock, and a spinlock taken with
+			interrupts enabled is the one thing Haiku's locking checks refuse.
+		 */
+		if ((frame->tstate & TSTATE_PRIV) == 0)
+			thread_at_kernel_entry(system_time());
 	}
 
 	~IFrameScope()
@@ -961,6 +977,14 @@ sparc_syscall(struct iframe *frame)
 
 	uint64 index = frame->g1;
 	bool isUser = (frame->tstate & TSTATE_PRIV) == 0;
+
+	// Kept so the call can be run again. A signal that interrupts a restartable
+	// system call sends the thread back to the `ta`, and by then both of these
+	// have been moved on and out[0] holds the result rather than the first
+	// argument. See iframe::syscallTpc.
+	frame->syscallTpc = frame->tpc;
+	frame->syscallTnpc = frame->tnpc;
+	frame->syscallArg0 = frame->out[0];
 
 	// Past the `ta`. %tnpc is the instruction after it, and on a trap from a
 	// delay slot it is not %tpc + 4, which is why it is copied rather than
