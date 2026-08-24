@@ -28,6 +28,7 @@
 #define SYSCALL_EXIT_TEAM		41
 #define SYSCALL_SEND_SIGNAL		91
 #define SYSCALL_SIGACTION		93
+#define SYSCALL_OPEN			114
 #define SYSCALL_DEBUG_OUTPUT		254
 
 #define FRAME				176
@@ -73,6 +74,9 @@
 
 #define SIGNAL_HIGH			0x7573657274657374	/* "usertest" */
 #define SIGNAL_LOW			0x207369670a000000	/* " sig\n\0"   */
+
+#define DEVICE_HIGH			0x2f6465762f6e6574	/* "/dev/net" */
+#define DEVICE_LOW			0x2f686d652f300000	/* "/hme/0\0"  */
 
 /*	Scratch inside this frame, past the sixteen words a spill of this window
  *	writes -- so building the message cannot be undone by the spill that the
@@ -223,6 +227,31 @@ _start:
 	ta	SYSCALL_TRAP
 
 	restore
+
+	/*	Ask for a network device, so that the kernel goes and finds one.
+	 *
+	 *	Not because this program has anything to say over a network. Opening a path
+	 *	under /dev is what makes devfs call legacy_driver_probe() for the directory
+	 *	named in it, which loads every driver symlinked under drivers/dev/net and
+	 *	gives each one its chance to probe. So this one syscall is what causes hme
+	 *	to be loaded, matched against the PCI device, and attached -- and the
+	 *	driver's own output on the serial console is the result.
+	 *
+	 *	The return value is deliberately ignored. Whether the device can be opened
+	 *	depends on there being a network stack, and there is not one yet; whether
+	 *	the driver attaches does not, and that is what is being asked.
+	 */
+	setx	DEVICE_HIGH, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 16]
+	setx	DEVICE_LOW, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 24]
+
+	mov	-1, %o0
+	add	%sp, SCRATCH + 16, %o1
+	clr	%o2
+	clr	%o3
+	set	SYSCALL_OPEN, %g1
+	ta	SYSCALL_TRAP
 
 	/*	Say so, on the same serial console the kernel prints to. Reached only if
 		all eight spills and fills above worked, and the signal went out and came

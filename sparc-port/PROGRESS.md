@@ -3395,3 +3395,112 @@ implied.
 
 Also unchanged, and checked: every in-kernel self-test is byte for byte identical to the boot before
 this, including the window-spill counts.
+
+
+## 42. hme attaches
+
+```
+[hme] hme: /dev/net/hme/0
+[hme] (miibus) found device driver: ukphy
+[hme] () OUI 0x1000e8, model 0x0000, rev. 1
+[hme] ()  none, 100baseTX-FDX, auto
+sparc_int: vector 33 enabled (0x1fe00001008 = 0x800007e1)
+[net/hme/0] compat_open(0x0)
+```
+
+The Ultra 10's onboard Ethernet: matched, resources allocated, station address read, MII bus attached,
+PHY identified, media negotiated to 100baseTX full duplex, a device node published, an interrupt routed
+through the sabre controller at INO 0x21 — and opened by a userland program.
+
+Not yet a ping. That needs the network stack driven by something with an address, which needs a real
+userland. But the driver is up and the hardware answers.
+
+### The plan was wrong about the donor, for a reason worth recording
+
+§32 settled on OpenBSD's `hme` through Haiku's `openbsd_network` compatibility layer, on the grounds
+that OpenBSD still supports sparc64 and the layer has an in-tree precedent. **That layer has no MII**,
+and `hme` uses fourteen distinct MII and ifmedia entry points — its whole link-management story. Haiku
+*does* ship a complete FreeBSD `miibus` (`mii.c`, `mii_physubr.c`, `mii_bitbang.c`, `ukphy.c`), which is
+what every other Ethernet driver in the tree uses.
+
+So the donor is FreeBSD's, from **release/12.4.0** — because FreeBSD deleted the driver in 13 along with
+sparc64 support. The file even carries the call announcing it:
+
+```c
+gone_in_dev(sc->sc_dev, 13, "10/100 NIC almost exclusively for sparc64");
+```
+
+which is removed here. The deprecation is FreeBSD's schedule, and printing it on a machine that is
+exclusively sparc64 would tell the user their network card is going away.
+
+Checking the emulated part first is what made this decision cheap. QEMU's `sunhme` models a real MII
+PHY at address 1, reports `DP83840_PHYID1`, and completes auto-negotiation — so the MII path is
+testable rather than a leap of faith, and `ukphy` covers the IEEE registers that is all the model has.
+
+### Four gaps in the compatibility layer, and one of them is a 64-bit bug
+
+**No sparc at all.** `machine/bus.h` and `machine/cpufunc.h` are `#error Need a … for this arch!` with
+branches for x86 and RISC-V. Both now point at the `machine/generic/` implementations RISC-V uses.
+
+**`bus_space_read_*` did not convert byte order.** Which is correct on RISC-V and wrong on any
+big-endian host. PCI is little-endian by specification — all five of QEMU's HME register blocks are
+`DEVICE_LITTLE_ENDIAN`, as the real chip is — so a 32-bit register read on SPARC returns the bytes
+reversed. FreeBSD's contract is that `bus_space_read_N` yields the *value* and
+`bus_space_read_stream_N` yields the *bytes*; the stream family here was `#define`d to the non-stream
+one, which is exact only where the distinction is empty. This is the third time this port has found the
+same class of bug in a different layer — after the PCI accessors and the ATA identify block in §29.
+
+**`pci_get_intpin()` and `pci_set_intpin()` were declared and never defined.** Since the layer was
+written. Nothing had called them.
+
+**And the one that took three boots: the BAR was mapped at the wrong physical address.**
+
+`pci_info::base_registers[]` is documented as the host view and is a `uint32`. On sun4u the host bridge
+puts PCI memory at host physical `0x1ff00000000`, so a BAR at PCI `0x21000000` is at `0x1ff21000000` —
+and the field holds the low half, which is `0x21000000`, which is the PCI address again and looks
+entirely reasonable. The bus manager's translation is correct; the field it lands in is too narrow.
+
+What follows is a mapping of whatever physical memory happens to be at that address, and then
+
+```
+PANIC: sparc: unhandled trap 0x32 at pc 0x8098df3c
+```
+
+— `data_access_error`, a bus error on the first register access, a long way from the cause. Fixed by
+translating at the point of use instead: `base_registers_pci[]` holds the PCI address, which fits, and
+`ram_address()` is the bus manager's own translation, identity on x86.
+
+### The station address is in the IDPROM, and nothing else has it
+
+FreeBSD's PCI attachment calls `OF_getetheraddr()`, which is the only thing in the driver that needs a
+firmware bus layer Haiku does not have. Replacing it looked like a five-line job and took four boots,
+because every obvious property is absent. Asking the firmware what it actually publishes ended it:
+
+```
+hme:   network node properties: name(8) vendor-id(4) device-id(4) revision-id(4) class-code(4)
+       interrupts(4) ... device_type(8) compatible(9) assigned-addresses(20) reg(40) hm-rev(4)
+       network-type(9) removable(8) category(4)
+hme:   chosen properties: name(7) stdin(4) stdout(4) keyboard(4) mmu(4) memory(4) bootargs(1)
+       bootpath(52) display(4)
+hme:   root properties: name(22) #address-cells(4) #size-cells(4) compatible(6) uuid(16)
+       idprom(32) clock-frequency(4)
+```
+
+No `local-mac-address` on the network node, no `mac-address` on `/chosen` — and `idprom(32)` on the
+root, which is where a Sun has always kept it. Six bytes at offset 2, after the format byte and the
+machine type, with byte 15 an XOR checksum of the fifteen before it that is verified rather than
+trusted. All four sources are tried in order, because on a two-port machine the per-port property is
+the more specific answer and real OpenBoot does publish it.
+
+*Lesson, and this port keeps relearning it: when a lookup fails, print what is there before guessing at
+another name for it.* Three boots went to guesses; one boot to `of_nextprop`.
+
+### What triggers the probe
+
+The driver is not preloaded — it is loaded on demand, when devfs is asked to look something up under
+`/dev`. So the userland test now opens `/dev/net/hme/0`, and that single system call is what causes hme
+to be loaded, matched, and attached. The open succeeds and the close and free are in the log, which is
+more than was being asked for.
+
+Nothing else moved: every in-kernel self-test is identical, the six winfixups still happen, and the
+signal test still passes.

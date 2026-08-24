@@ -58,6 +58,39 @@ addon_paths=(
 	partitioning_systems/intel
 )
 
+# Drivers the kernel loads on demand rather than at boot, each named by its path
+# below add-ons/kernel. Unlike the list above these are not preloaded by the
+# loader: legacy_driver_probe() finds them when something looks a device up under
+# /dev, which is why they go in drivers/bin with a symlink under drivers/dev
+# naming the directory they publish into.
+#
+# hme is the Ultra 10's onboard Ethernet -- function 1 of the PCIO chip whose
+# function 0 is the EBus bridge.
+ondemand_paths=(
+	drivers/network/ether/hme
+)
+
+# Where each of the above publishes, below drivers/dev.
+declare -A ondemand_dev=(
+	[drivers/network/ether/hme]=net
+)
+
+# Kernel modules that are not drivers and are not preloaded either -- the module
+# manager finds them by path when something asks for them by name. A FreeBSD
+# compatibility driver asks for network/stack/buffer/v1 before it will attach, so
+# without these the driver loads, matches its device, and then releases it again:
+#
+#   pci_reserve_device(1, 1, 1, hme)
+#   module: Search for network/stack/buffer/v1 failed.
+#   pci_unreserve_device(1, 1, 1, hme)
+#
+# which reads like a driver problem and is a missing file.
+module_paths=(
+	network/stack
+	network/datalink_protocols/ethernet_frame
+	network/devices/ethernet
+)
+
 output=bfs.img
 size_mb=48
 label=Haiku
@@ -223,6 +256,49 @@ if [[ "$install_addons" == "1" ]]; then
 		# traverses links.
 		shell_command ln -s "../../../add-ons/kernel/$path" \
 			"/myfs/system/add-ons/kernel/boot/$leaf"
+	done
+
+	# On-demand drivers, in the layout legacy_drivers.cpp expects: the binary
+	# under drivers/bin, and a symlink under drivers/dev in the directory the
+	# driver publishes into. legacy_driver_probe() is handed that directory's
+	# name when devfs is asked to look something up beneath it, and scans the
+	# matching drivers/dev subdirectory for links to try.
+	volume_mkdir_p system/add-ons/kernel/drivers/bin
+
+	for path in "${ondemand_paths[@]}"; do
+		leaf="${path##*/}"
+		dev="${ondemand_dev[$path]}"
+
+		if [[ ! -r "$addons/$path/$leaf" ]]; then
+			echo "missing on-demand driver: $leaf" >&2
+			echo "  cd $repo/generated.sparc && jam -q $leaf" >&2
+			exit 1
+		fi
+
+		shell_command cp -f ":$addons/$path/$leaf" \
+			"/myfs/system/add-ons/kernel/drivers/bin/$leaf"
+
+		volume_mkdir_p "system/add-ons/kernel/drivers/dev/$dev"
+		shell_command ln -s "../../bin/$leaf" \
+			"/myfs/system/add-ons/kernel/drivers/dev/$dev/$leaf"
+
+		echo "  drivers/bin/$leaf -> published under /dev/$dev"
+	done
+
+	# Modules, at the path the module manager derives from the name they publish.
+	for path in "${module_paths[@]}"; do
+		leaf="${path##*/}"
+
+		if [[ ! -r "$addons/$path/$leaf" ]]; then
+			echo "missing kernel module: $leaf" >&2
+			echo "  cd $repo/generated.sparc && jam -q $leaf" >&2
+			exit 1
+		fi
+
+		volume_mkdir_p "system/add-ons/kernel/${path%/*}"
+		shell_command cp -f ":$addons/$path/$leaf" \
+			"/myfs/system/add-ons/kernel/$path"
+		echo "  $path"
 	done
 fi
 
