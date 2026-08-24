@@ -15,68 +15,50 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 
 ## Status
 
-**The kernel runs its own MMU, page table and VM, schedules and preempts threads, keeps time, and
-drops into a working kernel debugger.** Phases 0–5 are complete, including Phase 2 — the MMU and
-trap table, the gate this port has always turned on.
+**The kernel boots from a real disk, mounts BFS, and runs userland programs.** A freestanding SPARC
+binary loaded by the kernel's own ELF loader runs unprivileged, nests register windows across the
+privilege boundary, makes real system calls into `libroot`'s stubs, receives a signal it sent
+itself, and exits cleanly. Phases 0 through 6 are complete and Phase 7 is most of the way there.
 
-On QEMU's `sun4u` machine the loader boots from Sun-disklabelled media, mounts a BFS volume and
-enters the kernel. The kernel brings up the platform, debug output, locking and interrupts, takes
-the MMU and trap table over from Open Firmware, builds its own three-level page table, runs
-`vm_page_init` and the slab allocator, creates its areas, and initialises the ELF loader, the
-commpage and the scheduler, switches between kernel threads, and gets as far as
-`KDiskDeviceManager::InitialDeviceScan()` — which finds nothing, because there are no disk drivers
-yet.
+The whole chain works. The loader boots from Sun-disklabelled media; the kernel takes the MMU and
+trap table over from Open Firmware, builds its own three-level page table, brings up the slab
+allocator and the VM, schedules and preempts threads, keeps time from `%TICK`, and drops into a
+working kernel debugger. Then a new `busses/pci/sabre` driver publishes the host bridge — Haiku's
+PCI bus manager does not *find* controllers, it attaches beneath one, and sun4u has neither ACPI nor
+FDT to hang it off — and PCI enumerates through both `simba` bridges to the CMD646, which reaches a
+disk over DMA through `generic_ide_pci` → `ata_adapter` → `ata` → `scsi_disk`, so `intel` can read
+the partition map and `bfs` can mount.
 
-All three of Phase 2's exit criteria are met by deliberate tests rather than by inference: it maps
-a page it allocated itself with the firmware no longer involved, it survives a TLB miss provoked
-by demapping a translation that exists only in its own TSB, and it survives a 24-frame recursion
-against 8 register windows with the values arriving back intact.
+Every phase's exit criterion is met by a deliberate test that prints its own result, rather than by
+inference from the boot getting further:
 
-Phase 3's exit criterion is met the same way: two kernel threads alternate a counter 64 times each
-and the total comes out exact. The context switch is twelve instructions, because on SPARC the
-callee-saved registers *are* the window registers — `flushw` spills them to the outgoing thread's
-own stack, and the fill after `restore` pulls them from the incoming one.
+| | |
+| --- | --- |
+| **2 — MMU** | maps a page it allocated itself with the firmware uninvolved; survives a TLB miss provoked by demapping a translation that exists only in its own TSB; survives a 24-frame recursion against 8 register windows |
+| **3 — threads** | two kernel threads alternate a counter 128 times and the total comes out exact. The switch is twelve instructions, because on SPARC the callee-saved registers *are* the window registers |
+| **4 — time** | `system_time()` off `%TICK`, the level-14 timer interrupt taken, and a thread that never yields taken off the CPU anyway |
+| **5 — backtraces** | a trace walks across spilled windows and terminates at the fabricated frame Phase 3 builds for a thread that has never run |
+| **6 — userspace** | contexts, per-address-space page tables, `ta 0x40`, TLS in `%g7`, windows across the boundary, signal delivery end to end |
+| **7 — disk** | `bfs: mounted "Haiku" … device = /dev/disk/ata/0/slave/raw`, over DMA, with real device interrupts |
 
-Phase 4 is done too: `system_time()` runs off `%TICK`, the kernel takes the level-14 timer
-interrupt, and a thread that never yields gets taken off the CPU anyway — `spinner reached 402130
-after 8720 us without either thread yielding`.
+KDL works: `sc` prints a symbolised backtrace and `threads` prints the thread table.
 
-Along the way the firmware's own clock turned out to be the unreliable one — OpenBIOS's
-`milliseconds` runs about eleven times fast under QEMU, which took timestamping the serial output
-on the host to establish.
+What is left in Phase 7 is `winfixup` — a fault taken *during* a register-window spill or fill, the
+one case the window machinery does not yet survive — and an `hme` driver for the Ultra 10's onboard
+Ethernet, which is the other half of the phase's exit criterion and would validate DMA and
+interrupts on a second device. Phase 8 is graphics, and needs hardware.
 
-Phase 5, window-aware backtraces, is done — four phases later than the plan said to do it. A trace
-walks across spilled register windows and terminates at `sparc_thread_entry`, the fabricated frame
-Phase 3 built for a thread that had never run.
+Around forty genuine bugs have been found and fixed along the way, a good many of them
+architecture-neutral. Two are still carried by the PowerPC Open Firmware port. One, `PAGE_SHIFT`,
+had been quietly corrupting physical memory for as long as the port existed. Several were not merely
+untested but unreachable — Haiku's kernel never enters a program directly, and nothing on this port
+called the trap-return hook that delivers signals, so an entire subsystem had been written, verified
+by disassembly, and could not have run.
 
-KDL works. `sc` prints a symbolised sixteen-frame backtrace and `threads` prints the thread table.
-That took two fixes beyond the stack walker: the prompt had never accepted a keypress, and
-`setjmp`/`longjmp` were a bare `ret` — which, on a machine where a leaf function must return with
-`retl`, transferred control two frames up while executing a stray instruction. That one bug is also
-why `DebugAllocPool::Free: bad address` had appeared in every boot since Phase 2.
-
-Phase 6's foundation is in and the thing it said to verify first is verified: page faults reach the
-VM, `user_memcpy` fails safely on a bad user address, and the shared address space holds with no
-changes to shared Haiku code. What remains of that phase — syscalls, `enter_userspace`,
-`runtime_loader` — is gated on being able to run a binary, which needs an image build that can
-produce SPARC media.
-
-Phase 7 has started, and the surprise is how little needed porting. The kernel reads PCI
-configuration space over sabre — verified against the device tree, which the firmware had already
-filled in — and every add-on on the path to a disk builds for sparc unchanged: `ata`, `scsi`,
-`generic_ide_pci`, `scsi_disk`, `intel`, `bfs`. Only the PCI bus manager failed to link, for three
-missing MSI symbols that sabre does not have anyway.
-
-What is left before the boot is plumbing rather than hardware: publish the sabre controller to the
-device manager, put the built add-ons into the BFS image so the loader preloads them, then bind ATA
-to the CMD646.
-
-Twenty genuine bugs have been found and fixed along the way, several of them
-architecture-neutral — including two the PowerPC Open Firmware port is still carrying, and one,
-`PAGE_SHIFT`, that had been quietly corrupting physical memory for as long as the port existed.
-
-The running log is [PROGRESS.md](sparc-port/PROGRESS.md), and the current design work is in
-[PHASE2_MMU_DESIGN.md](sparc-port/PHASE2_MMU_DESIGN.md).
+The running log is [PROGRESS.md](sparc-port/PROGRESS.md) — read it first on resume; it carries every
+experiment, every failed approach and why. Design documents:
+[PHASE2_MMU_DESIGN.md](sparc-port/PHASE2_MMU_DESIGN.md) for the MMU and trap table,
+[USERSPACE_DESIGN.md](sparc-port/USERSPACE_DESIGN.md) for the privilege boundary.
 
 ## Scope
 

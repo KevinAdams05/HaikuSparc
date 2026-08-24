@@ -104,6 +104,7 @@ settings file.
 ```sh
 ./make-bfs-image.sh --output bfs.img
 ./make-bfs-image.sh --output bfs.img --kernel /path/to/kernel_sparc
+./make-bfs-image.sh --output bfs.img --user-test        # put a userland on it
 ./make-bfs-image.sh --output bfs.img --serial-debug     # see the warning below
 ```
 
@@ -127,6 +128,38 @@ to serial output is the boot menu, via `serial-driver.py --script boot-kernel-de
 Endianness is not a problem here, though it looks like it should be: the host tool writes a
 little-endian volume, Haiku's BFS is built `BFS_LITTLE_ENDIAN_ONLY`, and the big-endian SPARC
 loader byte-swaps on read.
+
+### `--user-test`, and where it installs
+
+Builds `usertest/usertest.S` with the cross compiler and puts it on the volume **twice** — as
+`system/servers/launch_daemon` and as `system/runtime_loader`. The second one is the one that runs,
+and the reason is worth knowing before reading a boot log:
+
+**Haiku's kernel never enters the program.** `team_create_thread_start()` loads
+`/boot/system/runtime_loader` and enters *that*, whatever the executable is; `runtime_loader` then
+loads the program. So a freestanding binary installed where the program goes is never reached, and
+the only symptom is
+
+```
+error starting "/boot/system/servers/launch_daemon" error = -1
+```
+
+with no ELF diagnostic anywhere — because the loader that is missing is not the file the message
+names. Installed where the loader goes, the same binary is entered by exactly the path the real
+loader will use. The program file still has to exist for team creation to get that far, hence both
+copies.
+
+A successful run prints two lines on the same serial console as the kernel:
+
+```
+usertest sig
+usertest ok
+```
+
+`sig` comes from a `SIGUSR1` handler the program registered and sent itself, `ok` from after the
+handler returned — so the order is the test. Silence after the boot's last kernel message means the
+window machinery or the ELF entry failed; `sig` with no `ok` means delivery worked and the return
+did not.
 
 ## `make-sun-image.py`
 

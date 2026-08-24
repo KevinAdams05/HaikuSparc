@@ -511,7 +511,7 @@ that came up — see [PROGRESS §22 and §23](PROGRESS.md). That is one frame, n
 several of those bugs took a bracket-and-bisect hunt that a real stack walk would have shortened.
 The recommendation stands for anyone reading this before starting: do it earlier than we did.
 
-### Phase 6 — Userspace  **[IN PROGRESS]**
+### Phase 6 — Userspace  **[DONE]**
 
 Syscall entry and return. `arch_thread_enter_userspace`. Signal frames. TLS. Fork frames. The
 real `user_memcpy`/`memset`/`strlcpy` in place of the `retl; nop` stubs. `runtime_loader`.
@@ -527,12 +527,26 @@ dynamically linked one.
 **Risk: high** — the largest surface area in the plan, and the phase most likely to surface
 big-endian assumptions elsewhere in Haiku.
 
-**Status: the foundation is done and the model is verified.** Page faults reach `vm_page_fault()`,
-`user_memcpy()` fails safely on a bad user address, and the shared address space of §4.3 holds with
-no shared-code changes — which is what this phase said to check first. What remains is everything
-gated on running a binary: syscall entry, `arch_thread_enter_userspace`, signal frames, TLS, and
-`runtime_loader`. Note those are also gated on the image build, which cannot yet produce SPARC media
-(§5.4) — so the exit criterion needs that gap closed too. See [PROGRESS §27](PROGRESS.md).
+**Status: done, and §4.3's model held with no shared-code changes** — which is what this phase said
+to check first. Page faults reach `vm_page_fault()`, `user_memcpy()` fails safely on a bad user
+address, and beyond that: MMU contexts with per-address-space page tables, the `ta 0x40` system call
+trap dispatching into `syscall_dispatcher()`, `arch_thread_enter_userspace()`, register windows across
+the privilege boundary, TLS in `%g7`, `libroot`'s 288 syscall stubs, and signal delivery end to end.
+A freestanding SPARC binary loaded by the kernel's own ELF loader runs unprivileged, nests eight
+register windows, calls `_kern_debug_output()`, receives a `SIGUSR1` it sent itself, returns from the
+handler and exits cleanly.
+
+**The exit criterion was not gated on the image build after all**, and that assumption cost a session.
+A userland needs neither `runtime_loader` nor `libroot` nor a package — it needs a static ELF the
+kernel's loader can map. And the kernel enters `/boot/system/runtime_loader` whatever the executable
+is, so installing a test binary under that name runs it through the real path with nothing else
+present. The dynamically linked half of the exit criterion still wants §5.4 closed; the static half
+did not. See [PROGRESS §§39–40](PROGRESS.md).
+
+**Still owed from this phase:** `winfixup`, a fault taken *during* a spill or fill — the one window
+case the machinery does not survive; syscall restart, which is implemented but needs a signal arriving
+while a thread is blocked in an interruptible call; and context id recycling, which needs 8191
+simultaneously live teams to reach.
 
 **The design for the rest of it is written down separately**, in
 [USERSPACE_DESIGN.md](USERSPACE_DESIGN.md), because it is the one subsystem where the reasoning is
@@ -568,8 +582,7 @@ CMD646; `generic_ide_pci` binds the CMD646 through `ata_adapter`; `ata` presents
 `scsi_disk` drives it through `scsi_periph`; `intel` reads the partition map and `bfs` mounts the
 volume. The kernel then replaces every preloaded add-on with the file behind it, read off that volume.
 
-Everything after the mount is the kernel looking for a userland that is not on the volume yet, which
-is Phase 6's packaging gap seen from the other side.
+The kernel then runs a userland off that volume — see Phase 6, which was finished from this side.
 
 **Interrupts are routed and delivered, and the disk runs over DMA.** The sabre interrupt controller
 lives in the kernel, trap 0x60 and all fifteen interrupt levels are in the table, and the firmware's
@@ -587,10 +600,17 @@ What actually stood between DMA and working was a byte swap applied twice — se
 [PROGRESS §31](PROGRESS.md), which also corrects the mechanism this plan previously attributed the
 first DMA attempt's memory corruption to.
 
-So what remains of this phase is the other half of its exit criterion, `hme`, plus one deliberate
-omission: the CMD646's own interrupt latch at configuration offset 0x50 is never cleared, costing one
-unhandled interrupt per transfer. That is a chip-specific register and belongs in a chip-specific bus
-driver next to `silicon_image_3112`, not in shared code — PROGRESS §31 records what it wants.
+So what remains of this phase is the other half of its exit criterion, `hme`, plus `winfixup` — a
+fault taken during a register-window spill or fill, which the window machinery does not yet survive and
+which every user program is one unmapped stack page away from — plus one deliberate omission: the
+CMD646's own interrupt latch at configuration offset 0x50 is never cleared, costing one unhandled
+interrupt per transfer. That is a chip-specific register and belongs in a chip-specific bus driver next
+to `silicon_image_3112`, not in shared code — PROGRESS §31 records what it wants.
+
+`hme`'s route is settled and does not need writing from the datasheets after all. Haiku carries an
+`openbsd_network` compatibility layer with an in-tree precedent (`rtl8125`), and OpenBSD's `hme.c`,
+`hmereg.h` and `if_hme_pci.c` are NetBSD Foundation BSD — portable with their notices intact, per §3.2.
+The datasheets stay the reference for anything the driver leaves unexplained.
 
 See [PROGRESS §29](PROGRESS.md) for the twelve bugs between the device manager and a mounted volume,
 and for the QEMU invocation that reproduces it.

@@ -16,23 +16,38 @@ them for the one subsystem where the reasoning is most of the work.
 ## 1. What is actually missing
 
 Five things, in dependency order. The first two are the ones with design content; the last three are
-work.
+work. **All five are now done** — what follows is the reasoning that produced them, kept because the
+reasoning is most of the value, and because two of the five had their design corrected mid-flight.
 
 | # | Piece | State |
 | --- | --- | --- |
 | 1 | MMU contexts, a TSB comparison that survives them, and a per-address-space page table root | **Done** |
 | 2 | The syscall trap, and entering userspace | **Done** — `ta 0x40`, and an instruction runs unprivileged |
-| 3 | Register windows across the privilege boundary | All 64 spill/fill vectors point at the kernel handlers |
-| 4 | TLS — **done**, §4b's decision made it three lines. Signal frames | `arch_setup_signal_frame` and friends are stubs |
-| 5 | A userland to run | `libroot`'s `syscalls.inc` emits no instructions at all; plus Phase 6's packaging gap |
+| 3 | Register windows across the privilege boundary | **Done** — spills park in a per-thread save area, flushed to the user's stack at trap level zero |
+| 4 | TLS, and signal frames | **Done** — `%g7` for TLS; a handler a userland registered has run and returned |
+| 5 | A userland to run | **Done** — `libroot`'s 288 stubs emit real instructions, and `tools/usertest` runs off the volume |
 
-The system call path is no longer a stub either: `syscall_dispatcher()` is wired, and userspace has
-called `system_time()` and got a real answer.
+Items 1 and 2 were prerequisites for everything else and independent of each other, so they could be
+built and tested in either order. Item 1 was testable without any of the others, which made it the place
+to start.
 
-Items 1 and 2 are prerequisites for everything else and are independent of each other, so they can be
-built and tested in either order. Item 1 is testable without any of the others, which makes it the
-place to start.
+Three things this document could not have known, all found by running item 5 (PROGRESS sections 39 and
+40), and all the same shape — not merely untested but *unreachable*:
 
+- **Haiku's kernel never enters the program.** `team_create_thread_start()` loads
+  `/boot/system/runtime_loader` and enters *that*, whatever the executable is. Section 6's plan for a
+  hello-world had nowhere to land until the test binary was installed as the loader itself.
+- **Nothing called `thread_at_kernel_exit()`.** Signals are delivered from there, by each
+  architecture's own trap-return path, and this port called neither it nor `thread_at_kernel_entry()`.
+  So item 4's signal frame, trampoline and restore path were written, verified by disassembly, and
+  could not have run for any program.
+- **The trapped stack pointer was saved only for system calls.** A signal is delivered on the way out
+  of whichever trap the thread was in, which is nearly always a timer interrupt — so the one register
+  `arch_setup_signal_frame()` needs was filled in the one case it never sees.
+
+Still owed after all five: `winfixup`, a fault *during* a spill or fill, discussed in section 5; syscall
+restart, implemented but needing a signal that arrives while a thread is blocked in an interruptible
+call; and context id recycling, which needs 8191 simultaneously live teams.
 
 ## 2. Contexts, and the problem the plan did not reach
 
@@ -624,16 +639,27 @@ it — a fact worth stating, because their absence looks like an omission.
    in its own context-tagged address space, and traps back with a value it chose. Three things had to
    go with it: the page table root allocated on demand, the trap entry choosing a kernel stack rather
    than the user's, and user page table teardown. One thing came out of it and is still open — §4a.
-3. **The `_other` window handlers.** Then extend the test thread to `save` and `restore` and nest a
-   few calls deep, which is what actually exercises them.
-4. **Signals and TLS.** `arch_setup_signal_frame`, `arch_restore_signal_frame`,
-   `arch_on_signal_stack`, `arch_thread_init_tls`.
-5. **The userland.** `libroot`'s `syscalls.inc` — currently a stub that emits a label and no
-   instructions, so every syscall in the system falls through into the next function — then
-   `runtime_loader`, then something to run.
+3. **The `_other` window handlers. Done.** Then extend the test thread to `save` and `restore` and nest
+   a few calls deep, which is what actually exercises them.
+4. **Signals and TLS. Done.** `arch_setup_signal_frame`, `arch_restore_signal_frame`,
+   `arch_on_signal_stack`, `arch_thread_init_tls`. TLS was three lines; the signal frame was written
+   here and *delivered* two sessions later, because delivery turned out to need a trap-return hook this
+   port had never called at all.
+5. **The userland. Done.** `libroot`'s `syscalls.inc` — a stub that emitted a label and no instructions,
+   so every syscall in the system fell through into the next function — now emits four instructions
+   times 288 entry points. And `tools/usertest`, which is where the plan below turned out to be wrong.
 
-Steps 1 through 3 are kernel work with hand-built tests and no dependency on the image build. Step 5
-depends on Phase 6's media gap, which is the reason this ordering puts it last rather than first.
+Steps 1 through 4 were kernel work with hand-built tests and no dependency on the image build. Step 5
+was expected to depend on Phase 6's media gap, which is the reason this ordering put it last rather
+than first — **and that dependency was smaller than it looked.** A userland does not need
+`runtime_loader`, or `libroot`, or a package: it needs a static ELF the kernel's loader can map, and
+the kernel enters `/boot/system/runtime_loader` regardless, so installing the test binary under that
+name runs it through the real path with nothing else present. Two sessions of work turned out to be an
+afternoon, and the three pieces above stopped being verified-by-inspection the same day.
+
+The order held, though, and steps 3 and 4 are why: a program that never executes `save` needs none of
+the window work, and a program that never registers a handler needs none of the signal work. Doing
+step 5 first would have produced a userland that failed for four reasons at once.
 
 
 ## 7. Decisions recorded
@@ -648,4 +674,8 @@ depends on Phase 6's media gap, which is the reason this ordering puts it last r
 | Spill user windows into a per-thread kernel save area | Store straight to the user stack via `ASI_AS_IF_USER_PRIMARY` | A fault at TL>0 nests toward a watchdog reset. Same rule the miss handler lives by. |
 | `ta 0x40` for syscalls | A low trap number | A stray `ta` with a small immediate hits an unhandled entry that reports |
 | Re-establish the trap global banks after every firmware call | Saving and restoring three banks' worth around each one | Idempotent, two stores per bank, and it calls the same function the cutover did so it cannot drift |
+| Save `%o0`, `%o6`, `%o7` on every trap; the argument registers only for system calls | All eight always, or all eight conditionally | A signal arrives on the way out of *any* trap and needs the stack pointer. A slot written on the way out but filled only sometimes hands userspace poison. |
+| Take an instruction fault's address from `%tpc` | Read the I-MMU's Tag Access register as well | `%tpc` *is* the address a fetch faulted on, and it is an instruction rather than a page number. One fewer ASI access on every trap. |
+| Keep syscall-restart state in the iframe | One copy per thread in `arch_thread` | System calls nest: a handler interrupting a restartable call makes calls of its own, and one copy per thread would be overwritten by the inner one. |
+| Zero the trampoline's save area before returning to a signal handler | Trust that the page a fill would read is present | Changing the handler's stack pointer changes the interrupted window's, so a spilled window's fill reads from the new one. A fault inside a fill is `winfixup`. |
 | Arguments in the ABI's reserved slots at `%sp + BIAS + 128` | A separate argument buffer the stub builds | The slots exist for exactly this; stack arguments already continue from there |
