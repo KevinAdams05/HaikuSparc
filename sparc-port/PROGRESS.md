@@ -3504,3 +3504,108 @@ more than was being asked for.
 
 Nothing else moved: every in-kernel self-test is identical, the six winfixups still happen, and the
 signal test still passes.
+
+
+## 43. libroot, runtime_loader, and a fault direction nobody was reading
+
+`arch_relocate_image()` was the last stub in the SPARC userland path and the gate on dynamic linking.
+It is written; `libroot.so` links for this architecture for the first time; `runtime_loader` runs, brings
+up its heap, and gets as far as opening the program and reading its ELF header. **It does not yet run a
+dynamically linked program** — that is where this section stops, and the remaining failure is stated at
+the end rather than implied.
+
+### The relocation code was mostly already paid for
+
+Twelve relocation types, ported from the kernel's `arch_elf.cpp`, which had already found the two
+expensive bugs: `R_SPARC_RELATIVE` is a **64-bit** write (a 32-bit one puts the value in the high half on
+a big-endian machine, which is how 1153 of the kernel's GOT slots were wrong for six phases), and
+`R_SPARC_HI22`/`LO10` in a linked object are the GOT-base idiom `(B + A) − P`, not the psABI's
+`(S + A) >> 10`.
+
+That second one is now verified against real data rather than argument. runtime_loader's first pair is
+
+```
+8ed4  R_SPARC_HI22  .got + 11e6f4
+8edc  R_SPARC_LO10  .got + 11e6fc
+```
+
+and `0x11e6f4 − 0x8ed4 = 0x11e6fc − 0x8edc = 0x115820`. Both halves agree, and adding the call's address
+lands exactly on `.got` at `0x11e6f8`. The formula is right for the same reason it was right in the
+kernel, and now there is a second independent witness.
+
+New here: `R_SPARC_COPY`, and a `needs_symbol()` test. Most ports resolve the symbol whenever the index
+is non-zero; SPARC cannot, because its GOT-base relocations carry an index naming the `.got` *section*,
+and resolving that produces a value the relocation must not use.
+
+### Three small things stood between libroot and linking
+
+**`bits/hwcap.h` did not exist.** glibc's SPARC `sysdep.h` includes it unconditionally for ifunc
+dispatch on AT_HWCAP, which Haiku's import does not carry — nothing in the tree references an
+`HWCAP_SPARC_*` constant on any architecture. The include had nothing to find, and the seven
+multi-precision assembly routines underneath string and stdio failed to compile, presenting as
+`posix_string.o`.
+
+**`_MAX_PAGE_SHIFT` was defined only for a 4096-byte page**, with no `#else`. SPARC's page is 8192, so
+the identifier simply did not exist and the build failed in `malloc.c` on a line mentioning neither page
+sizes nor that file. The same shape as the kernel's `PAGE_SHIFT`, which had been quietly halving
+physical addresses.
+
+**Three `__fpclassify` sources were missing** from the sparc musl math Jamfile. Found by diffing the
+whole source list against riscv64's rather than adding the one the linker named — they were the only
+difference, which is worth knowing for certain rather than discovering three times.
+
+Result: `libroot.so`, 1.9 MB, 2650 exported functions. And a hand-linked `hellodyn` with
+`NEEDED: libroot.so` and `SONAME: _APP_`, built with the glue ordering `ArchitectureRules` calls
+`HAIKU_EXECUTABLE_BEGIN_GLUE_CODE`.
+
+### The fault handler had been reading a register that says nothing
+
+The interesting bug. `sparc_page_fault()` decided read-versus-write from SFSR's W bit — and the "fast"
+MMU traps are fast precisely because they **skip the fault status registers**. On a
+`fast_data_access_MMU_miss`, SFSR holds whatever the last trap that did write it left behind.
+
+The evidence had been in every log line this port has ever printed:
+
+```
+sparc: user fault at 0x6f9ba1a8 ... sfsr 0xd
+sparc: user fault at 0x7d37a1d0 ... sfsr 0xd
+sparc: user fault at 0x484461a8 ... sfsr 0xd
+```
+
+The same value every time, W bit included. Every data miss was being called a write.
+
+That was invisible while the only faulting accesses were writes — a thread growing its stack is writing,
+so the wrong answer was the right one by luck. The first *read* of an untouched read-only page broke it:
+the kernel fetching an area name out of runtime_loader's `.rodata`, on the way through
+`_kern_create_area`, refused as a write to read-only memory.
+
+Two fixes were tried before the right one, and the failed one is worth recording because it does not
+fail loudly. **Calling every miss a read is worse than calling it a write.** This port has no modified
+tracking, so it marks pages writable in the page table up front; a store that faulted as a read gets a
+writable mapping of the shared zero page and *silently writes into it*. Nothing reports an error — the
+first symptom was a file read whose buffer came back full of zeroes.
+
+So the instruction at `%tpc` is decoded: SPARC V9 puts load and store in `op = 3`, and within it `op3`
+bit 2 separates them in every group, with the read-modify-write instructions falling on the store side
+where they belong. Read through `user_memcpy()` when the address is userspace's, because "it faulted, so
+it was fetched, so its page is mapped" is **false for an instruction fault**, where `%tpc` is the address
+that could not be fetched — reading it directly panicked the kernel with interrupts disabled and no
+fault handler, on the first regression boot.
+
+### Where it stops
+
+`runtime_loader` now runs properly: it relocates (the kernel does that, mapping text writable and
+protecting it afterwards), initialises its heap, opens the program, and reports in its own voice:
+
+```
+runtime_loader: /boot/system/servers/launch_daemon: Incorrect ELF header
+```
+
+The header it read back is **all zeroes** — `ident 00 00 00 00 class 00, phoff 0, phentsize 0, phnum 0`
+— while the file on the volume passes all four of `parse_elf_header()`'s checks when inspected directly.
+So `_kern_read()` returns the right length and the buffer is not written. That is the next thing to
+chase, and the shape of it — a syscall whose `user_memcpy` into a userspace stack buffer does not land
+— is the same family as the two bugs above.
+
+Unchanged and re-checked after the fault-path change: no panics, six winfixups per boot, `usertest sig`
+then `usertest ok`, hme still negotiating 100baseTX-FDX, and every in-kernel self-test identical.

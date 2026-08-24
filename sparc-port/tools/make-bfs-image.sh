@@ -113,6 +113,12 @@ Usage: make-bfs-image.sh [options]
                   Freestanding -- no libroot, no runtime_loader -- so it tests
                   the kernel's ELF loading and userspace entry rather than a
                   userland's bootstrap.
+  --dynamic-test  install the *real* runtime_loader and libroot.so, and build
+                  sparc-port/tools/hellodyn against them as the launch_daemon.
+                  The other half of --user-test: that one takes everything out of
+                  the way to test the kernel, this one puts it all back.
+                  Mutually exclusive with --user-test, which installs a stand-in
+                  where the real runtime_loader goes.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
                   framebuffer blue screen where nothing can read it.
@@ -127,6 +133,7 @@ EOF
 }
 
 user_test=${user_test:-0}
+dynamic_test=${dynamic_test:-0}
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -137,6 +144,7 @@ while [[ $# -gt 0 ]]; do
 		--no-add-ons) install_addons=0; shift ;;
 		--serial-debug) serial_debug=1; shift ;;
 		--user-test) user_test=1; shift ;;
+		--dynamic-test) dynamic_test=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -300,6 +308,65 @@ if [[ "$install_addons" == "1" ]]; then
 			"/myfs/system/add-ons/kernel/$path"
 		echo "  $path"
 	done
+fi
+
+if [[ $dynamic_test -eq 1 ]]; then
+	if [[ $user_test -eq 1 ]]; then
+		echo "--user-test and --dynamic-test both install a runtime_loader" >&2
+		exit 2
+	fi
+
+	# The real userland: the kernel enters runtime_loader, which relocates
+	# itself, loads libroot.so, relocates that, resolves the program's imports
+	# against it, and only then calls main(). Everything --user-test deliberately
+	# takes out of the way.
+	cc="$repo/generated.sparc/cross-tools-sparc/bin/sparc64-unknown-haiku-gcc"
+	glue="$objects/haiku/sparc/release/system/glue"
+	libroot_dir="$objects/haiku/sparc/release/system/libroot"
+	loader="$objects/haiku/sparc/release/system/runtime_loader/runtime_loader"
+	gcc_dir=$("$cc" -print-file-name=crtbeginS.o | xargs dirname)
+
+	for file in "$cc" "$loader" "$libroot_dir/libroot.so" \
+			"$glue/start_dyn.o" "$glue/init_term_dyn.o" \
+			"$glue/arch/sparc/crti.o" "$glue/arch/sparc/crtn.o"; do
+		if [[ ! -r "$file" ]]; then
+			echo "missing for --dynamic-test: $file" >&2
+			echo "  cd $repo/generated.sparc && jam -q runtime_loader libroot.so"\
+				"'<sparc>glue_common.o'" >&2
+			exit 1
+		fi
+	done
+
+	hellodyn_binary="$(dirname "$output")/hellodyn"
+
+	# Haiku's headers are not in the cross compiler's sysroot, so they are named
+	# here the same way the build names them. The link order is the one
+	# ArchitectureRules calls HAIKU_EXECUTABLE_BEGIN_GLUE_CODE and
+	# HAIKU_EXECUTABLE_END_GLUE_CODE, and -soname=_APP_ is what marks an image as
+	# an application rather than a library.
+	"$cc" -c -o "$hellodyn_binary.o" \
+		"$repo/sparc-port/tools/hellodyn/hellodyn.c" \
+		-I"$repo/headers" -I"$repo/headers/os" -I"$repo/headers/os/support" \
+		-I"$repo/headers/os/kernel" -I"$repo/headers/posix"
+
+	"$cc" -nostdlib -Xlinker -soname=_APP_ -o "$hellodyn_binary" \
+		"$glue/arch/sparc/crti.o" "$gcc_dir/crtbeginS.o" \
+		"$glue/start_dyn.o" "$glue/init_term_dyn.o" \
+		"$hellodyn_binary.o" \
+		-L"$libroot_dir" -lroot \
+		"$gcc_dir/crtendS.o" "$glue/arch/sparc/crtn.o"
+
+	volume_mkdir_p system/servers
+	volume_mkdir_p system/lib
+
+	shell_command cp -f ":$loader" /myfs/system/runtime_loader
+	shell_command cp -f ":$libroot_dir/libroot.so" /myfs/system/lib/libroot.so
+	shell_command cp -f ":$hellodyn_binary" \
+		/myfs/system/servers/launch_daemon
+
+	echo "  system/runtime_loader          $(stat -c%s "$loader") bytes"
+	echo "  system/lib/libroot.so          $(stat -c%s "$libroot_dir/libroot.so") bytes"
+	echo "  system/servers/launch_daemon   $(stat -c%s "$hellodyn_binary") bytes (hellodyn)"
 fi
 
 if [[ $user_test -eq 1 ]]; then
