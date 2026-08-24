@@ -86,7 +86,6 @@ static int
 bus_alloc_mem_resource(device_t dev, struct resource *res, pci_info *info,
 	int bar_index)
 {
-	phys_addr_t addr = info->u.h0.base_registers[bar_index];
 	uint64 size = info->u.h0.base_register_sizes[bar_index];
 	uchar flags = info->u.h0.base_register_flags[bar_index];
 
@@ -100,9 +99,37 @@ bus_alloc_mem_resource(device_t dev, struct resource *res, pci_info *info,
 
 	// TODO: check flags & PCI_address_prefetchable ?
 
+	/*	Translated here rather than read out of base_registers[], which holds the
+		host view already -- and holds it in a uint32.
+
+		On every platform where a PCI address and a host physical address are the
+		same number, that field is right and this is the same arithmetic. On one
+		where they are not, and where the window the host bridge puts PCI memory in
+		sits above 4 GB, the correct answer does not fit: sun4u's sabre places PCI
+		memory at host physical 0x1ff00000000, so a BAR at PCI 0x21000000 is at
+		0x1ff21000000 and base_registers[] holds the low 32 bits of it -- which is
+		the PCI address again, and looks entirely reasonable.
+
+		What follows is a mapping of whatever physical memory happens to live at
+		that address, or of nothing at all, and the first register access is a bus
+		error a long way from here.
+
+		base_registers_pci[] is the PCI address, which fits, and ram_address() is
+		the bus manager's own translation -- identity on x86, the controller's
+		ranges everywhere else.
+	 */
+	uint64 pciAddress = info->u.h0.base_registers_pci[bar_index];
+
 	if ((flags & PCI_address_type) == PCI_address_type_64) {
-		addr |= (uint64)info->u.h0.base_registers[bar_index + 1] << 32;
+		pciAddress |= (uint64)info->u.h0.base_registers_pci[bar_index + 1] << 32;
 		size |= (uint64)info->u.h0.base_register_sizes[bar_index + 1] << 32;
+	}
+
+	phys_addr_t addr = gPci->ram_address(pciAddress);
+	if (addr == 0) {
+		device_printf(dev, "no host address for the PCI address %#" B_PRIx64
+			" of BAR %d\n", pciAddress, bar_index);
+		return -1;
 	}
 
 	// enable this I/O resource

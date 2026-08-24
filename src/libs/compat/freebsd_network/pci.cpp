@@ -135,6 +135,29 @@ pci_get_cachelnsz(device_t dev)
 	return pci_read_config(dev, PCI_line_size, 1);
 }
 
+
+/*	The interrupt pin, which has been declared in pcivar.h since this layer was
+	written and never defined -- nothing needed it until a driver arrived whose
+	donor was written for a machine where the pin is what the firmware's
+	interrupt-map is keyed on.
+
+	Read and written rather than read-only, because hme's PCI attachment writes it
+	back: some of the parts it drives come out of reset with the pin register
+	clear, and the value has to be put where later code will look for it.
+*/
+uint8_t
+pci_get_intpin(device_t dev)
+{
+	return pci_read_config(dev, PCI_interrupt_pin, 1);
+}
+
+
+void
+pci_set_intpin(device_t dev, uint8_t pin)
+{
+	pci_write_config(dev, PCI_interrupt_pin, pin, 1);
+}
+
 uint8_t *
 pci_get_ether(device_t dev)
 {

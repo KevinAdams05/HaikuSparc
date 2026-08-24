@@ -107,4 +107,22 @@
 #	define ntohs(x) B_BENDIAN_TO_HOST_INT16(x)
 #endif
 
+
+/*	FreeBSD's typed minimum and maximum helpers. Only the u_long pair is defined
+	here, because it is the only one anything in this tree has needed -- the rest
+	are one line each and can follow when something asks.
+*/
+static __inline unsigned long
+ulmin(unsigned long a, unsigned long b)
+{
+	return (a < b ? a : b);
+}
+
+
+static __inline unsigned long
+ulmax(unsigned long a, unsigned long b)
+{
+	return (a > b ? a : b);
+}
+
 #endif	/* _FBSD_COMPAT_SYS_PARAM_H_ */
