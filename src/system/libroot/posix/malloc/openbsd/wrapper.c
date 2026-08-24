@@ -17,8 +17,21 @@
 
 
 /* generic stuff */
+/*	Enumerated rather than derived, because there is no constant-expression log2
+ *	in C -- but enumerated *exhaustively*, with an #error for the case nobody has
+ *	added yet.
+ *
+ *	This used to define _MAX_PAGE_SHIFT only for a 4096-byte page and say nothing
+ *	otherwise, which is not a missing case so much as a silent one: the identifier
+ *	simply does not exist, and the build fails in malloc.c on a line that mentions
+ *	neither page sizes nor this file. SPARC has an 8192-byte page.
+ */
 #if B_PAGE_SIZE == 4096
 #define _MAX_PAGE_SHIFT 12
+#elif B_PAGE_SIZE == 8192
+#define _MAX_PAGE_SHIFT 13
+#else
+#error Add the page shift for this B_PAGE_SIZE.
 #endif
 
 extern char* __progname;
