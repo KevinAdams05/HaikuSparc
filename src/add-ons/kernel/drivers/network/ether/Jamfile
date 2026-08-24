@@ -18,6 +18,7 @@ HaikuSubInclude attansic_l2 ;
 HaikuSubInclude broadcom570x ;
 HaikuSubInclude broadcom440x ;
 HaikuSubInclude dec21xxx ;
+HaikuSubInclude hme ;
 HaikuSubInclude intel22x ;
 HaikuSubInclude ipro100 ;
 HaikuSubInclude ipro1000 ;
