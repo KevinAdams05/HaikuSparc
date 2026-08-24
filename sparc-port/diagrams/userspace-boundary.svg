@@ -61,7 +61,7 @@
   <text x="76" y="654" font-size="12" fill="#404752">hardware routes that through <tspan font-family="monospace">spill_*_other</tspan> rather than</text>
   <text x="76" y="672" font-size="12" fill="#404752">the normal vector, precisely so the handler knows the</text>
   <text x="76" y="690" font-size="12" fill="#404752">window belongs to the other privilege level.</text>
-  <text x="76" y="714" font-size="12" font-family="monospace" fill="#8f2020">all 64 vectors → kernel handlers today</text>
+  <text x="76" y="714" font-size="12" font-family="monospace" fill="#146638">the 32 _other vectors spill to the save area</text>
 
   <rect x="572" y="568" width="492" height="160" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
   <text x="592" y="594" font-size="14" font-weight="600" fill="#1a1d24">Why it cannot store to the user stack</text>
@@ -80,8 +80,8 @@
 
   <rect x="56" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
   <text x="76" y="836" font-size="13" font-weight="600" fill="#1a1d24">user → kernel</text>
-  <text x="76" y="858" font-size="12" font-family="monospace" fill="#404752">ta — trap 0x100 + n</text>
-  <text x="76" y="876" font-size="11.5" fill="#8f2020">no number chosen yet</text>
+  <text x="76" y="858" font-size="12" font-family="monospace" fill="#404752">ta 0x40 — trap 0x140</text>
+  <text x="76" y="876" font-size="11.5" fill="#146638">works — dispatched from userspace</text>
 
   <rect x="312" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
   <text x="332" y="836" font-size="13" font-weight="600" fill="#1a1d24">user → kernel</text>
@@ -95,8 +95,8 @@
 
   <rect x="826" y="812" width="238" height="76" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
   <text x="846" y="836" font-size="13" font-weight="600" fill="#1a1d24">kernel → user</text>
-  <text x="846" y="858" font-size="12" font-family="monospace" fill="#404752">done, PSTATE.PRIV = 0</text>
-  <text x="846" y="876" font-size="11.5" fill="#8f2020">enter_userspace is a stub</text>
+  <text x="846" y="858" font-size="12" font-family="monospace" fill="#404752">retry, PSTATE.PRIV = 0</text>
+  <text x="846" y="876" font-size="11.5" fill="#146638">works — done skips the trap</text>
 
   <text x="56" y="922" font-size="11.5" fill="#8a93a3">Register field positions from the UltraSPARC-IIi User's Manual, FIGURE 15-1 and TABLE 14-12. Window handling shape from OpenBSD <tspan font-family="monospace">sparc64/locore.s</tspan> — see THIRD_PARTY.md.</text>
 </svg>

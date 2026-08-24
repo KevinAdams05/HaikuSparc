@@ -3108,3 +3108,103 @@ position-independence are all in place and individually checked, and **no signal
 delivered** — nothing registers a handler until there is a userland. `sparc_flush_user_windows()`'s
 failure path is likewise unexercised, and so is context id recycling, which needs 8191 live teams to
 reach.
+
+
+## 39. The first userland
+
+`usertest ok`, printed by a program running at PSTATE.PRIV = 0, on its own stack, through
+`_kern_debug_output`. Four bugs stood between the last section and that line, and every one of them was
+invisible in the sense that matters: nothing crashed at the point of the mistake.
+
+### Haiku's kernel never enters the program
+
+`team_create_thread_start()` loads `/boot/system/runtime_loader` and enters **that**, whatever the
+executable is; `runtime_loader` then loads the program. So the freestanding static binary written as a
+test rig was never reached, and the only symptom was `error starting "/boot/system/servers/launch_daemon"
+error = -1` with no ELF diagnostic anywhere — because the loader that was missing is not the file the
+message names.
+
+Which turns out to be convenient rather than obstructive. Installing the test *as* `runtime_loader` runs
+it through exactly the path the real loader will use, with no kernel change and no `libroot`. The program
+file still has to exist for team creation to reach that point, so `make-bfs-image.sh --user-test` writes
+the same 1920 bytes to both names.
+
+### An instruction fault was reported at a data address
+
+`sparc_page_fault()` took the faulting address from the Tag Access register for all five MMU traps. There
+are **two** Tag Access registers — the I-MMU's and the D-MMU's — and the trap entry records the D-MMU's,
+because that is the one the other four need.
+
+So an instruction-fetch miss was reported at whatever address the last data access had left behind:
+page-aligned, plausible, and unrelated. The first userland appeared to die touching the top of its own
+stack when it was really failing to fetch its entry point 200 MB away. `frame->sfsr` is the D-MMU's too,
+so `isWrite` was reading a stale bit and calling the fetch a write.
+
+The fix is not to read the second register. An instruction fetch faults on the address it was fetching
+from, which is `%tpc` — an instruction rather than a page number, so it is strictly better than the
+register would have been. See the note in `sparc_page_fault()`.
+
+### The window flush was never allowed to fault
+
+`TRAP_TO_C` drops to trap level zero before flushing parked user windows to the user's stack,
+"so a fault there is an ordinary page fault". Trap level zero is necessary and **not sufficient**:
+`PSTATE.IE` is still clear, and `sparc_page_fault()` refuses to page anything in when the faulting frame
+has interrupts disabled — a fault that cannot block cannot be resolved, so it takes the thread's fault
+handler instead.
+
+`user_memcpy()` has one installed. So the copy did not crash; it returned `B_BAD_ADDRESS`, the flush
+printed that it could not write the window, and the thread returned to userspace with a frame that was
+never stored. A brand-new stack is nothing but first-touch faults, so this was every window, every time.
+
+Interrupts are now on for the copy and only for the copy. PIL is left alone: it gates device interrupts,
+and a page fault is synchronous and arrives regardless, which is the point.
+
+### `out[6]` was poison exactly when it mattered
+
+The trapped stack pointer was saved only for system calls, on the reasoning that only a system call
+reads the outs. Signals are delivered on the way out of **whichever trap the thread was in** when the
+signal arrived — nearly always a timer interrupt, nearly never a system call — and
+`arch_setup_signal_frame()` decides where to put the frame from that stack pointer.
+
+So the one thing `get_signal_stack()` needs was filled in the one case it never sees. It read
+`0xcccccccc` slab poison, which is at least a wrong answer that looks wrong. `%o6` and `%o7` are now
+saved for every trap and restored for none; the argument registers stay conditional.
+
+Found by printing it in a diagnostic and noticing the value, not by delivering a signal. Signal delivery
+is still untested end to end.
+
+### And one that was not mine
+
+`ClearAccessedAndModified()` unlocked the map before calling `UnaccessedPageUnmapped()`, which releases
+`fLock` itself on every path — so the second release was by a thread that no longer held it. x86 has the
+comment (`locker.Detach(); // UnaccessedPageUnmapped() will unlock for us`) and this port had the bug.
+It panics in the page daemon minutes after boot, the first time anything ages a page, which is why five
+weeks of booting never reached it and the first program to dirty a page did.
+
+### A null pointer with a five-minute fuse
+
+Before any of that, the boot started panicking at address 0x0 inside `io_interrupt_handler`, in the idle
+thread, a minute in, on a change that only added a file to a disk image.
+
+`update_int_load()` dereferences `sVectors[i].assigned_cpu` unconditionally, and a vector only gets an
+`irq_assignment` when somebody **reserves** it. Every other port reserves its vectors during
+`arch_int_init`; this one never did. That is not a crash on the first interrupt — it is a crash the first
+time `compute_load()` returns a different number than last time, which needs enough interrupts over
+enough seconds, and lands in whatever happened to be running.
+
+Reserved in `arch_int_init_post_vm()` rather than `arch_int_init()`, because `interrupts_init_post_vm()`
+walks the whole vector array resetting `type` to `INTERRUPT_TYPE_UNKNOWN` and only *then* calls the arch
+hook. Reserving before that loop — which is what the other ports do — leaves the vectors assigned but
+wrongly typed. It does not crash, because the loop leaves `assigned_cpu` alone, which is presumably why
+nobody has noticed.
+
+### What this rig now proves, and what it still does not
+
+Proven, on hardware-accurate paths rather than by inspection: user ELF loading through the kernel's own
+loader path, entry at PSTATE.PRIV = 0, eight nested `save`s with the spill crossing into the kernel's
+save area and back out to the user's stack, and two real system calls dispatched through the trap table
+into `libroot`'s stubs.
+
+Still untested: **signal delivery end to end** — nothing registers a handler yet. Context id recycling
+still needs 8191 live teams. And `winfixup` — a fault *during* a spill — remains unwritten; the design
+constraint from §35 stands, that a faulted spill cannot be resumed.

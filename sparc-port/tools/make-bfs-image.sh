@@ -75,6 +75,11 @@ Usage: make-bfs-image.sh [options]
   --no-add-ons    leave the kernel add-ons out, giving a volume the loader can
                   boot but the kernel cannot find a disk from. Only useful for
                   telling a kernel problem apart from an add-on problem.
+  --user-test     build sparc-port/tools/usertest and install it as the volume's
+                  launch_daemon, so the kernel's own boot path runs a userland.
+                  Freestanding -- no libroot, no runtime_loader -- so it tests
+                  the kernel's ELF loading and userspace entry rather than a
+                  userland's bootstrap.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
                   framebuffer blue screen where nothing can read it.
@@ -88,6 +93,8 @@ Usage: make-bfs-image.sh [options]
 EOF
 }
 
+user_test=${user_test:-0}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--kernel)  kernel="$2"; shift 2 ;;
@@ -96,6 +103,7 @@ while [[ $# -gt 0 ]]; do
 		--label)   label="$2"; shift 2 ;;
 		--no-add-ons) install_addons=0; shift ;;
 		--serial-debug) serial_debug=1; shift ;;
+		--user-test) user_test=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -216,6 +224,40 @@ if [[ "$install_addons" == "1" ]]; then
 		shell_command ln -s "../../../add-ons/kernel/$path" \
 			"/myfs/system/add-ons/kernel/boot/$leaf"
 	done
+fi
+
+if [[ $user_test -eq 1 ]]; then
+	# The kernel's boot path runs /boot/system/servers/launch_daemon, so putting
+	# the test there needs no kernel change -- load_image() and everything under
+	# it is exercised exactly as it would be for the real thing.
+	usertest_source="$repo/sparc-port/tools/usertest/usertest.S"
+	usertest_binary="$(dirname "$output")/usertest"
+	cc="$repo/generated.sparc/cross-tools-sparc/bin/sparc64-unknown-haiku-gcc"
+
+	if [[ ! -x "$cc" ]]; then
+		echo "no cross compiler at $cc" >&2
+		exit 1
+	fi
+
+	"$cc" -nostdlib -nostartfiles -static -Wl,-e,_start \
+		"$usertest_source" -o "$usertest_binary"
+
+	# Installed twice, and the second one is the one that runs.
+	#
+	# Haiku's kernel never enters a program directly. team_create_thread_start()
+	# loads /boot/system/runtime_loader and enters *that*, whatever the executable
+	# is, and runtime_loader then loads the program. So a freestanding static
+	# binary put where the program goes is never reached -- but put where the
+	# loader goes, it is entered by exactly the path the real thing uses.
+	#
+	# The program file still has to exist for the team to get that far, so the
+	# same binary goes in both places.
+	volume_mkdir_p system/servers
+	shell_command cp -f ":$usertest_binary" /myfs/system/servers/launch_daemon
+	shell_command cp -f ":$usertest_binary" /myfs/system/runtime_loader
+	usertest_size=$(stat -c%s "$usertest_binary")
+	echo "  system/runtime_loader                 $usertest_size bytes (usertest)"
+	echo "  system/servers/launch_daemon          $usertest_size bytes (usertest)"
 fi
 
 if [[ "$serial_debug" == "1" ]]; then
