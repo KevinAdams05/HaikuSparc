@@ -3894,3 +3894,76 @@ The remaining candidates, in the order they seem worth testing:
   measurement not yet taken and the only one that shows the state at the moment a window is parked.
 
 Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
+
+
+## 48. Two problems, not one
+
+The three candidates §47 listed were all about the window accounting, on the assumption that the leaked
+kernel windows were what stopped the dynamically linked program. Measuring them says otherwise, and
+separating the two is worth more than any of the three would have been.
+
+### Candidate 3 first, because it decides the other two
+
+The measurement §47 said was missing: what the accounting looked like *at the moment a window was
+parked*, rather than later at flush time. A slot is 256 bytes with only 136 in use, so there is room to
+record it beside the registers — but `SPILL_USER_WINDOW` fills its four-entry trap group almost exactly,
+and adding five instructions tripped the `.org` guard that exists for precisely that:
+
+```
+arch_traps.S:2229: Error: attempt to move .org backwards
+```
+
+Moving the recorder out of line costs the group *fewer* instructions than it frees — one annulled branch
+replaces the counter and the `saved`/`retry` pair — which is worth remembering as the way to instrument
+a full trap group.
+
+What it showed:
+
+```
+slot 0/2 parked with otherwin 2 canrestore 3 (cwp 7, tl 1)
+slot 1/2 parked with otherwin 1 canrestore 3 (cwp 0, tl 1)
+slot 0/2 parked with otherwin 2 canrestore 4 (cwp 0, tl 1)
+slot 1/2 parked with otherwin 1 canrestore 5 (cwp 1, tl 1)
+```
+
+OTHERWIN counts down 2 → 1 → 0 exactly as it should, one park per credit, with the invariant intact
+throughout. CANRESTORE being 3 to 5 is the handler's own C code nesting and is expected. **The
+accounting at park time is self-consistent.**
+
+### Candidate 1 is dead
+
+Zero winfixups in every dynamically linked boot — five of them, checked. runtime_loader never recurses
+deep enough onto untouched stack pages to provoke one, so the `winfixup` path is not involved in this
+failure at all. §47 ranked it first; it was the wrong end.
+
+### And the two problems come apart
+
+The boot that produced the accounting above **parked no handler windows at all** and *still* failed. So
+the kernel-window leak is intermittent, and the dynamically linked program fails without it. They are
+two bugs, and treating the leak as the blocker was an error of composition — the leak was simply the
+most alarming thing in the log.
+
+What actually kills the program, located by deriving runtime_loader's base from the landmark fault its
+second instruction takes on every boot and resolving the fatal pc against `nm`:
+
+```
+fatal pc is in: load_image(char const*, image_type, ...)
+```
+
+reading a user address that differs every boot — `0x0` once, `0x7242a000` another time. A pointer inside
+one function going wild, differently each time, which is what corrupted locals or uninitialised memory
+look like and is not what a missing window looks like.
+
+### Where the two now stand
+
+**The window leak** is real, intermittent, and has a confirmed shape — handler windows identified by
+their own trap types in §47 — but no reproducer that fires reliably. Its accounting is self-consistent
+at park time, so whatever goes wrong is upstream of the spill: candidate 2, the state
+`sparc_enter_userspace()` leaves behind, is the last of the three still standing and is now the one to
+test.
+
+**The dynamic-linking failure** is a separate investigation, inside `load_image()`, and wants the
+pointer identified rather than the window machinery re-examined.
+
+Unchanged: no panics, six winfixups on the freestanding test, `usertest sig` then `usertest ok`, hme
+negotiating 100baseTX-FDX.

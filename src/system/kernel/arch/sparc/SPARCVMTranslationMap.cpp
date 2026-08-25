@@ -1228,12 +1228,6 @@ SPARCVMPhysicalPageMapper::MemsetPhysical(phys_addr_t address, int value,
 }
 
 
-/*!	Copies out of physical memory a byte at a time.
-
-	Byte at a time because the source and destination alignments are independent
-	and this is not on any hot path -- correctness first, and the wide-word
-	version can come with a measurement that says it matters.
-*/
 /*!	Physical memory, a byte at a time, through ASI_PHYS_USE_EC.
 
 	Byte-wise because neither end is guaranteed aligned and the ASI accesses come
