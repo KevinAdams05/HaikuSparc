@@ -1234,21 +1234,79 @@ SPARCVMPhysicalPageMapper::MemsetPhysical(phys_addr_t address, int value,
 	and this is not on any hot path -- correctness first, and the wide-word
 	version can come with a measurement that says it matters.
 */
-status_t
-SPARCVMPhysicalPageMapper::MemcpyFromPhysical(void* to, phys_addr_t from,
-	size_t length, bool user)
+/*!	Physical memory, a byte at a time, through ASI_PHYS_USE_EC.
+
+	Byte-wise because neither end is guaranteed aligned and the ASI accesses come
+	in eight-byte units: each byte is picked out of the word containing it, and on
+	the way back written with a read-modify-write of that word. Slow, and used by
+	the file cache on every read, which is the argument for revisiting it with an
+	aligned fast path -- not for leaving the user case unimplemented.
+*/
+static void
+read_physical_bytes(uint8* destination, phys_addr_t from, size_t length)
 {
-	if (user)
-		return B_NOT_SUPPORTED;
-
-	uint8* destination = (uint8*)to;
-
 	for (size_t i = 0; i < length; i++) {
 		phys_addr_t address = from + i;
 		phys_addr_t aligned = address & ~(phys_addr_t)7;
 		uint64 word = sparc_read_physical(aligned);
 		uint32 shift = (7 - (address - aligned)) * 8;
 		destination[i] = (uint8)(word >> shift);
+	}
+}
+
+
+static void
+write_physical_bytes(phys_addr_t to, const uint8* source, size_t length)
+{
+	for (size_t i = 0; i < length; i++) {
+		phys_addr_t address = to + i;
+		phys_addr_t aligned = address & ~(phys_addr_t)7;
+		uint64 word = sparc_read_physical(aligned);
+		uint32 shift = (7 - (address - aligned)) * 8;
+		word &= ~((uint64)0xff << shift);
+		word |= (uint64)source[i] << shift;
+		sparc_write_physical(aligned, word);
+	}
+}
+
+
+status_t
+SPARCVMPhysicalPageMapper::MemcpyFromPhysical(void* to, phys_addr_t from,
+	size_t length, bool user)
+{
+	if (!user) {
+		read_physical_bytes((uint8*)to, from, length);
+		return B_OK;
+	}
+
+	/*	A userspace destination cannot be written directly.
+	 *
+	 *	Not because it is unreachable -- section 4.3's shared address space means
+	 *	the kernel can store to a user address with an ordinary instruction -- but
+	 *	because it may not be *there*. A user page that has never been touched
+	 *	faults on the first write, and this runs with a lock held and, on some
+	 *	paths, with interrupts disabled. user_memcpy() is the function that makes
+	 *	such a fault an error return instead of a dead kernel.
+	 *
+	 *	So the bytes go through the stack: read from physical with the ASI
+	 *	accesses above, then hand the block to user_memcpy(). One extra copy of a
+	 *	few hundred bytes at a time, against a fault the caller cannot survive.
+	 */
+	uint8 buffer[256];
+	uint8* destination = (uint8*)to;
+
+	while (length > 0) {
+		size_t chunk = min_c(length, sizeof(buffer));
+
+		read_physical_bytes(buffer, from, chunk);
+
+		status_t status = user_memcpy(destination, buffer, chunk);
+		if (status != B_OK)
+			return status;
+
+		destination += chunk;
+		from += chunk;
+		length -= chunk;
 	}
 
 	return B_OK;
@@ -1259,19 +1317,27 @@ status_t
 SPARCVMPhysicalPageMapper::MemcpyToPhysical(phys_addr_t to, const void* from,
 	size_t length, bool user)
 {
-	if (user)
-		return B_NOT_SUPPORTED;
+	if (!user) {
+		write_physical_bytes(to, (const uint8*)from, length);
+		return B_OK;
+	}
 
+	// The mirror of MemcpyFromPhysical()'s user case; see the note there.
+	uint8 buffer[256];
 	const uint8* source = (const uint8*)from;
 
-	for (size_t i = 0; i < length; i++) {
-		phys_addr_t address = to + i;
-		phys_addr_t aligned = address & ~(phys_addr_t)7;
-		uint64 word = sparc_read_physical(aligned);
-		uint32 shift = (7 - (address - aligned)) * 8;
-		word &= ~((uint64)0xff << shift);
-		word |= (uint64)source[i] << shift;
-		sparc_write_physical(aligned, word);
+	while (length > 0) {
+		size_t chunk = min_c(length, sizeof(buffer));
+
+		status_t status = user_memcpy(buffer, source, chunk);
+		if (status != B_OK)
+			return status;
+
+		write_physical_bytes(to, buffer, chunk);
+
+		source += chunk;
+		to += chunk;
+		length -= chunk;
 	}
 
 	return B_OK;
