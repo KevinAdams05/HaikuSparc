@@ -3967,3 +3967,65 @@ pointer identified rather than the window machinery re-examined.
 
 Unchanged: no panics, six winfixups on the freestanding test, `usertest sig` then `usertest ok`, hme
 negotiating 100baseTX-FDX.
+
+
+## 49. The loader failure is not a relocation bug
+
+§48 separated the window leak from the dynamic-linking failure. This is the second of those, followed
+to the point where its character is clear even though its cause is not.
+
+### Everything loads
+
+Tracing each `load_container()` call: the program, `libroot.so` and `libgcc_s.so.1` are all opened,
+their headers parsed, their segments mapped, and `load_dependencies` returns `No error`. The failure is
+after loading, in `relocate_dependencies` — which on this architecture means inside
+`arch_relocate_image()`.
+
+### And relocation dies in a different place every boot
+
+Tracing each relocation entry as it is processed:
+
+```
+boot A:  ... [39] type 21 sym 95   [40] type 21 sym 100   <- stops
+boot B:  ... [3] type 22 sym 0     [4]  type 20 sym 38    <- stops
+```
+
+Entry 40 one boot, entry 4 the next, on the same image with the same relocation table. In both cases
+the last line printed is the one *before* `resolve_symbol()` returns, so the fault is inside the symbol
+lookup rather than in writing the relocation.
+
+Symbol 100 was a promising suspect — `pthread_mutex_unlock`, `WEAK` and `UND`, the first undefined weak
+symbol in the table, which resolves to address zero by definition. It is handled correctly:
+`resolve_symbol()` returns `B_OK` with a null address, and a `JMP_SLOT` built against it is a `call` to
+zero, which is exactly what an unresolved weak function should be. Boot B dies on entry 4 instead, on an
+ordinary `GLOB_DAT`, which rules it out.
+
+**A crash that moves is not a logic error in the code doing the crashing.** `resolve_symbol()` walks
+image structures and hash tables; failing at a varying point means those structures are being corrupted,
+and the relocation code is merely the first thing to walk them afterwards.
+
+### Which points back at the heap
+
+`image_t` and everything hanging off it live on runtime_loader's own heap, which comes from `add_area()`
+— the same function whose first chunk write landed on a kernel address in §46. The two syscalls it
+depends on were checked and are sound: `_user_reserve_address_range()` reads the caller's value as a
+hint and writes the chosen address back, and `_kern_create_area()` with `B_EXACT_ADDRESS` honours it.
+
+So the next question is not about relocation at all. It is whether the heap's area is as large and as
+mapped as the allocator believes — `add_area()` reserves `kHeapReservationSize` but creates an area of
+`size`, and grows later by `_kern_resize_area()`, which is a path nothing on this port has exercised
+before.
+
+### The three candidates, resolved
+
+- **Candidate 1, winfixup**, is dead: zero winfixups in every dynamically linked boot, five of them
+  checked. runtime_loader never recurses deep enough onto untouched stack pages to provoke one.
+- **Candidate 3**, the park-time accounting, was built and says the accounting is self-consistent —
+  OTHERWIN counting down one credit per park with the invariant intact.
+- **Candidate 2**, the state `sparc_enter_userspace()` leaves behind, analyses as sound: `flushw` leaves
+  a fresh userland with exactly one live window and CANRESTORE at zero, so the first trap's OTHERWIN of
+  one covers exactly that window. It is the last one standing for the *leak*, and the leak is now known
+  not to be what stops the program.
+
+Unchanged: no panics, six winfixups on the freestanding test, `usertest sig` then `usertest ok`, hme
+negotiating 100baseTX-FDX.
