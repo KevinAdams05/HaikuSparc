@@ -3787,3 +3787,42 @@ one is not in the log.
 
 Unchanged and re-checked: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating
 100baseTX-FDX, every in-kernel self-test identical.
+
+
+## 46. What 0x808da000 was, and a guard that was worse than the bug
+
+A diagnosis and a retraction. No fix yet, and the reason is worth as much as the finding.
+
+### The value userspace kept finding
+
+`0x808da000` had appeared in the logs for six or seven boots, in different guises — written, then read, then written again — and each time it was filed as a consequence of whatever had failed just before. It is thread 37's own **kernel stack**, and after §45 cleared every register `sparc_enter_userspace()` hands over, it was *still* arriving.
+
+The evidence had already been printed and misread. A probe in `sparc_flush_user_windows()` reporting parked windows containing kernel-looking values gave, among others:
+
+```
+parked window 3 ... l0 0x800001203
+parked window 1 ... l0 0x9900001203
+parked window 2 ... l0 0x4400001203
+```
+
+which I dismissed as ordinary integer data. `0xNN00001203` with a varying high byte is a **TSTATE**: CCR in bits 39:32, PSTATE in 20:8. And `%l0` is exactly where `TRAP_TO_C` puts TSTATE on the way in.
+
+So those are not userspace's windows. They are **the trap handler's own**, parked in the per-thread user window save area and then written out to the user's stack by the flush — and `%l7` in such a window is the interrupt frame pointer, a kernel stack address in the `0x808daXXX` range. Userspace later reads that stack slot as an uninitialised local. In `add_area()` it is `reservedBase`, which is genuinely uninitialised before the syscall that fills it, and the heap then writes its first chunk header through it.
+
+The window accounting is over-classifying: kernel windows are reaching the `_other` spill vector, which exists only for userspace's.
+
+### The guard, and why it is not in the tree
+
+The obvious containment is to refuse to write a window whose `%l7` is a kernel address — turning a kernel disclosure into a lost window. It was written, and it works in the sense that the fatal fault becomes a null dereference instead of a kernel one.
+
+**It also breaks the freestanding userland**, which had been passing since §40. A user window's locals are uninitialised once CLEANWIN saturates — §44 lowers CLEANWIN on entry to userspace, so the first `save` is cleaned, and the three hundredth is not — so a perfectly legitimate user window can hold a kernel-looking value in `%l7` by accident. Dropping it loses real data, the matching fill reads whatever the stack held, and the program wanders off. `usertest sig` and `usertest ok` stopped appearing.
+
+So the guard is reverted. A check that discards good data is worse than the leak it was meant to contain, and the only reason that is known rather than suspected is that this port has a userland test that was already passing.
+
+### What the fix has to be
+
+The accounting, in `TRAP_TO_C`. §41 gave it two hand-overs — CANRESTORE into OTHERWIN before its own `save` to keep that save off the user's stack, and again after it to classify the window the trap came from. Between them OTHERWIN ends up at the user's original CANRESTORE plus one, which is what the single hand-over produced before §41 and is therefore not obviously wrong. Something else is adding to it, or the *hardware's* idea of which windows are oldest does not match what the count implies after the fixup path has moved CWP about.
+
+That is where to look next, and it wants reasoning about the invariant rather than another probe: `CANSAVE + CANRESTORE + OTHERWIN = NWINDOWS - 2` holds at every point in this file, and a leak of kernel windows into the `_other` vector means OTHERWIN is counting windows that CANRESTORE should still own.
+
+Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
