@@ -4073,3 +4073,160 @@ drains would leave the stack depth alone, which matters when the thing being inv
 stack-related and the tool is a kilobyte of stack per call.
 
 Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
+
+
+## 51. A userland that runs, and three things a trap entry may not assume
+
+The dynamically linked program works. `hellodyn ok, argc 1`, through `snprintf`, `printf`, `strlen`
+and `fflush`, after the kernel loaded `runtime_loader`, which relocated itself, loaded and relocated
+`libroot.so` and `libgcc_s.so.1`, resolved the imports and ran the initialisers.
+
+Six bugs between §50 and that line. Five of them were found by one test.
+
+### The reproducer
+
+§50 ended by proposing to stop instrumenting `runtime_loader` and instead ask the register window
+machinery a direct question, on the grounds that the remaining symptom — deep C code with valid inputs
+producing a wild pointer — is what corrupted locals look like.
+
+The test stamps six windows with their own depth, takes 64 syscalls from the deepest one, and reads the
+stamps back on the way out. The depth is the whole point. The existing 300-deep recursion crosses stack
+pages, which is what it was for, but it takes no traps while it is down there — and the window state a
+trap *finds* is what decides which paths run. Six live windows means the next trap arrives with CANSAVE
+at zero.
+
+It failed on the boot it was written, and not intermittently. The machine stopped dead with no output
+at all, which took a QEMU monitor session to read: the CPU was parked on a `b,a .` at trap level two,
+in `sparc_unhandled_trap`, which only reports at trap level one and otherwise spins in silence.
+
+![three things a trap entry may not assume](diagrams/trap-entry-hazards.svg)
+
+### 1. Nothing may be live in a global across the entry `save`
+
+`%sp` was 46. The trap data block said `otherSpillCount` was 46.
+
+`TRAP_TO_C` loaded the kernel stack into `%g2` and named that register as the `save` operand. But the
+save can trap: CANSAVE being zero is exactly the condition that makes a trap arrive with no window
+free, and **a spill taken at trap level one does not get a fresh global bank**. The hardware selects the
+alternate globals on entry, they are already selected, so the spill handler and the trap entry are
+holding the same physical registers. `SPILL_USER_WINDOW` ends by incrementing a counter through `%g2`,
+and `retry` re-ran the `save` with that as the stack pointer.
+
+`%g1` was the other casualty. It carried TSTATE across the same instruction, so the test deciding
+whether the trapped window belonged to userspace was reading a spill counter too — which is how kernel
+windows were being classified as the user's and flushed to the user's stack.
+
+Both are now derived after the save: the operands are `%sp` and a constant, TSTATE is re-read, and the
+stack address goes into a local. Locals are window registers, which is the one kind a spill cannot
+reach.
+
+### 2. CLEANWIN only ever grows
+
+§44 lowered CLEANWIN on entry to userspace, and §46 already noticed that "a user window's locals are
+uninitialised once CLEANWIN saturates". Both were right and neither went far enough: the kernel starts
+CLEANWIN growing again on its very next trap, long before userspace takes its second.
+
+So every window a program entered after its first carried the kernel's `%l0`–`%l7` — and the kernel's
+most recent use of any window is the trap entry, so what a program received was TSTATE in `%l0`, the
+trapped `%tpc` and `%tnpc` in `%l1` and `%l2`, and the trap number in `%l3`. Programs write only the
+locals they have a use for. The rest were still there when the window spilled to the user's stack.
+
+The trap return now lowers CLEANWIN on every return to userspace, at CANRESTORE − 1: the `restore`
+below it has not happened yet, and the equality that forces the next `save` to trap has to hold
+afterwards.
+
+### 3. A correction: what 0x808da000 actually was
+
+§46 is titled "What 0x808da000 was" and its answer was wrong.
+
+It is thread 37's kernel stack — that part was right — but userspace never had it. **The kernel
+misreported it as the fault address.** The D-MMU rewrites its Tag Access register on every miss,
+including the fast ones resolved in the trap table, and `TRAP_TO_C` read it *after* writing seven
+globals into the interrupt frame. That frame is on a kernel stack a freshly scheduled thread may not
+have in the TLB. One miss on those stores and the address handed to the VM is the kernel stack page.
+
+The tell was there and unread for seven boots: the same instruction faulted twice in a row, once at the
+address its own registers computed and once at `0x808daXXX`. The VM refused the second — correctly, it
+is a kernel address in a user fault — and killed the thread at a program counter with nothing wrong
+with it.
+
+§46 built an entire theory of window mis-accounting on the assumption that userspace had obtained that
+value. The window disclosure it described is real and is §2 above; the address it was named after is
+not part of it.
+
+The read now happens in the first instruction of `sparc_fault_entry`, into the trap data block — which
+has its own locked D-TLB entry precisely so a store from a handler cannot itself miss.
+
+### 4. An unhandled trap from userspace is not the kernel's failure
+
+With those three fixed, the loader relocated everything and the program died on an illegal instruction
+— reported as *the kernel executing at a kernel address with user privilege*, which is not a thing that
+should be possible.
+
+`sparc_unhandled_trap` reports by writing a C function's address into `%tnpc` and issuing `done`, and
+`done` restores PSTATE from TSTATE — the **trapped** context's PSTATE. For a trap taken in the kernel
+that is privileged, on the normal globals, with `%g7` on the current thread and `%sp` on a kernel
+stack, and the reporter works. For a trap taken in userspace it is none of those things, and the
+function faults on its own first instruction: a report of the reporting, with the trap that caused it
+nowhere in the log.
+
+These now go the way every other trap from userspace goes, through `TRAP_TO_C`, which stays at the
+privilege the trap already granted. `sparc_unhandled_user_trap()` names the trap, prints the offending
+instruction word, and raises SIGILL, SIGBUS or SIGFPE.
+
+### 5. `__tls_get_addr`
+
+`libroot.so` referenced it and nothing defined it. SPARC was the last architecture still carrying the
+upstream TLS stub, whose own comment described it as "just broken now (okay for single threaded apps,
+though)" — a static array shared by every thread in the team.
+
+The slot array is where every other architecture puts it, and the register naming it is `%g7`, which the
+SPARC ABI reserves for exactly this. The kernel gave `%g7` up in §35, when the trap entry started
+reading the current thread out of the trap data block instead; that was this decision being made in
+advance.
+
+### 6. `_init`, and an address no image ever claimed
+
+The last one was not in the kernel at all.
+
+`crti.S` declared `.global _init` and `.type _init, #function` and never wrote `_init:`. Announcing a
+symbol is not defining one — the `.init` section was emitted and the compiler's constructor code linked
+into it, but the symbol naming its entry point stayed undefined, so the linker wrote **DT_INIT as
+zero**.
+
+The runtime loader adds the image's load address to DT_INIT and tests the result against zero to decide
+whether to call it. Zero plus a load address is the first byte of the image, so every program calling
+`libgcc_s.so.1`'s initialiser jumped to its ELF header:
+
+| word | bytes | as an instruction |
+| --- | --- | --- |
+| `0x7f454c46` | `\x7fELF` | bits 31:30 are `01` — a `call`, taken |
+| `0x02020100` | class 64, big-endian, version 1 | `op` 0, `op2` 0 — illegal |
+
+which is why the failure was an illegal-instruction trap four bytes into a mapping, in a program that
+had linked and relocated perfectly.
+
+`crti.S` now defines both labels, with the `save` that opens a register window and the matching
+`ret; restore` in `crtn.S`. That is not sufficient on its own: `libgcc_s.so.1` comes from a prebuilt
+package built with the old file and cannot be relinked from here, and every other SPARC binary in the
+existing package set has the same tag. So the runtime loader no longer believes a DT_INIT of zero —
+which is defensible on any architecture, since linkers omit the tag rather than write zero.
+
+### Where that leaves the port
+
+| | |
+| --- | --- |
+| Freestanding userland | `usertest deep`, `usertest winok`, `usertest sig`, `usertest ok` |
+| Dynamically linked userland | `hellodyn ok, argc 1` |
+| Window round trips | six windows, 64 syscalls, every stamp intact |
+| winfixup | six per boot, one per 8 KB stack page |
+| hme | 100baseTX-FDX |
+| Panics | none |
+
+The §47–§50 investigation is closed. What it was chasing was three separate faults wearing each other's
+symptoms, and none of the five explanations those sections proposed was the right one — which is worth
+recording as plainly as the fixes are.
+
+Still open: syscall restart and winfixup's fill side are untested, context-id recycling is untested,
+and the CMD646 wants a driver of its own to clear the chip's interrupt latch. Phase 7's exit criterion
+is still to answer a ping.

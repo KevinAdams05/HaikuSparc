@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1080" viewBox="0 0 1120 1080" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1120" height="1080" fill="#fbfbfd"/>
+  <rect x="0.5" y="0.5" width="1119" height="1079" fill="none" stroke="#d6d9e0"/>
+
+  <text x="40" y="42" font-size="21" font-weight="600" fill="#1a1d24">Three things a trap entry may not assume</text>
+  <text x="40" y="66" font-size="13.5" fill="#5b6472">Every one of them held for a shallow call graph and a warm TLB, which is why a freestanding test passed for eleven sections while a dynamically linked program could not start.</text>
+
+  <!-- ============ A. the save can trap ============ -->
+  <text x="56" y="106" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">A. NOTHING MAY BE LIVE IN A GLOBAL ACROSS THE ENTRY `save`</text>
+
+  <rect x="56" y="118" width="1008" height="116" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="146" font-size="12.5" fill="#404752">A trap arriving with CANSAVE at zero has no free window, so the <tspan font-family="monospace">save</tspan> in the trap entry spills before it completes. The spill handler needs</text>
+  <text x="76" y="166" font-size="12.5" fill="#404752">scratch registers, and the only ones it has are globals — and a trap taken at trap level one does <tspan font-style="italic">not</tspan> get a fresh bank. The hardware selects</text>
+  <text x="76" y="186" font-size="12.5" fill="#404752">the alternate globals on entry; they are already selected; the handler and the entry hold the same physical registers.</text>
+  <text x="76" y="214" font-size="12.5" fill="#404752">So <tspan font-family="monospace">retry</tspan> re-runs the <tspan font-family="monospace">save</tspan> with whatever the spill handler left behind.</text>
+
+  <!-- the wrong way -->
+  <rect x="56" y="250" width="492" height="230" rx="7" fill="#fff6f6" stroke="#e6b9b9"/>
+  <text x="76" y="276" font-size="12" font-weight="600" fill="#a03434">WAS — the address computed before the save</text>
+  <text x="76" y="304" font-size="12" font-family="monospace" fill="#404752">ldx  [%g7 + KERNEL_STACK], %g2</text>
+  <text x="76" y="324" font-size="12" font-family="monospace" fill="#404752">sub  %g2, FRAME, %g2</text>
+  <text x="76" y="344" font-size="12" font-family="monospace" fill="#a03434">save %g2, %g0, %sp</text>
+  <text x="76" y="364" font-size="12" font-family="monospace" fill="#404752">andcc %g1, TSTATE_PRIV, %g0</text>
+
+  <text x="76" y="396" font-size="11.5" fill="#7a4a4a">When that save spills, SPILL_USER_WINDOW runs and ends with</text>
+  <text x="76" y="414" font-size="11.5" font-family="monospace" fill="#7a4a4a">ldx [%g7 + OTHER_SPILL_COUNT], %g2 ; inc ; stx</text>
+  <text x="76" y="436" font-size="11.5" fill="#7a4a4a">so %g2 is the number of spills this thread has taken.</text>
+  <text x="76" y="458" font-size="11.5" font-weight="600" fill="#a03434">%sp became 46. %g1 held TSTATE and went the same way.</text>
+
+  <!-- the right way -->
+  <rect x="572" y="250" width="492" height="230" rx="7" fill="#f4faf5" stroke="#b7d9bd"/>
+  <text x="592" y="276" font-size="12" font-weight="600" fill="#2f7a3f">IS — everything derived after it</text>
+  <text x="592" y="304" font-size="12" font-family="monospace" fill="#2f7a3f">save %sp, -FRAME, %sp</text>
+  <text x="592" y="324" font-size="12" font-family="monospace" fill="#404752">rdpr %tstate, %l0</text>
+  <text x="592" y="344" font-size="12" font-family="monospace" fill="#404752">andcc %l0, TSTATE_PRIV, %g0</text>
+  <text x="592" y="364" font-size="12" font-family="monospace" fill="#404752">ldx  [%g7 + KERNEL_STACK], %l1</text>
+  <text x="592" y="384" font-size="12" font-family="monospace" fill="#404752">sub  %l1, FRAME, %sp</text>
+
+  <text x="592" y="416" font-size="11.5" fill="#42704c">The operands are %sp and a constant — right for a trap out of</text>
+  <text x="592" y="434" font-size="11.5" fill="#42704c">the kernel, harmless for one out of userspace, because `save`</text>
+  <text x="592" y="452" font-size="11.5" fill="#42704c">only does arithmetic and %sp is overwritten before any store.</text>
+  <text x="592" y="470" font-size="11.5" fill="#42704c">Locals are window registers: a spill cannot reach them.</text>
+
+  <!-- ============ B. cleanwin ============ -->
+  <text x="56" y="524" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">B. CLEANWIN ONLY EVER GROWS, SO CLEANING ONCE IS NOT CLEANING</text>
+
+  <rect x="56" y="536" width="1008" height="176" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="564" font-size="12.5" fill="#404752">The clean_window handler zeroes a window and increments CLEANWIN — tens of thousands of times a boot, as the kernel works through its</text>
+  <text x="76" y="584" font-size="12.5" fill="#404752">own call graph. Nothing lowers it again; <tspan font-family="monospace">flushw</tspan> does not, because spilling a window says nothing about whether it was scrubbed.</text>
+
+  <rect x="76" y="604" width="440" height="88" rx="6" fill="#fff6f6" stroke="#e6b9b9"/>
+  <text x="96" y="628" font-size="12" font-weight="600" fill="#a03434">Lowered once, at thread start</text>
+  <text x="96" y="650" font-size="11.5" fill="#7a4a4a">The first window a thread enters is clean. The kernel takes its</text>
+  <text x="96" y="668" font-size="11.5" fill="#7a4a4a">next trap long before userspace takes its second, so every</text>
+  <text x="96" y="686" font-size="11.5" fill="#7a4a4a">window after the first carries the kernel's %l0–%l7.</text>
+
+  <rect x="604" y="604" width="440" height="88" rx="6" fill="#f4faf5" stroke="#b7d9bd"/>
+  <text x="624" y="628" font-size="12" font-weight="600" fill="#2f7a3f">Lowered on every return to userspace</text>
+  <text x="624" y="650" font-size="11.5" fill="#42704c">CLEANWIN := CANRESTORE − 1, because the `restore` below has</text>
+  <text x="624" y="668" font-size="11.5" fill="#42704c">not happened yet and the equality that forces the next `save`</text>
+  <text x="624" y="686" font-size="11.5" fill="#42704c">to trap has to hold afterwards. Guarded: zero already forces it.</text>
+
+  <text x="76" y="712" font-size="0" fill="#404752"> </text>
+
+  <!-- what leaked -->
+  <rect x="56" y="728" width="1008" height="82" rx="7" fill="#fcfaf4" stroke="#ded6c0"/>
+  <text x="76" y="754" font-size="12.5" fill="#404752">What userspace received was not arbitrary: the kernel's most recent use of any window is the trap entry itself, so a dirty window handed</text>
+  <text x="76" y="774" font-size="12.5" fill="#404752">to a program held <tspan font-family="monospace">%l0</tspan> = TSTATE, <tspan font-family="monospace">%l1</tspan> = the trapped %tpc, <tspan font-family="monospace">%l2</tspan> = %tnpc, <tspan font-family="monospace">%l3</tspan> = the trap number. Programs write only the locals they have a</text>
+  <text x="76" y="794" font-size="12.5" fill="#404752">use for, so the rest were still there when the window spilled — to the user's own stack.</text>
+
+  <!-- ============ C. tag access ============ -->
+  <text x="56" y="854" font-size="11.5" font-weight="600" fill="#8a93a3" letter-spacing="0.5">C. THE FAULTING ADDRESS SURVIVES ONLY UNTIL THE NEXT D-MMU MISS</text>
+
+  <rect x="56" y="866" width="1008" height="188" rx="7" fill="#ffffff" stroke="#d6d9e0"/>
+  <text x="76" y="894" font-size="12.5" fill="#404752">The D-MMU rewrites Tag Access on <tspan font-style="italic">every</tspan> miss, including the fast ones the kernel resolves in the trap table without any of this running.</text>
+
+  <rect x="76" y="912" width="960" height="60" rx="6" fill="#fff6f6" stroke="#e6b9b9"/>
+  <text x="96" y="936" font-size="12" font-family="monospace" fill="#404752">stx %g1,[%l7+G1] … stx %g7,[%l7+G7]</text>
+  <text x="500" y="936" font-size="12" fill="#a03434">← seven stores to a kernel stack a freshly scheduled thread may not have in the TLB</text>
+  <text x="96" y="960" font-size="12" font-family="monospace" fill="#a03434">ldxa [TAG_ACCESS] ASI_DMMU</text>
+  <text x="500" y="960" font-size="12" fill="#a03434">← reads whichever of those missed, not the address userspace faulted on</text>
+
+  <text x="76" y="998" font-size="12.5" fill="#404752">The comment above that read said “before anything else can overwrite them”, and it was written in good faith: a list of registers being</text>
+  <text x="76" y="1018" font-size="12.5" fill="#404752">saved does not read as memory traffic. It now happens in the first instruction of <tspan font-family="monospace">sparc_fault_entry</tspan>, recorded in the trap data block —</text>
+  <text x="76" y="1038" font-size="12.5" fill="#404752">which has its own locked D-TLB entry precisely so that a store from a handler cannot itself miss.</text>
+</svg>
