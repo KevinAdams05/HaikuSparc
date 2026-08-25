@@ -36,6 +36,18 @@
 #elif defined(__arm__) || defined(__aarch64__)
 #	define RLD_PROGRAM_BASE	0x200000
 #	define MAX_PAGE_SIZE	0x10000
+#elif defined(__sparc64__) || defined(__sparc__)
+	// The same reason x86_64 raises this: the toolchain aligns segments to
+	// 1 MB by default here, so a megabyte of nothing between an image's text
+	// and its data is the normal layout rather than an unreasonable one.
+	//
+	// Haiku's own sparc binaries are linked with -z max-page-size=0x2000 and pack
+	// tightly, so this is not about them. It is about the ones that cannot be
+	// relinked -- libgcc_s.so.1 arrives prebuilt in gcc_syslibs with the
+	// toolchain default, and libroot.so names it, so refusing that layout means
+	// refusing every program on the system.
+#	define RLD_PROGRAM_BASE	0x200000
+#	define MAX_PAGE_SIZE	0x100000
 #else
 #	define RLD_PROGRAM_BASE	0x200000
 #	define MAX_PAGE_SIZE	B_PAGE_SIZE

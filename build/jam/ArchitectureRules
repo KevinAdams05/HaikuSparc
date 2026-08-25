@@ -150,6 +150,24 @@ rule ArchitectureSetup architecture
 	# TODO: Temporary work-around. Should be defined in the compiler specs
 	HAIKU_LINKFLAGS_$(architecture) += -Xlinker --no-undefined ;
 
+	if $(cpu) = sparc {
+		# The same 1 MB segment alignment the kernel case below turns off, and
+		# for the same reason one layer up. runtime_loader's map_image() reserves
+		# the whole span an image covers and refuses one whose segments sit
+		# further apart than a couple of pages -- so a userland binary left at
+		# the linker's default failed with
+		#
+		#   runtime_loader: ...: Could not map image: Bad data
+		#
+		# which is the identical check, the identical error and the identical
+		# cause as load_kernel_add_on() rejecting every add-on. Fixing it for the
+		# kernel and not for userland just moved the day it was noticed.
+		#
+		# 0x2000 is the page size, so segments pack as tightly as they can.
+		HAIKU_LINKFLAGS_$(architecture)
+			+= -Xlinker -z -Xlinker max-page-size=0x2000 ;
+	}
+
 	# private shared kernel/libroot headers
 	HAIKU_PRIVATE_SYSTEM_HEADERS_$(architecture)
 		= [ PrivateHeaders $(DOT) system system/arch/$(cpu) ] ;
