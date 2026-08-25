@@ -123,6 +123,8 @@ needs_symbol(int type)
 		case R_SPARC_JMP_SLOT:
 		case R_SPARC_64:
 		case R_SPARC_COPY:
+		case R_SPARC_TLS_DTPMOD64:
+		case R_SPARC_TLS_DTPOFF64:
 			return true;
 		default:
 			return false;
@@ -266,6 +268,28 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 				write_word64(P, B + A);
 				break;
 
+			case R_SPARC_TLS_DTPMOD64:
+				/*	Which module's thread-local block the offset beside this one
+					is measured in -- the first half of a general-dynamic TLS
+					pair, whose two words __tls_get_addr() is handed together.
+
+					A symbol index of zero means this module's own block, which
+					is the only form libroot currently carries.
+				 */
+				write_word64(P, symbolImage == NULL
+					? image->dso_tls_id : symbolImage->dso_tls_id);
+				break;
+
+			case R_SPARC_TLS_DTPOFF64:
+				/*	And the offset within that block. resolve_symbol() returns a
+					TLS symbol's value already relative to its module, so there
+					is nothing to add a load address to -- which is the whole
+					point of the pair: neither half needs to know where the
+					block will be until the thread asks.
+				 */
+				write_word64(P, S + A);
+				break;
+
 			case R_SPARC_COPY:
 			{
 				/*	The one relocation that moves data rather than computing an
@@ -304,18 +328,39 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 
 					The displacement is measured from the call itself, at P + 8.
 				 */
-				addr_t jumpOffset = S - (P + 8);
+				int64 jumpOffset = (int64)S - (int64)(P + 8);
 
-				if ((jumpOffset & 0xc0000000) != 0
-					&& (~jumpOffset & 0xc0000000) != 0) {
-					/*	Further than a call can reach. The psABI's answer is a
-						longer sequence that materialises the address in a
-						register and jumps through it; nothing has needed it yet,
-						and guessing at it untested would be worse than saying so.
+				/*	What a `call` can actually reach.
+				 *
+				 *	Its displacement field is thirty bits counted in
+				 *	*instructions*, so the byte range is a signed 32-bit one:
+				 *	-2 GB to just under +2 GB.
+				 *
+				 *	Worth stating because the obvious test is wrong by a factor
+				 *	of two. Requiring bits 31:30 to be 00 or 11 -- which is what
+				 *	the kernel's copy of this did, and what this inherited -- is
+				 *	a signed *31*-bit range, so it rejects everything between
+				 *	1 GB and 2 GB away. Userspace here is a shade under 2 GB
+				 *	end to end, so two images can perfectly legally sit further
+				 *	apart than that check allows: libgcc_s.so.1's forty-six PLT
+				 *	entries resolve into libroot.so, the two landed 1.7 GB apart,
+				 *	and every one of them was refused as unreachable.
+				 *
+				 *	It was also not a 64-bit test. Looking only at bits 31:30
+				 *	says nothing about bits 63:32, so a displacement that
+				 *	genuinely does not fit could pass.
+				 */
+				if (jumpOffset < -(int64)0x80000000
+					|| jumpOffset > (int64)0x7ffffffc) {
+					/*	Genuinely out of reach. The psABI's answer is a longer
+						sequence that materialises the address in a register and
+						jumps through it; a 2 GB user address space cannot
+						produce this, so writing it untested would be worse than
+						saying so.
 					 */
-					printf("R_SPARC_JMP_SLOT: displacement %#lx needs more than "
-						"30 bits, which is not implemented\n",
-						(unsigned long)jumpOffset);
+					dprintf("sparc: R_SPARC_JMP_SLOT in \"%s\": %#" B_PRIx64
+						" is further than a call reaches\n", image->name,
+						jumpOffset);
 					return B_BAD_DATA;
 				}
 

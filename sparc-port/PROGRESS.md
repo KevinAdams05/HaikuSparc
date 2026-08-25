@@ -3696,3 +3696,94 @@ in, since `flushw` spills every window *except* the current one.
 
 Unchanged and re-checked: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating
 100baseTX-FDX, every in-kernel self-test identical.
+
+
+## 45. Four fixes, two of them found without booting
+
+The review §44 ended on asked for a look before going further, and it paid for itself twice.
+
+### Both relocation blockers, diagnosed by reading the libraries
+
+No instrumentation, no boot — just asking what the images actually contain:
+
+```
+libgcc_s.so.1:  46 R_SPARC_JMP_SLOT, 4 R_SPARC_RELATIVE, 4 R_SPARC_GLOB_DAT
+libroot.so:     7711 WDISP30, 1309 RELATIVE, 845 HI22, 843 LO10, 428 R_SPARC_64,
+                119 GLOB_DAT, 4 JMP_SLOT, 1 R_SPARC_TLS_DTPMOD64
+```
+
+libroot's single **`R_SPARC_TLS_DTPMOD64`** is the unhandled type. It is the module half of a
+general-dynamic TLS pair, with symbol index zero meaning this module's own block, so it writes
+`image->dso_tls_id` exactly as x86_64's `R_X86_64_DTPMOD64` does. The offset half, `DTPOFF64`, is
+implemented with it; the initial-exec forms are named in the header but left to report, since getting
+them right needs a static TLS block layout this port has not laid out.
+
+And **libgcc uses only types already handled** — which means its `Troubles relocating: Bad data` was not
+a missing type at all. It was this, inherited from the kernel:
+
+```c
+if ((jumpOffset & 0xc0000000) != 0 && (~jumpOffset & 0xc0000000) != 0)
+```
+
+`call` carries a thirty-bit displacement counted in *instructions*, so the byte range it reaches is a
+signed **32**-bit one. Requiring bits 31:30 to be `00` or `11` is a signed **31**-bit range: it rejects
+everything between 1 GB and 2 GB away, half of what the instruction can encode. Userspace here is a
+shade under 2 GB end to end, and libgcc's forty-six PLT entries resolve into a libroot that had been
+mapped 1.7 GB away. Every one was refused as unreachable.
+
+It was not a 64-bit test either — bits 31:30 say nothing about bits 63:32, so a displacement that
+genuinely did not fit could pass. Corrected in both copies. The kernel's has never been wrong in
+practice, its add-ons landing close together, and the corrected test is strictly more permissive, so it
+cannot break what already worked.
+
+### The kernel's frame pointer, handed to userspace
+
+§44 cleared the globals, the locals and the outs on the way into userspace, and stated that `%i6` would
+have been a kernel frame pointer "if `%sp` were not already being set". **That was wrong.** `%sp` is
+`%o6`. `%i6` is a different register — the frame pointer, the previous window's `%o6` — and it was left
+holding the kernel's, along with `%i7`.
+
+It does not stay in a register, either. The first trap out of userspace parks that window in the save
+area, `sparc_flush_user_windows()` writes it to the user's stack, and a later fill loads `%i6` back and
+uses it as a stack pointer. A probe in the flush caught it in the act:
+
+```
+sparc: parked window 0 has kernel values: sp 0x7c9cf751, i6 0x808dae41 i7 0x800c61dc
+```
+
+`%sp` a proper user pointer; `%i6` and `%i7` the kernel's. The observed end of that chain was userspace
+reading `0x808da000` — its own thread's kernel stack — which had been showing up for several boots and
+been filed as a consequence of whatever failed just before it.
+
+The ins are cleared now, zero for the reason `arch_thread_init_kthread_stack()` zeroes the same pair: a
+userland's entry frame is the outermost one, so a stack walk should stop rather than follow whatever the
+memory used to hold.
+
+*The probe's heuristic — "any register at or above KERNEL_BASE" — produces false positives on ordinary
+integer data, which is why it is a probe and not a check.*
+
+### runtime_loader never got the alignment flag
+
+§44 gave `HAIKU_LINKFLAGS` `-z max-page-size=0x2000` on sparc. runtime_loader is linked by its own `Ld`
+invocation with an explicit flag list and never sees that variable, so it kept the linker's 1 MB segment
+alignment — and it is the one image where that hurts most, because the kernel maps it at a randomised
+base, so a 1 MB span is a megabyte of chances to land on something already mapped. The failure is
+therefore *intermittent*, and reads as
+
+```
+error mapping file data: Bad address!
+```
+
+which arrives from the kernel with no hint that alignment is involved. It now gets the flag through a
+variable of its own.
+
+### Where it stands
+
+Further again, and still not a running program. Everything loads and relocates; the thread then dies
+inside what looks like an ordinary copy loop, faulting page by page — a miss and then a
+`fast_data_access_protection` at each of `0x78904000`, `0x78906000`, `0x78908000` — which is
+copy-on-write behaving exactly as it should. Sixty user faults, the report bound reached, so the fatal
+one is not in the log.
+
+Unchanged and re-checked: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating
+100baseTX-FDX, every in-kernel self-test identical.

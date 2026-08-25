@@ -114,7 +114,9 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			[ TargetKernelLibgcc ]
 			[ TargetKernelLibgcceh ]
 			:
-			: --no-undefined -shared -Bsymbolic -soname=runtime_loader -entry=runtime_loader
+			: --no-undefined -shared -Bsymbolic -soname=runtime_loader
+				-entry=runtime_loader
+				$(HAIKU_RUNTIME_LOADER_LINKFLAGS_$(architecture))
 		;
 	}
 }

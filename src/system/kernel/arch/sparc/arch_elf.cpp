@@ -295,16 +295,33 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 				// location of a procedure linkage table entry. The runtime
 				// linker modifies the procedure linkage table entry to
 				// transfer control to the designated symbol address.
-				addr_t jumpOffset = S - (P + 8);
-				if ((jumpOffset & 0xc0000000) != 0
-					&& (~jumpOffset & 0xc0000000) != 0) {
-					// Offset > 30 bit.
-					// TODO: Implement!
+				int64 jumpOffset = (int64)S - (int64)(P + 8);
+
+				/*	`call` carries a thirty-bit displacement counted in
+					instructions, so the byte range it reaches is a signed 32-bit
+					one: -2 GB to just under +2 GB.
+
+					This used to test that bits 31:30 were 00 or 11, which is a
+					signed *31*-bit range and rejects everything between 1 GB and
+					2 GB away -- half of what the instruction can encode. It
+					never bit the kernel, whose add-ons land close together, and
+					it did bit userspace: runtime_loader carries the same code,
+					and libgcc_s.so.1's PLT entries resolve into a libroot.so
+					that had been mapped 1.7 GB away.
+
+					It was also not a 64-bit test: bits 31:30 say nothing about
+					bits 63:32, so a displacement that genuinely did not fit
+					could pass it.
+				 */
+				if (jumpOffset < -(int64)0x80000000
+					|| jumpOffset > (int64)0x7ffffffc) {
+					// TODO: the psABI's long form materialises the address in a
+					// register and jumps through it.
 					// See https://docs.oracle.com/cd/E26502_01/html/E26507/chapter6-1235.html
 					// examples .PLT102 and .PLT103
-					dprintf("arch_elf_relocate_rela(): R_SPARC_JMP_SLOT: "
-						"Offsets > 30 bit currently not supported!\n");
-					dprintf("jumpOffset: %p\n", (void*)jumpOffset);
+					dprintf("arch_elf_relocate_rela(): R_SPARC_JMP_SLOT: %#"
+						B_PRIx64 " is further than a call reaches\n",
+						jumpOffset);
 					return B_ERROR;
 				} else {
 					uint32* instructions = (uint32*)P;

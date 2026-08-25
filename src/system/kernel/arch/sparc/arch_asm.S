@@ -310,6 +310,32 @@ FUNCTION(sparc_enter_userspace):
 	clr	%o5
 	clr	%o7
 
+	/*	And the ins, which are a different eight registers from the outs and were
+		missed the first time this was fixed.
+	 *
+	 *	%sp is %o6. %i6 is *not* %sp -- it is the frame pointer, the previous
+	 *	window's %o6 -- and leaving it holding the kernel's meant the entry window
+	 *	carried a kernel frame pointer and, in %i7, a kernel return address. That
+	 *	does not stay in a register either: the first trap out of userspace parks
+	 *	this window in the save area, sparc_flush_user_windows() writes it to the
+	 *	user's stack, and a later fill loads %i6 back and uses it as a stack
+	 *	pointer. The observed end of that chain was userspace reading its own
+	 *	thread's kernel stack.
+	 *
+	 *	Zero rather than anything else, for the reason
+	 *	arch_thread_init_kthread_stack() zeroes the same pair: this is the
+	 *	outermost frame a userland has, so a stack walk should stop here rather
+	 *	than follow whatever the memory used to hold.
+	 */
+	clr	%i0
+	clr	%i1
+	clr	%i2
+	clr	%i3
+	clr	%i4
+	clr	%i5
+	clr	%i6
+	clr	%i7
+
 	/*	And make the *next* window userspace enters get cleaned.
 
 		CLEANWIN counts the windows a `save` may enter without the hardware

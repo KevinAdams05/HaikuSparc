@@ -166,6 +166,18 @@ rule ArchitectureSetup architecture
 		# 0x2000 is the page size, so segments pack as tightly as they can.
 		HAIKU_LINKFLAGS_$(architecture)
 			+= -Xlinker -z -Xlinker max-page-size=0x2000 ;
+
+		# runtime_loader is linked by its own Ld invocation with an explicit flag
+		# list and never sees HAIKU_LINKFLAGS, so it needs telling separately --
+		# and it is the one image where the default hurts most, because the kernel
+		# maps it at a randomised base and a 1 MB span between its segments is
+		# 1 MB of chances to land on something already there. That failure is
+		# intermittent, and reads as "error mapping file data: Bad address".
+		#
+		# Passed to ld directly rather than through the compiler, hence no
+		# -Xlinker.
+		HAIKU_RUNTIME_LOADER_LINKFLAGS_$(architecture)
+			= -z max-page-size=0x2000 ;
 	}
 
 	# private shared kernel/libroot headers

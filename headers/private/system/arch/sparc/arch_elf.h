@@ -69,6 +69,37 @@
 #define R_SPARC_SIZE32		86
 #define R_SPARC_SIZE64		87
 
+/*	Thread-local storage relocations, from the SPARC psABI.
+
+	Only the 64-bit general-dynamic pair is implemented; see
+	runtime_loader/arch/sparc/arch_relocate.cpp. The rest are named so that an
+	image needing one reports which, rather than a bare type number.
+*/
+#define R_SPARC_TLS_GD_HI22		56
+#define R_SPARC_TLS_GD_LO10		57
+#define R_SPARC_TLS_GD_ADD		58
+#define R_SPARC_TLS_GD_CALL		59
+#define R_SPARC_TLS_LDM_HI22		60
+#define R_SPARC_TLS_LDM_LO10		61
+#define R_SPARC_TLS_LDM_ADD		62
+#define R_SPARC_TLS_LDM_CALL		63
+#define R_SPARC_TLS_LDO_HIX22		64
+#define R_SPARC_TLS_LDO_LOX10		65
+#define R_SPARC_TLS_LDO_ADD		66
+#define R_SPARC_TLS_IE_HI22		67
+#define R_SPARC_TLS_IE_LO10		68
+#define R_SPARC_TLS_IE_LD		69
+#define R_SPARC_TLS_IE_LDX		70
+#define R_SPARC_TLS_IE_ADD		71
+#define R_SPARC_TLS_LE_HIX22		72
+#define R_SPARC_TLS_LE_LOX10		73
+#define R_SPARC_TLS_DTPMOD32		74
+#define R_SPARC_TLS_DTPMOD64		75
+#define R_SPARC_TLS_DTPOFF32		76
+#define R_SPARC_TLS_DTPOFF64		77
+#define R_SPARC_TLS_TPOFF32		78
+#define R_SPARC_TLS_TPOFF64		79
+
 #define TLS_DTV_OFFSET 0
 
 #endif	/* _KERNEL_ARCH_SPARC_ELF_H */
