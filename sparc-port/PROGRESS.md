@@ -4029,3 +4029,47 @@ before.
 
 Unchanged: no panics, six winfixups on the freestanding test, `usertest sig` then `usertest ok`, hme
 negotiating 100baseTX-FDX.
+
+
+## 50. Five things it is not, and a correction to the section before
+
+§49 concluded that runtime_loader's data structures were being corrupted, on the strength of the crash
+moving between boots. Every structure it could have meant has now been measured, and they are all
+intact. That conclusion was wrong, and the elimination is worth more than the guess was.
+
+### What was checked
+
+| Suspect | Measured | Verdict |
+| --- | --- | --- |
+| The heap area | `reserved 0x66fe6000, area 269 at 0x66fe6000 size 65536` | base is *exactly* the reserved base, size as asked |
+| `image_t` for all three images | `syms`, `strtab`, `symhash` each inside that image's own region | intact before relocation begins |
+| Hash tables | libgcc `nchain` 141 against 141 dynamic symbols; libroot 2798 against 2798 | correct, and correctly big-endian |
+| `SymbolLookupCache` | bounds-checked on every access, sized from `symhash[1]` | cannot index out of range |
+| Version arrays | `symbol_versions` and `versions` non-null and inside the heap, `num_versions` 13 | present and plausible |
+
+`_kern_resize_area()` — flagged in §49 as a path nothing had exercised — turns out not to be reached at
+all: the initial 64 KB heap is never outgrown by three images.
+
+### The correction
+
+"A crash that moves is not a logic error in the code doing the crashing" was too strong. The crash does
+move between boots *without* instrumentation — `0x0` one boot, `0x7242a000` another — so something
+genuinely varies. But the specific entry numbers §49 quoted, 40 and 4, came from boots carrying
+*different amounts of tracing*, and runtime_loader's `dprintf()` builds its message in a 1024-byte stack
+buffer. Comparing those two numbers was comparing two different programs. They should not have been
+presented as evidence of anything.
+
+What survives is weaker and still useful: the failure varies, and every input `resolve_symbol()` reads
+has now been shown valid.
+
+### What that leaves
+
+The crash is inside `resolve_symbol()` with all of its inputs correct, which points at the path rather
+than the data — `find_undefined_symbol` is an indirect call through a function pointer in `image_t`, and
+the lookup walks the image list rather than any single structure.
+
+The next instrument should not be `dprintf`. Recording into a fixed buffer that a later, single print
+drains would leave the stack depth alone, which matters when the thing being investigated may itself be
+stack-related and the tool is a kilobyte of stack per call.
+
+Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
