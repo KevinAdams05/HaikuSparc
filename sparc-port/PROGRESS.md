@@ -3826,3 +3826,71 @@ The accounting, in `TRAP_TO_C`. §41 gave it two hand-overs — CANRESTORE into 
 That is where to look next, and it wants reasoning about the invariant rather than another probe: `CANSAVE + CANRESTORE + OTHERWIN = NWINDOWS - 2` holds at every point in this file, and a leak of kernel windows into the `_other` vector means OTHERWIN is counting windows that CANRESTORE should still own.
 
 Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
+
+
+## 47. Narrowing the window leak, and refuting my own explanation
+
+No fix again, but the space of possibilities is a good deal smaller and one attractive theory is dead.
+
+### The parked windows name their own traps
+
+`TRAP_TO_C` keeps its trap state in locals — `%l0` TSTATE, `%l1` TPC, `%l3` TT, `%l7` the interrupt frame —
+so a leaked handler window says which trap it belonged to. Printing those for any parked window with a
+kernel address in `%l7`:
+
+```
+handler window parked: tt 0x140 tstate 0x4400001203 tpc 0xd2d1f78 ...
+handler window parked: tt 0x68  tstate 0x1203       tpc 0xd2d2598 ...
+handler window parked: tt 0x4e  tstate 0x4400001204 tpc 0x6f3a9f78 ...
+```
+
+`0x140` is the system call, `0x68` a data MMU miss, `0x4e` the level-14 timer. And the TSTATE values
+decode as PSTATE `0x12` — `PEF | IE`, **PRIV clear** — with plausible user TPCs, so these are genuinely
+handler windows for traps taken *from userspace*, not stale data that happens to look like it.
+
+So it is not one path. Every kind of trap out of userspace can leave its handler's window in the
+per-thread save area, from which `sparc_flush_user_windows()` writes it to the user's stack.
+
+### The accounting at flush time, and the theory it killed
+
+```
+flush 2 parked: cansave 4 canrestore 2 otherwin 0; save-area fills so far 0, parks 3
+flush 4 parked: cansave 4 canrestore 2 otherwin 0; save-area fills so far 0, parks 15
+```
+
+`CANSAVE + CANRESTORE + OTHERWIN` is 6 every time, so the invariant the hardware enforces is intact —
+this is not a lost or double-counted window in the arithmetic sense.
+
+`CANRESTORE = 2` at the exit point looked like the answer. It starts at zero after the entry hand-over
+and balanced `save`/`restore` pairs return it to zero, so something must be raising it — and `restored`
+does exactly that, while *also* decrementing OTHERWIN instead of CANSAVE whenever OTHERWIN is non-zero.
+A kernel fill misrouted to the `_other` vector would therefore spend an OTHERWIN credit belonging to a
+user window, leaving OTHERWIN over-counted and the next spill parking a kernel window. It explains the
+symptom exactly.
+
+**It is also wrong.** `save-area fills so far 0`, on every flush, all boot: `FILL_USER_WINDOW` never
+runs, so nothing is being misrouted. The `CANRESTORE = 2` is ordinary kernel-stack fills, whose
+`restored` decrements CANSAVE and leaves OTHERWIN alone. §38 said that handler was unreachable and it
+still is.
+
+### What is left
+
+The parks happen while OTHERWIN is non-zero — that much is structural, since the `_other` vector is
+chosen no other way — and by flush time OTHERWIN is back to zero with the invariant intact. So OTHERWIN
+is not being corrupted; it is being *spent on the wrong windows*. The hardware spills the oldest window
+and treats the oldest OTHERWIN of them as belonging to the other context, so a handler window being
+oldest at spill time means the user's windows were no longer where the count said they were.
+
+The remaining candidates, in the order they seem worth testing:
+
+- **The user's own spills.** Userspace spilling its own windows to its own stack at trap level one
+  changes CANRESTORE before the kernel ever sees it, and `winfixup` re-runs those instructions.
+  §41's fixup restores CWP from TSTATE and asserts the accounting is untouched because `saved` never
+  executed — worth checking against the hardware rather than against the argument.
+- **`sparc_enter_userspace`'s `flushw`,** which leaves CANSAVE at 6 and CANRESTORE at 0 — so the very
+  first trap out of a new userland has `b = 0` and OTHERWIN becomes 1, covering only the trapped window
+  while userspace may have more live than the count admits.
+- **Recording the accounting inside the spill handler** rather than at flush time, which is the one
+  measurement not yet taken and the only one that shows the state at the moment a window is parked.
+
+Unchanged: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating 100baseTX-FDX.
