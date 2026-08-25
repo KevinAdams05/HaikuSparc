@@ -325,6 +325,8 @@ if [[ $dynamic_test -eq 1 ]]; then
 	libroot_dir="$objects/haiku/sparc/release/system/libroot"
 	loader="$objects/haiku/sparc/release/system/runtime_loader/runtime_loader"
 	gcc_dir=$("$cc" -print-file-name=crtbeginS.o | xargs dirname)
+	libgcc_glob="$repo/generated.sparc/build_packages/gcc_syslibs-*"
+	libgcc=$(ls $libgcc_glob/lib/libgcc_s.so.1 2>/dev/null | head -1)
 
 	for file in "$cc" "$loader" "$libroot_dir/libroot.so" \
 			"$glue/start_dyn.o" "$glue/init_term_dyn.o" \
@@ -349,7 +351,11 @@ if [[ $dynamic_test -eq 1 ]]; then
 		-I"$repo/headers" -I"$repo/headers/os" -I"$repo/headers/os/support" \
 		-I"$repo/headers/os/kernel" -I"$repo/headers/posix"
 
-	"$cc" -nostdlib -Xlinker -soname=_APP_ -o "$hellodyn_binary" \
+	# -z max-page-size matches what ArchitectureRules now gives every other
+	# sparc binary: without it the linker leaves 1 MB between text and data,
+	# and runtime_loader's map_image() refuses the image as Bad data.
+	"$cc" -nostdlib -Xlinker -soname=_APP_ \
+		-Xlinker -z -Xlinker max-page-size=0x2000 -o "$hellodyn_binary" \
 		"$glue/arch/sparc/crti.o" "$gcc_dir/crtbeginS.o" \
 		"$glue/start_dyn.o" "$glue/init_term_dyn.o" \
 		"$hellodyn_binary.o" \
@@ -361,11 +367,17 @@ if [[ $dynamic_test -eq 1 ]]; then
 
 	shell_command cp -f ":$loader" /myfs/system/runtime_loader
 	shell_command cp -f ":$libroot_dir/libroot.so" /myfs/system/lib/libroot.so
+
+	# libroot.so is linked against libgcc_s.so.1 -- the unwinder and the software
+	# routines the compiler emits calls to -- and runtime_loader resolves that by
+	# name at load time, so it has to be on the volume beside it.
+	shell_command cp -f ":$libgcc" /myfs/system/lib/libgcc_s.so.1
 	shell_command cp -f ":$hellodyn_binary" \
 		/myfs/system/servers/launch_daemon
 
 	echo "  system/runtime_loader          $(stat -c%s "$loader") bytes"
 	echo "  system/lib/libroot.so          $(stat -c%s "$libroot_dir/libroot.so") bytes"
+	echo "  system/lib/libgcc_s.so.1       $(stat -c%s "$libgcc") bytes"
 	echo "  system/servers/launch_daemon   $(stat -c%s "$hellodyn_binary") bytes (hellodyn)"
 fi
 

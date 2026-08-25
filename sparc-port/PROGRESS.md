@@ -3609,3 +3609,90 @@ chase, and the shape of it — a syscall whose `user_memcpy` into a userspace st
 
 Unchanged and re-checked after the fault-path change: no panics, six winfixups per boot, `usertest sig`
 then `usertest ok`, hme still negotiating 100baseTX-FDX, and every in-kernel self-test identical.
+
+
+## 44. A read that reported success and copied nothing
+
+§43 ended on runtime_loader reading an ELF header back as sixty-four zero bytes. The cause turned out to
+be one line, and the reason it was invisible turned out to be another line somewhere else.
+
+### The bug
+
+```c
+SPARCVMPhysicalPageMapper::MemcpyFromPhysical(void* to, phys_addr_t from,
+    size_t length, bool user)
+{
+    if (user)
+        return B_NOT_SUPPORTED;
+```
+
+That is the case **every** `read()` and `write()` from userspace takes. The file cache reads a file into
+pages and copies out of them with `vm_memcpy_from_physical(..., IS_USER_ADDRESS(buffer))`.
+
+And `read_into_cache()` does not check the return value:
+
+```c
+    vm_memcpy_from_physical((void*)buffer, ..., bytes, IS_USER_ADDRESS(buffer));
+
+    buffer += bytes;
+    bufferSize -= bytes;
+```
+
+So the copy declined, the loop advanced, `cache_io` reported the full length, and the buffer was
+untouched. **A read that returns the number of bytes you asked for and no data.** Nothing anywhere
+reported an error.
+
+The fix is to implement the case. The destination cannot simply be stored to — §4.3's shared address
+space means the kernel *can* reach a user address, but a page that has never been touched faults on the
+first write and this runs with a cache lock held. So the bytes go through a stack buffer: read from
+physical with the same ASI accesses as before, then `user_memcpy()` to userspace, which makes a bad
+address an error return rather than a dead kernel.
+
+### Four boots to find one line, and the wrong turns are the useful part
+
+The chase went: instrument the syscall boundary (kernel reads back zeros too, so it is not a userspace
+visibility problem) → instrument `generic_vm_memcpy_from_physical` (**never fires**) → instrument
+`read_from_file` (**never fires**) → read `cache_io` and find that the normal path is `read_into_cache`,
+not `read_from_file`.
+
+The instrument that never fired was the informative one, and it took too long to treat it that way:
+**SPARC has its own `SPARCVMPhysicalPageMapper`** and does not use `GenericVMPhysicalPageMapper` at all.
+Instrumenting the generic file and concluding "that path isn't taken" was right; concluding "so the
+copy must be somewhere else entirely" was wrong. The lesson is the port's own, relearned: a probe that
+stays silent is evidence about *where you put it* before it is evidence about control flow.
+
+### Then two segment-alignment bugs, both already solved once
+
+With the header readable, runtime_loader got further and stopped at
+
+```
+runtime_loader: ...: Could not map image: Bad data
+```
+
+which is `map_image()` refusing an image whose segments sit more than a couple of pages apart. That is
+the **identical check, error and cause** as §29's bug 12, where `load_kernel_add_on()` refused every
+kernel add-on because sparc64's linker aligns segments to 1 MB. That was fixed by linking the kernel and
+its add-ons with `-z max-page-size=0x2000`, and userland never got the same treatment — so fixing it for
+the kernel only moved the day it was noticed. `HAIKU_LINKFLAGS` now carries it on sparc too.
+
+Which is still not sufficient, because not every image is ours to link. `libgcc_s.so.1` arrives prebuilt
+in `gcc_syslibs` with the toolchain default, and `libroot.so` names it, so refusing that layout refuses
+every program on the system. runtime_loader's `MAX_PAGE_SIZE` gains a sparc case at 1 MB — which is
+exactly what x86_64 already does, with the comment already there explaining why.
+
+### Where it stands
+
+`libroot.so` and `libgcc_s.so.1` load, the program maps, and runtime_loader gets far enough to run into
+a wild pointer:
+
+```
+sparc: user fault at 0x808da000 from pc 0x62e4f1ec (write, data, ...), thread 37
+```
+
+`0x808da000` is a **kernel** address — thread 37's own kernel stack region — being written by userspace.
+That is a different class of bug from the three above and the next thing to chase; the leading candidate
+is that `sparc_enter_userspace()` leaves the kernel's values in the window userspace starts executing
+in, since `flushw` spills every window *except* the current one.
+
+Unchanged and re-checked: no panics, six winfixups, `usertest sig` then `usertest ok`, hme negotiating
+100baseTX-FDX, every in-kernel self-test identical.
