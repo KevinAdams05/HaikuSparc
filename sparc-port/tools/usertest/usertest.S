@@ -28,6 +28,7 @@
 #define SYSCALL_EXIT_TEAM		41
 #define SYSCALL_SEND_SIGNAL		91
 #define SYSCALL_SIGACTION		93
+#define SYSCALL_SYSTEM_TIME		196
 #define SYSCALL_OPEN			114
 #define SYSCALL_DEBUG_OUTPUT		254
 
@@ -44,6 +45,13 @@
  *	setting the program up.
  */
 #define DEPTH				300
+
+/*	Shallower than DEPTH, because this one is not about crossing stack pages --
+ *	it is about how many windows can be live while the kernel is repeatedly
+ *	parking and flushing them, and seven is all the register file holds.
+ */
+#define WINDOW_DEPTH			6
+#define WINDOW_TRAPS			64
 
 /*	struct sigaction, from <signal.h>, laid out for a 64-bit big-endian target:
  *	an 8-byte handler pointer, an 8-byte sigset_t mask, a 4-byte flag word with
@@ -74,6 +82,12 @@
 
 #define SIGNAL_HIGH			0x7573657274657374	/* "usertest" */
 #define SIGNAL_LOW			0x207369670a000000	/* " sig\n\0"   */
+
+#define MARK_DEEP			0x20646565700a0000	/* " deep\n"  */
+#define MARK_WINOK			0x2077696e6f6b0a00	/* " winok\n" */
+#define WINBAD_HIGH			0x7573657274657374	/* "usertest" */
+#define WINBAD_MID			0x2077696e20626164	/* " win bad" */
+#define WINBAD_END			0x0a00000000000000	/* "\n\0"       */
 
 #define DEVICE_HIGH			0x2f6465762f6e6574	/* "/dev/net" */
 #define DEVICE_LOW			0x2f686d652f300000	/* "/hme/0\0"  */
@@ -172,6 +186,94 @@ _start:
 	deccc	%g4
 	bne	2b
 	 nop
+
+	setx	MESSAGE_HIGH, %g2, %g3
+	stx	%g3, [%sp + SCRATCH]
+	setx	MARK_DEEP, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 8]
+	add	%sp, SCRATCH, %o0
+	set	SYSCALL_DEBUG_OUTPUT, %g1
+	ta	SYSCALL_TRAP
+
+	/*	Do the register windows survive the kernel parking and flushing them?
+	 *
+	 *	The question this exists to answer. A trap out of userspace hands the
+	 *	kernel every live window: the trap entry marks them as userspace's, a spill
+	 *	inside the handler parks one in the per-thread save area, and
+	 *	sparc_flush_user_windows() writes it back to this stack on the way out. A
+	 *	`restore` here then fills it from that stack.
+	 *
+	 *	Every step of that is the kernel's, and a userland has no way to know it
+	 *	went wrong except that a local it never touched has changed. So: stamp each
+	 *	window with its own depth, trap enough times to drive the machinery hard,
+	 *	and read the stamps back on the way out.
+	 *
+	 *	%l0 because it is a local -- the registers a `save` rotates and a spill
+	 *	writes out. %g4 is a global and survives a trap by a different mechanism
+	 *	(the interrupt frame), which is what makes it usable as the reference to
+	 *	compare against.
+	 */
+	set	WINDOW_DEPTH, %g4
+1:	save	%sp, -FRAME, %sp
+	mov	%g4, %l0
+	deccc	%g4
+	bne	1b
+	 nop
+
+	/*	Now trap, repeatedly, from the deepest window. Each of these is a full
+	 *	round trip through the entry, the hand-over, the save-area machinery and
+	 *	the flush.
+	 */
+	set	WINDOW_TRAPS, %g5
+2:	set	SYSCALL_SYSTEM_TIME, %g1
+	ta	SYSCALL_TRAP
+	deccc	%g5
+	bne	2b
+	 nop
+
+	/*	And back out, checking each stamp. The deepest window was stamped 1, and
+	 *	each `restore` should reveal one more than the last.
+	 */
+	mov	1, %g4
+3:	cmp	%l0, %g4
+	bne	5f
+	 nop
+	cmp	%g4, WINDOW_DEPTH
+	be	4f
+	 nop
+	restore
+	ba	3b
+	 inc	%g4
+4:	restore
+	ba	6f
+	 nop
+
+	/*	A stamp came back wrong, which means a window did not survive the round
+	 *	trip. Say so and stop -- the windows below this one cannot be trusted to
+	 *	unwind, so this deliberately does not `restore` its way out.
+	 */
+5:	setx	WINBAD_HIGH, %g2, %g3
+	stx	%g3, [%sp + SCRATCH]
+	setx	WINBAD_MID, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 8]
+	setx	WINBAD_END, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 16]
+	add	%sp, SCRATCH, %o0
+	set	SYSCALL_DEBUG_OUTPUT, %g1
+	ta	SYSCALL_TRAP
+
+	clr	%o0
+	set	SYSCALL_EXIT_TEAM, %g1
+	ta	SYSCALL_TRAP
+6:
+
+	setx	MESSAGE_HIGH, %g2, %g3
+	stx	%g3, [%sp + SCRATCH]
+	setx	MARK_WINOK, %g2, %g3
+	stx	%g3, [%sp + SCRATCH + 8]
+	add	%sp, SCRATCH, %o0
+	set	SYSCALL_DEBUG_OUTPUT, %g1
+	ta	SYSCALL_TRAP
 
 	/*	Then a signal, to itself, with a handler of its own.
 	 *
