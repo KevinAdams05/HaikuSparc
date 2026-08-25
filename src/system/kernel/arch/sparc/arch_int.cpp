@@ -8,6 +8,7 @@
 
 
 #include <setjmp.h>
+#include <signal.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -15,9 +16,11 @@
 #include <arch_thread_types.h>
 #include <debug.h>
 #include <interrupts.h>
+#include <ksignal.h>
 #include <smp.h>
 #include <thread.h>
 #include <timer.h>
+#include <user_debugger.h>
 #include <arch_mmu.h>
 #include <arch_thread_types.h>
 #include <kernel.h>
@@ -1321,6 +1324,103 @@ sparc_window_fault(struct iframe* frame)
 	 */
 	addr_t ignored = 0;
 	vm_page_fault(address, (addr_t)frame->tpc, isWrite, false, true, &ignored);
+
+	disable_interrupts();
+}
+
+
+/*!	A trap out of userspace that nothing in the table claims.
+
+	Illegal instructions, misaligned accesses, division by zero -- the traps a
+	program earns by being wrong, as opposed to the ones the kernel services on
+	its behalf. Reached from sparc_unhandled_trap in arch_traps.S, which routes
+	them here rather than into its own reporter; the note there says why.
+
+	Its job is to name the trap and end the thread, not to recover. A signal is
+	how Haiku ends one, and which signal is a property of the trap type: the
+	SPARC V9 numbers are architectural, listed in the manual's trap table, and
+	the mapping below is the same one every other Unix on this architecture uses.
+
+	The dprintf is not redundant with the signal. A thread killed by SIGILL says
+	nothing about *which* instruction unless something prints it, and on a port
+	whose userland cannot yet run a debug server there is nothing else to ask.
+*/
+extern "C" void
+sparc_unhandled_user_trap(struct iframe* frame)
+{
+	IFrameScope frameScope(frame);
+
+	enable_interrupts();
+
+	uint32 signalNumber = SIGILL;
+	int32 signalCode = ILL_ILLOPC;
+	debug_exception_type exception = B_INVALID_OPCODE_EXCEPTION;
+
+	switch (frame->tt) {
+		case 0x10:	// illegal_instruction
+			break;
+
+		case 0x11:	// privileged_opcode
+			signalCode = ILL_PRVOPC;
+			break;
+
+		case 0x20:	// fp_exception_ieee_754
+		case 0x21:	// fp_exception_other
+			signalNumber = SIGFPE;
+			signalCode = FPE_FLTINV;
+			exception = B_FLOATING_POINT_EXCEPTION;
+			break;
+
+		case 0x28:	// division_by_zero
+			signalNumber = SIGFPE;
+			signalCode = FPE_INTDIV;
+			exception = B_DIVIDE_ERROR;
+			break;
+
+		case 0x34:	// mem_address_not_aligned
+			signalNumber = SIGBUS;
+			signalCode = BUS_ADRALN;
+			exception = B_ALIGNMENT_EXCEPTION;
+			break;
+
+		default:
+			break;
+	}
+
+	/*	The instruction itself, when it can be had. For an illegal instruction
+		the word is the entire question, and %tpc is by definition an address the
+		processor just fetched from -- so this read is very unlikely to fail, and
+		is guarded rather than trusted because "very unlikely" is not "cannot".
+	 */
+	uint32 instruction = 0;
+	bool haveInstruction = user_memcpy(&instruction, (void*)(addr_t)frame->tpc,
+		sizeof(instruction)) == B_OK;
+
+	dprintf("sparc: unhandled user trap %#" B_PRIx64 " at pc %#" B_PRIx64
+		" (instruction ", frame->tt, frame->tpc);
+	if (haveInstruction)
+		dprintf("%#" B_PRIx32 "", instruction);
+	else
+		dprintf("unreadable");
+	dprintf("), signal %" B_PRIu32 ", thread %" B_PRId32 "\n", signalNumber,
+		thread_get_current_thread_id());
+
+
+	struct sigaction action;
+	Thread* thread = thread_get_current_thread();
+
+	/*	The user debugger first, unless the thread has said it wants the signal
+		-- which is the order every other architecture in this tree uses, and the
+		reason is that a debugger wants to see the exception before the program
+		gets a chance to handle it away.
+	 */
+	if ((sigaction(signalNumber, NULL, &action) == 0
+			&& action.sa_handler != SIG_DFL && action.sa_handler != SIG_IGN)
+		|| user_debug_exception_occurred(exception, signalNumber)) {
+		Signal signal(signalNumber, signalCode, B_ERROR, thread->team->id);
+		signal.SetAddress((void*)(addr_t)frame->tpc);
+		send_signal_to_thread(thread, signal, 0);
+	}
 
 	disable_interrupts();
 }

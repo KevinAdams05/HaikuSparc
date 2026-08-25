@@ -927,8 +927,39 @@ sparc_unhandled_trap:
 	stx	%g1, [%g7 + TRAP_DATA_MISS_TL]
 	cmp	%g1, 1
 	bne,pn	%xcc, sparc_unhandled_trap_stop
-	 ldx	[%g7 + TRAP_DATA_REPORT_HANDLER], %g1
+	 nop
 
+	/*	A trap out of userspace is not the kernel's failure and must not be
+		reported as one.
+
+		The path below is `done` into a C function, and `done` restores PSTATE
+		from TSTATE -- the *trapped* context's PSTATE. For a trap taken in the
+		kernel that is privileged, on the normal globals, with %g7 pointing at
+		the current thread and %sp on a kernel stack, and the reporter works.
+		For a trap taken in userspace it is none of those things: the function
+		runs unprivileged, on the user's stack, with the user's %g7, and faults
+		on its own first instruction.
+
+		Which is how an illegal instruction in a user program presented as the
+		kernel executing at a kernel address with user privilege -- a report of
+		the reporting, with the trap that caused it nowhere in the log.
+
+		So userspace goes the way every other trap from userspace goes. TRAP_TO_C
+		is what makes the transition this needs: it stays at the privilege the
+		trap already granted, takes a kernel stack from the trap data block, and
+		reaches C at trap level zero where a signal can be raised against the
+		thread that earned it.
+
+		TSTATE, not the trap type: what makes this the wrong path is where the
+		trap came from, and every trap type that reaches here can arrive from
+		either side.
+	 */
+	rdpr	%tstate, %g1
+	andcc	%g1, TSTATE_PRIV, %g0
+	be,pn	%xcc, sparc_unhandled_user_entry
+	 nop
+
+	ldx	[%g7 + TRAP_DATA_REPORT_HANDLER], %g1
 	brz,pn	%g1, sparc_unhandled_trap_stop
 	 nop
 	wrpr	%g1, 0, %tnpc
@@ -1741,6 +1772,22 @@ sparc_fault_entry:
 */
 sparc_window_fault_entry:
 	TRAP_TO_C sparc_window_fault, 0
+
+
+/*	A trap out of userspace that no handler in the table claims -- an illegal
+	instruction, a misaligned access, a division by zero.
+
+	Reached from sparc_unhandled_trap, which has already recorded everything
+	about the trap in the trap data block and established that it came from
+	userspace at trap level one. See the note there for why it cannot report
+	these itself.
+
+	The interrupt level is not raised, for the same reason the fault path does
+	not raise it: the handler ends in raising a signal, which takes locks and can
+	block.
+*/
+sparc_unhandled_user_entry:
+	TRAP_TO_C sparc_unhandled_user_trap, 0
 
 
 /*	System call entry, reached by `ta SPARC_SYSCALL_TRAP` from either privilege
