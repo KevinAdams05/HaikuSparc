@@ -292,13 +292,32 @@ parse_dynamic_segment(image_t* image)
 			case DT_PLTRELSZ:
 				image->pltrel_len = d[i].d_un.d_val;
 				break;
+			// A zero address is "there is no initialiser", not "the initialiser
+			// is at the start of the image".
+			//
+			// The load address is added to whatever DT_INIT holds, and the
+			// caller's test for whether to run it is against zero -- so an image
+			// declaring DT_INIT 0 gets called at its own first byte, which is
+			// the ELF header. That is a jump into "\x7fELF", and what happens
+			// next depends on the architecture rather than on anything sensible.
+			//
+			// Linkers omit the tag rather than writing zero, so this only comes
+			// up where something went wrong at build time: a crti.S that
+			// declares _init without defining it leaves the symbol undefined and
+			// the tag written as zero. Binaries built that way are already
+			// shipped and cannot be relinked from here, and there is nothing to
+			// be gained by calling an address the image never claimed.
 			case DT_INIT:
-				image->init_routine
-					= (d[i].d_un.d_ptr + image->regions[0].delta);
+				if (d[i].d_un.d_ptr != 0) {
+					image->init_routine
+						= (d[i].d_un.d_ptr + image->regions[0].delta);
+				}
 				break;
 			case DT_FINI:
-				image->term_routine
-					= (d[i].d_un.d_ptr + image->regions[0].delta);
+				if (d[i].d_un.d_ptr != 0) {
+					image->term_routine
+						= (d[i].d_un.d_ptr + image->regions[0].delta);
+				}
 				break;
 			case DT_SONAME:
 				sonameOffset = d[i].d_un.d_val;
