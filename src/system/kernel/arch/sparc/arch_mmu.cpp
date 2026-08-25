@@ -1023,6 +1023,7 @@ sparc_verify_trap_globals()
 		offsetof(sparc_trap_data, winfixupAddress),
 		offsetof(sparc_trap_data, winfixupTrapType),
 		offsetof(sparc_trap_data, winfixupCount),
+		offsetof(sparc_trap_data, faultTagAccess),
 	};
 
 	for (int i = 0; i < TRAP_DATA_OFFSET_COUNT; i++) {

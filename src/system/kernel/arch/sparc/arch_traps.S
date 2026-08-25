@@ -87,6 +87,7 @@
 #define TRAP_DATA_WINFIXUP_ADDRESS	0xf8
 #define TRAP_DATA_WINFIXUP_TRAP		0x100
 #define TRAP_DATA_WINFIXUP_COUNT	0x108
+#define TRAP_DATA_FAULT_TAG_ACCESS	0x110
 #define TRAP_DATA_OFFSET_COUNT		21
 
 /*	Geometry of struct sparc_window_save, from arch_thread_types.h. The count is
@@ -1109,18 +1110,48 @@ sparc_winfixup:
 	 *	biased and already-adjusted top the context switch leaves in the trap data
 	 *	block.
 	 *
-	 *	`save rs1, rs2, rd` computes in the *old* window and writes rd in the new
-	 *	one, and the globals are shared by both -- which is what lets the address
-	 *	be worked out here and land in the new window's %sp either way.
+	 *	**Which is worked out after the `save`, not before it, and that is the
+	 *	whole shape of what follows.**
 	 *
-	 *	%g1 and %g2 only. %g3 holds the page table root in the MMU bank and the
-	 *	fault path arrives here with that bank selected, so clobbering it would
-	 *	break the next miss rather than this trap.
+	 *	`save rs1, rs2, rd` computes in the *old* window and writes rd in the new
+	 *	one, so the obvious way to write this is to put the address in a global
+	 *	first and name that global as the operand. That was this code, and it was
+	 *	wrong: the `save` can *trap*.
+	 *
+	 *	CANSAVE being zero is exactly the condition that makes a trap arrive with
+	 *	no window free, and then the save spills. The spill handler needs scratch
+	 *	registers, the only ones it has are globals, and a trap taken at trap level
+	 *	one does not get a fresh bank -- the hardware selects the alternate globals
+	 *	on entry, they are already selected here, so the handler and this code are
+	 *	holding the same physical registers. SPILL_USER_WINDOW leaves its last
+	 *	scratch value in %g2; `retry` then re-runs the `save` with that as the
+	 *	stack pointer. What lands in %sp is the number of spills this thread has
+	 *	taken.
+	 *
+	 *	The failure is quiet and it is intermittent, because it needs a trap that
+	 *	arrives with the register file full. Under a shallow call graph it never
+	 *	happens; six windows deep it happens on the next trap. It presented as
+	 *	corrupted locals in a dynamically linked program, which is what a stack
+	 *	pointer of 46 looks like from C. %g1 was the other casualty -- it carried
+	 *	TSTATE across the same instruction, so the test that decides whether the
+	 *	trapped window belongs to userspace was reading a spill counter too, which
+	 *	is how kernel windows got classified as the user's and flushed to the
+	 *	user's stack.
+	 *
+	 *	So nothing is live in a global across the `save` any more. The operands
+	 *	are %sp and a constant, which is right for a trap out of the kernel and
+	 *	harmless for one out of userspace -- `save` only does arithmetic, and the
+	 *	user's %sp is overwritten below before anything dereferences it. TSTATE is
+	 *	read again on the far side rather than carried: the trap registers belong
+	 *	to trap level one, the spill ran at level two, and its `retry` restored
+	 *	the level it borrowed. Everything the far side needs it either re-reads or
+	 *	keeps in a local, and locals are window registers -- the one kind of
+	 *	register a spill cannot reach.
 	 */
 	rdpr	%tstate, %g1
 	andcc	%g1, TSTATE_PRIV, %g0
 	bne,pt	%xcc, 7f
-	 sub	%sp, (SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %g2
+	 nop
 
 	/*	Out of userspace. Hand the user's live windows to the kernel, and take the
 		kernel stack from the trap data block rather than trusting %sp.
@@ -1161,9 +1192,6 @@ sparc_winfixup:
 	rdpr	%canrestore, %g2
 	wrpr	%g0, 0, %canrestore
 	wrpr	%g2, 0, %otherwin
-
-	ldx	[%g7 + TRAP_DATA_KERNEL_STACK], %g2
-	sub	%g2, (SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %g2
 7:
 	/*	Written for both kinds of trap, and unconditionally on purpose: a value
 		that is merely expected to be right is one nothing re-establishes when it
@@ -1172,13 +1200,25 @@ sparc_winfixup:
 	 */
 	wrpr	%g0, WSTATE_KERNEL, %wstate
 
-	save	%g2, %g0, %sp
+	save	%sp, -(SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
 
-	/*	And the window the trap came from, which the save just counted in
-		CANRESTORE. See the note above: it is the user's, so it goes where the
-		user's windows went. Skipped for a trap out of the kernel, whose
-		CANRESTORE counts kernel windows that the kernel handler is right to
-		spill.
+	/*	Now on the far side, where two things are still owed for a trap out of
+		userspace: the frame has to move off the user's stack and onto this
+		thread's, and the window the trap came from has to be classified.
+
+		TSTATE re-read rather than carried. See the note above -- a global does
+		not survive this instruction, and %l0 is about to be loaded with exactly
+		this value anyway by the block below.
+
+		The stack address is loaded here, after the save, for the same reason.
+		%g7 is the one global that does survive: the spill handlers take it as
+		their base rather than clobbering it, which is what makes the trap data
+		block reachable from inside them at all.
+
+		And the window the trap came from, which the save just counted in
+		CANRESTORE: it is the user's, so it goes where the user's windows went.
+		Skipped for a trap out of the kernel, whose CANRESTORE counts kernel
+		windows that the kernel handler is right to spill.
 
 		CANRESTORE is exactly one here, which is what lets this be done with a
 		single scratch register. The transfer above set it to zero; `save`
@@ -1188,17 +1228,21 @@ sparc_winfixup:
 		exact only if the transfer above is ever removed -- which is the other
 		half of the pair, so it will not be.
 
-		%g1 still holds the trapped TSTATE, read before the save; %g2 is free now
-		that the stack address has landed in the new window's %sp. %g3 is the page
-		table root in the MMU bank and this path can be running on it, so %g2 is
-		the only register available.
+		%l1 as the scratch, and %l0 for TSTATE, because the block immediately
+		below overwrites both -- so this borrows registers it does not have to
+		give back.
 	 */
-	andcc	%g1, TSTATE_PRIV, %g0
+	rdpr	%tstate, %l0
+	andcc	%l0, TSTATE_PRIV, %g0
 	bne,pt	%xcc, 8f
 	 nop
-	rdpr	%otherwin, %g2
-	add	%g2, 1, %g2
-	wrpr	%g2, 0, %otherwin
+
+	ldx	[%g7 + TRAP_DATA_KERNEL_STACK], %l1
+	sub	%l1, (SPARC_MINIMUM_FRAME_SIZE + IFRAME_SIZEOF), %sp
+
+	rdpr	%otherwin, %l1
+	add	%l1, 1, %l1
+	wrpr	%l1, 0, %otherwin
 	wrpr	%g0, 0, %canrestore
 8:
 
@@ -1243,12 +1287,24 @@ sparc_winfixup:
 	 */
 	ldx	[%g7 + TRAP_DATA_CURRENT_THREAD], %l6
 
+	/* The frame sits above this window's own save area. Computed here rather
+	 * than after the bank switch, because the address below has to be read while
+	 * this bank is still selected and there is no spare local to park it in.
+	 */
+	add	%sp, SPARC_MINIMUM_FRAME_SIZE + BIAS, %l7
+
+	/* The faulting address, from where the fault path put it rather than from
+	 * the MMU. See sparc_fault_entry: by the time this runs, the register it
+	 * came from has very likely been rewritten by a miss on this very store.
+	 * Reached through the trap bank's %g7, so it has to happen before the switch
+	 * and before %g7 is repointed at the thread.
+	 */
+	ldx	[%g7 + TRAP_DATA_FAULT_TAG_ACCESS], %l5
+	stx	%l5, [%l7 + IFRAME_TAG_ACCESS]
+
 	rdpr	%pstate, %l5
 	andn	%l5, PSTATE_AG | PSTATE_MG | PSTATE_IG, %l5
 	wrpr	%l5, 0, %pstate
-
-	/* The frame sits above this window's own save area. */
-	add	%sp, SPARC_MINIMUM_FRAME_SIZE + BIAS, %l7
 
 	stx	%g1, [%l7 + IFRAME_G1]
 	stx	%g2, [%l7 + IFRAME_G2]
@@ -1264,9 +1320,13 @@ sparc_winfixup:
 	 */
 	mov	%l6, %g7
 
-	/* The data MMU's fault status and address, before anything else can
-	 * overwrite them. Meaningless for traps that do not set them, and cheaper to
-	 * record unconditionally than to decide here which those are.
+	/* The data MMU's fault status. Meaningless for traps that do not set them,
+	 * and cheaper to record unconditionally than to decide here which those are.
+	 *
+	 * These two are safe to read this late, unlike the address: SFSR and SFAR
+	 * are written for a genuine access exception and left alone by the fast
+	 * misses the kernel resolves in the table, so nothing between the trap and
+	 * here disturbs them.
 	 */
 	mov	MMU_SFSR, %l5
 	ldxa	[%l5] ASI_DMMU, %l5
@@ -1274,9 +1334,6 @@ sparc_winfixup:
 	mov	MMU_SFAR, %l5
 	ldxa	[%l5] ASI_DMMU, %l5
 	stx	%l5, [%l7 + IFRAME_SFAR]
-	mov	MMU_TLB_TAG_ACCESS, %l5
-	ldxa	[%l5] ASI_DMMU, %l5
-	stx	%l5, [%l7 + IFRAME_TAG_ACCESS]
 
 	/* Raise the interrupt level so nothing can nest, and remember what it was.
 	 *
@@ -1547,6 +1604,45 @@ sparc_winfixup:
 	wrpr	%g0, 0, %otherwin
 	add	%l6, %l5, %l6
 	wrpr	%l6, 0, %canrestore
+
+	/*	And make the next window userspace enters a clean one.
+
+		CLEANWIN counts the windows a `save` may enter without the hardware
+		raising clean_window, and the handler servicing that trap zeroes a window
+		and increments it. It therefore only ever grows -- tens of thousands of
+		times a boot, as the kernel works through its own call graph -- and
+		nothing lowers it again. `flushw` does not: it spills windows, which says
+		nothing about whether their registers have been scrubbed.
+
+		So without this, CLEANWIN is saturated by the time any trap returns, and
+		userspace's next `save` does not trap. It gets a window whose %l0-%l7 are
+		still the kernel's -- and the kernel's most recent use of any window is
+		this handler, so what userspace receives is TSTATE in %l0, the trapped
+		%tpc and %tnpc in %l1 and %l2, and the trap number in %l3.
+
+		That is a disclosure on its own. It also does not stay in the register
+		file: userspace only writes the locals it has a use for, the rest keep the
+		kernel's values, and when the window spills -- by userspace's own hand or
+		by this kernel flushing the save area -- they are written to the user's
+		stack. Kernel stack addresses and Thread pointers were being found there.
+
+		sparc_enter_userspace() does this once, for the first window a thread ever
+		enters, and the comment there explains the same mechanism. Once was not
+		enough: CLEANWIN starts growing again the moment the kernel takes its next
+		trap, which is long before userspace takes its second.
+
+		Less one, because the `restore` below has not happened yet. It moves CWP
+		back and takes CANRESTORE with it, and what has to hold is
+		CLEANWIN == CANRESTORE *after* that -- that equality is what makes the
+		next `save` trap. Guarded because CANRESTORE can be zero here, in which
+		case the `restore` fills rather than counting down, and zero is already
+		the value that forces the trap.
+	 */
+	brz,pn	%l6, 10f
+	 nop
+	sub	%l6, 1, %l6
+10:
+	wrpr	%l6, 0, %cleanwin
 9:
 
 	rdpr	%cwp, %l6
@@ -1587,6 +1683,42 @@ sparc_interrupt_entry:
  *	thing that knows whether blocking is allowed.
  */
 sparc_fault_entry:
+	/*	The faulting address, first, before this handler executes anything that
+		could take it away.
+
+		The D-MMU writes its Tag Access register on every miss, including the
+		fast ones the kernel resolves in a handful of instructions without any of
+		this running. So the register holds the faulting address only until the
+		next D-MMU miss on this processor -- and the next D-MMU miss is whatever
+		this handler touches first.
+
+		Which used to be the interrupt frame. TRAP_TO_C reads Tag Access after
+		writing the seven globals into the frame, and the frame is on a kernel
+		stack that a thread which has just been scheduled may not have in the
+		TLB. One miss on that store and the address the VM is handed is the
+		kernel stack page rather than the address userspace faulted on. The VM
+		refuses it -- correctly, it is a kernel address in a user fault -- and
+		kills the thread, at a program counter that has nothing wrong with it.
+
+		The comment on that read says "before anything else can overwrite them"
+		and it was written in good faith; the seven stores above it are not
+		obviously memory accesses when what you are reading is a list of
+		registers being saved.
+
+		It presented as an intermittent crash in dynamically linked programs and
+		nowhere else, because the loader is the first thing this port runs that
+		faults on a cold stack: the same instruction faults twice, once at the
+		address it meant and once at whatever the kernel touched in between.
+
+		Safe to store from here, and this is the reason the trap data block has
+		its own locked D-TLB entry: a store to it cannot itself miss. %g1 is free
+		-- TRAP_TO_C loads it below, and the branch to sparc_winfixup re-reads
+		Tag Access for itself before anything can disturb it again.
+	 */
+	mov	MMU_TLB_TAG_ACCESS, %g1
+	ldxa	[%g1] ASI_DMMU, %g1
+	stx	%g1, [%g7 + TRAP_DATA_FAULT_TAG_ACCESS]
+
 	/*	A fault at trap level two or deeper did not come from ordinary code: it
 		came from one of the handlers in this file, and the only ones that touch
 		memory which can fault are the window spill and fill paths that write and
@@ -1856,6 +1988,8 @@ FUNCTION(sparc_trap_data_offsets):
 	stx	%o1, [%o0 + (25 * 8)]
 	mov	TRAP_DATA_WINFIXUP_COUNT, %o1
 	stx	%o1, [%o0 + (26 * 8)]
+	mov	TRAP_DATA_FAULT_TAG_ACCESS, %o1
+	stx	%o1, [%o0 + (27 * 8)]
 	retl
 	 nop
 

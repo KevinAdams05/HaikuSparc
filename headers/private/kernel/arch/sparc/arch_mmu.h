@@ -312,7 +312,8 @@ struct sparc_trap_data {
 	uint64	winfixupAddress;	// 0xf8  address a faulted spill or fill wanted
 	uint64	winfixupTrapType;	// 0x100 the window trap that was abandoned
 	uint64	winfixupCount;		// 0x108 spills and fills abandoned since boot
-	uint64	reserved[30];		// pad to TRAP_DATA_SIZE
+	uint64	faultTagAccess;		// 0x110 the faulting VA, read before it is lost
+	uint64	reserved[29];		// pad to TRAP_DATA_SIZE
 };
 
 #define TRAP_DATA_TSB_BASE			0x00
@@ -340,6 +341,7 @@ struct sparc_trap_data {
 #define TRAP_DATA_WINFIXUP_ADDRESS	0xf8
 #define TRAP_DATA_WINFIXUP_TRAP		0x100
 #define TRAP_DATA_WINFIXUP_COUNT	0x108
+#define TRAP_DATA_FAULT_TAG_ACCESS	0x110
 
 // Values for sparc_trap_data::trapKind.
 #define SPARC_TRAP_UNRESOLVED_MISS	0
@@ -382,7 +384,7 @@ extern "C" uint64 sparc_read_trap_globals(int bank);
 extern "C" uint64 sparc_read_trap_page_table(int bank);
 extern "C" void sparc_trap_data_offsets(uint64 *out);
 
-#define TRAP_DATA_OFFSET_COUNT		27
+#define TRAP_DATA_OFFSET_COUNT		28
 
 
 #endif	/* _KERNEL_ARCH_SPARC_MMU_H */
