@@ -161,8 +161,8 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 			if (status != B_OK) {
 				TRACE(("resolve symbol \"%s\" returned: %" B_PRId32 "\n",
 					SYMNAME(image, sym), status));
-				printf("resolve symbol \"%s\" returned: %" B_PRId32 "\n",
-					SYMNAME(image, sym), status);
+				dprintf("sparc: could not resolve \"%s\" for \"%s\": %"
+					B_PRId32 "\n", SYMNAME(image, sym), image->name, status);
 				return status;
 			}
 		}
@@ -329,8 +329,15 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 			}
 
 			default:
-				TRACE(("unhandled relocation type %d\n", type));
-				printf("unhandled relocation type %d\n", type);
+				/*	dprintf() rather than printf(): runtime_loader's printf goes
+					to standard error through _kern_write, and while it is
+					relocating libroot there is no standard error yet. dprintf
+					goes to _kern_debug_output, which is the serial console the
+					kernel is already using.
+				 */
+				dprintf("sparc: unhandled relocation type %d in \"%s\" at "
+					"offset %#lx\n", type, image->name,
+					(unsigned long)rel[i].r_offset);
 				return B_BAD_DATA;
 		}
 	}

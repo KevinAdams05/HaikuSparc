@@ -275,6 +275,63 @@ FUNCTION(sparc_enter_userspace):
 	clr	%g5
 	clr	%g6
 
+	/*	And the window registers, for the same reason as the globals and with a
+		sharper edge.
+
+		`retry` below returns into *this* window, so these are the registers
+		userspace starts with. %o0, %o1 and %sp were just set; everything else
+		here still holds whatever the kernel left, and two of them are load
+		bearing.
+
+		%o7 is the worst. The first thing a userland function does is `save`,
+		which makes this window's outs its ins -- so %i7, the address a `ret`
+		jumps to, becomes the return address of whoever called
+		sparc_enter_userspace(). A userland that returns from its entry point
+		therefore jumps into the kernel, in user mode, and the fault reports an
+		instruction fetch at a kernel address with no explanation of how a user
+		program got hold of one. %i6 would be a kernel frame pointer the same way
+		if %sp were not already being set.
+
+		The locals matter less and leak just as much: userspace can read %l0-%l7
+		before its first `save` and see whatever the kernel was holding.
+	 */
+	clr	%l0
+	clr	%l1
+	clr	%l2
+	clr	%l3
+	clr	%l4
+	clr	%l5
+	clr	%l6
+	clr	%l7
+
+	clr	%o2
+	clr	%o3
+	clr	%o4
+	clr	%o5
+	clr	%o7
+
+	/*	And make the *next* window userspace enters get cleaned.
+
+		CLEANWIN counts the windows a `save` may enter without the hardware
+		raising clean_window, and the handler that services that trap zeroes a
+		window and increments it. It therefore only ever grows -- fifty thousand
+		times a boot, as the kernel works -- and nothing lowers it again. `flushw`
+		does not: it spills windows, which says nothing about whether their
+		registers have been scrubbed.
+
+		So by the time a thread reaches userspace, CLEANWIN is saturated and
+		userspace's first `save` does *not* trap. It gets a window still holding
+		kernel register values, which is precisely the disclosure CLEANWIN exists
+		to prevent.
+
+		Set to CANRESTORE -- zero here, since `flushw` above left nothing to
+		restore -- so the next `save` traps and the handler hands over a window it
+		has zeroed.
+	 */
+	rdpr	%canrestore, %g1
+	wrpr	%g1, 0, %cleanwin
+	clr	%g1
+
 	/*	And userspace spills its own windows itself, to its own stack, with its
 		own privilege. WSTATE.NORMAL selects which of the eight spill handlers a
 		trap uses; group one is the one that stores through

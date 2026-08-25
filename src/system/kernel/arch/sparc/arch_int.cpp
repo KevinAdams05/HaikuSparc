@@ -1086,7 +1086,21 @@ sparc_instruction_writes_memory(uint64 pc)
 	if ((instruction >> 30) != 3)
 		return false;
 
-	return (((instruction >> 19) & 0x3f) & 0x04) != 0;
+	uint32 op3 = (instruction >> 19) & 0x3f;
+
+	/*	PREFETCH sits on the store side of that bit and writes nothing.
+
+		It cannot reach here on this processor -- V9 defines PREFETCH as having no
+		side effects and never raising a data access exception, and
+		UltraSPARC-IIi implements it as a NOP -- so this is one comparison to stop
+		depending on that being true. Calling a prefetch a write would ask the VM
+		to fault a page in for writing and raise SIGSEGV on a read-only one, for
+		an instruction whose whole contract is that it is safe to ignore.
+	 */
+	if (op3 == 0x2d)
+		return false;
+
+	return (op3 & 0x04) != 0;
 }
 
 
