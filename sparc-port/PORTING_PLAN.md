@@ -540,13 +540,21 @@ handler and exits cleanly.
 A userland needs neither `runtime_loader` nor `libroot` nor a package — it needs a static ELF the
 kernel's loader can map. And the kernel enters `/boot/system/runtime_loader` whatever the executable
 is, so installing a test binary under that name runs it through the real path with nothing else
-present. The dynamically linked half of the exit criterion still wants §5.4 closed; the static half
-did not. See [PROGRESS §§39–40](PROGRESS.md).
+present. See [PROGRESS §§39–40](PROGRESS.md).
 
-**Still owed from this phase:** `winfixup`, a fault taken *during* a spill or fill — the one window
-case the machinery does not survive; syscall restart, which is implemented but needs a signal arriving
-while a thread is blocked in an interruptible call; and context id recycling, which needs 8191
-simultaneously live teams to reach.
+**Both halves of the exit criterion are now met.** A dynamically linked program runs: the kernel loads
+`runtime_loader`, which relocates itself, loads and relocates `libroot.so` and `libgcc_s.so.1`,
+resolves the program's imports, runs the initialisers and calls `main()`, which returns through
+`snprintf`, `printf`, `strlen` and `fflush`. That took six fixes — three in the trap entry, one in the
+unhandled-trap path, thread local storage, and a `crti.S` that declared `_init` without defining it.
+See [PROGRESS §51](PROGRESS.md), which also corrects §46.
+
+`winfixup` is done and runs six times a boot, one per 8 KB of stack the test recurses across.
+
+**Still owed from this phase:** syscall restart, which is implemented but needs a signal arriving while
+a thread is blocked in an interruptible call — now *testable*, because arranging that needs a userland
+and there is one; the fill side of `winfixup`, which the spill side's fix should cover and nothing has
+exercised; and context id recycling, which needs 8191 simultaneously live teams to reach.
 
 **The design for the rest of it is written down separately**, in
 [USERSPACE_DESIGN.md](USERSPACE_DESIGN.md), because it is the one subsystem where the reasoning is
@@ -600,12 +608,19 @@ What actually stood between DMA and working was a byte swap applied twice — se
 [PROGRESS §31](PROGRESS.md), which also corrects the mechanism this plan previously attributed the
 first DMA attempt's memory corruption to.
 
-So what remains of this phase is the other half of its exit criterion, `hme`, plus `winfixup` — a
-fault taken during a register-window spill or fill, which the window machinery does not yet survive and
-which every user program is one unmapped stack page away from — plus one deliberate omission: the
-CMD646's own interrupt latch at configuration offset 0x50 is never cleared, costing one unhandled
-interrupt per transfer. That is a chip-specific register and belongs in a chip-specific bus driver next
-to `silicon_image_3112`, not in shared code — PROGRESS §31 records what it wants.
+`hme` attaches, finds its station address in the machine's IDPROM, and negotiates 100baseTX-FDX. **No
+packet has moved through it yet** — the other half of this phase's exit criterion is the whole of what
+remains, and it is now unblocked: assigning an address to an interface needs a userland, and Phase 6
+finished producing one.
+
+One deliberate omission stands: the CMD646's own interrupt latch is never cleared, costing one
+unhandled interrupt per transfer. It is a chip-specific register and belongs in a chip-specific bus
+driver next to `silicon_image_3112`, not in shared code — PROGRESS §31 records what it wants, and the
+datasheet is on disk with the exact recipe (`RefDocs/Storage/IDE/CMD_PCI0646_PCI-IDE_Spec_Rev1.2.pdf`):
+the primary channel's status is CFR bit 2 at configuration offset `0x50` and the secondary's is
+ARTTIM23 bit 4 at `0x57`, both cleared by being read. In native mode both channels multiplex onto
+INTA, so a handler reads both and, if neither is set, the interrupt belonged to another device sharing
+the pin.
 
 `hme`'s route is settled and does not need writing from the datasheets after all. Haiku carries an
 `openbsd_network` compatibility layer with an in-tree precedent (`rtl8125`), and OpenBSD's `hme.c`,
@@ -778,19 +793,30 @@ Branching follows the existing convention: never push to `main` directly; releas
 
 ## 10. Immediate next actions
 
-1. **Fork Haiku into `SPARC/src`**, add `upstream` as a remote, enable `git rerere`, and commit
-   this plan and the matrix.
-2. ~~Install `qemu-system-sparc`~~ — **already present and verified booting to `ok`.** ✅
-3. **Build the cross toolchain and `haiku_loader.openfirmware`**, and get it to print its banner
-   over serial in QEMU. This is Phase 0's exit criterion and validates the entire toolchain in
-   one shot.
-4. **Prove the gdb stub** attaches and breaks on `arch_start_kernel`.
+Phases 0 through 6 are done. What follows closes Phase 7. The detailed staging, and the reasoning
+behind the order, is in [PROGRESS §52](PROGRESS.md).
+
+1. **Give the port a `flush`.** `arch_cpu_sync_icache()` and both memory barriers are empty bodies,
+   and §5.5 named them as the standing example of what QEMU will never punish. The obligation is now
+   concrete rather than theoretical: `R_SPARC_JMP_SLOT` writes *instructions* into a PLT entry, in
+   both the runtime loader and the kernel's own ELF loader, and UltraSPARC does not keep its
+   instruction cache coherent with stores. Implement the three, then call `sync_icache` from both
+   relocators.
+2. **Answer a ping**, which is the rest of Phase 7's exit criterion and is now unblocked — assigning
+   an address to an interface needs a userland, and there is one. Staged so that each step is
+   observable: capture every frame to a pcap first, then the missing protocol modules, then interface
+   configuration from a small userland program, then ARP, then ICMP. Expect big-endian bugs; this is
+   the first time Haiku's network stack has run on a big-endian machine.
+3. **Clear the CMD646's interrupt latch**, in a chip-specific ATA bus driver beside
+   `silicon_image_3112`. Fully specified by the datasheet on disk — see Phase 7 above.
+4. **Test syscall restart**, which Phase 6 implemented and nothing has exercised. A userland program
+   that blocks in an interruptible call and takes a signal is now something this port can run.
 5. **Source a Sun Blade 150** — *in parallel, blocking nothing* (see §5.5). An Ultra 10 when one
    appears at a sensible price. Order a null-modem serial cable and USB-serial adapter alongside.
 6. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
 
-Phase 1 begins once items 1–4 are green. Items 5–6 run alongside and gate nothing before
-Phase 7.
+Items 5–6 gate nothing before Phase 9, and item 1 is the one that most wants hardware to prove it —
+which is the argument for writing it now and having it already in place when a machine arrives.
 
 ---
 
@@ -804,6 +830,15 @@ datasheets. Itemised with coverage assessment in the [matrix §7](HARDWARE_MATRI
 **Donor source trees** (local) — `/home/kevin/Code/OpenBSD/sys/arch/sparc64/`,
 `/home/kevin/Code/NetBSD/sys/arch/sparc64/`, `/home/kevin/Code/FreeBSD`,
 `/home/kevin/Code/Linux/linux` *(reference only — GPL)*.
+
+**One documented gap.** The corpus has no **SPARC V9 psABI** — the ELF supplement that specifies PLT
+entry layout, relocation semantics and the `flush` obligation after writing code. Everything this port
+does with relocations was reasoned from the architecture manual and from the linker's output, which
+worked but left two limits in `R_SPARC_JMP_SLOT` that were only found by reading someone else's
+implementation. The working substitute is NetBSD's, which is BSD-licensed and therefore portable
+rather than merely readable: `NetBSD/sys/arch/sparc64/include/elf_support.h` is the authoritative
+branch writer, and `NetBSD/libexec/ld.elf_so/arch/sparc64/mdreloc.c` is the relocation loop around it.
+Worth sourcing the specification anyway.
 
 **Haiku** — [Port status](https://www.haiku-os.org/guides/building/port_status/) ·
 [The SPARC port](https://www.haiku-os.org/docs/develop/kernel/arch/sparc/overview.html) ·

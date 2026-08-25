@@ -4230,3 +4230,124 @@ recording as plainly as the fixes are.
 Still open: syscall restart and winfixup's fill side are untested, context-id recycling is untested,
 and the CMD646 wants a driver of its own to clear the chip's interrupt latch. Phase 7's exit criterion
 is still to answer a ping.
+
+
+## 52. Where the port stands, what the corpus says, and the plan for next session
+
+A review rather than a session of work. Three things: what is actually done, what reading the reference
+material changed, and what to do next.
+
+### Where it stands
+
+| Phase | | |
+| --- | --- | --- |
+| 0 Environment | done | |
+| 1 Bootable media | done | |
+| 2 MMU and trap table | done | the gate |
+| 3 Context switch | done | |
+| 4 Timer and interrupts | done | |
+| 5 KDL and backtraces | done | |
+| 6 Userspace | **done** | both halves of the exit criterion, as of §51 |
+| 7 Device stack | **half** | mounts BFS from a real disk; has never moved a packet |
+| 8 Desktop | not started | needs hardware |
+| 9 Hardware validation | blocked | no machine yet |
+
+Phase 6 closing matters more than one row suggests. Its exit criterion — "a statically linked
+hello-world runs to completion and exits cleanly; then a dynamically linked one" — was the last thing
+gating a *userland*, and a userland is what several later tasks quietly depend on. Assigning an address
+to a network interface is one of them, which is why Phase 7's remaining half was not really reachable
+until yesterday.
+
+Carried, and not forgotten: syscall restart is implemented and untested, `winfixup`'s fill side is
+implemented and untested, and context id recycling needs 8191 live teams to reach. The first of those
+is now *testable* for the same reason — arranging a signal to arrive during a blocking call needs a
+program, and this port can run one.
+
+### What the reference material changed
+
+Three findings, one of which corrects code committed yesterday.
+
+**The CMD646 datasheet is on disk, and it specifies the omission exactly.** Phase 7 carries one
+deliberate gap: the chip's own interrupt latch is never cleared, so every transfer costs an unhandled
+interrupt. `RefDocs/Storage/IDE/CMD_PCI0646_PCI-IDE_Spec_Rev1.2.pdf` gives the whole recipe — the
+primary channel's status is CFR bit 2 at configuration offset `0x50`, the secondary's is ARTTIM23 bit 4
+at `0x57`, **both cleared by being read**, and in native mode both channels multiplex onto INTA so a
+handler reads both and treats "neither" as an interrupt belonging to some other device on the pin. That
+turns a someday item into a specified one.
+
+**NetBSD's sparc64 runtime loader validates our `R_SPARC_JMP_SLOT` and finds two limits in it.**
+`NetBSD/sys/arch/sparc64/include/elf_support.h` is the authoritative version of what §51's PLT code
+does, and it is BSD-licensed, so it is portable rather than merely readable. Comparing:
+
+| | ours | NetBSD's |
+| --- | --- | --- |
+| Encodings | one — `mov %o7,%g1; call; mov %g1,%o7`, and an error beyond ±2 GB | four, by range: `ba,a` within ±8 MB, `sethi/jmp` for a 32-bit address, `sethi/xor/jmp` for the top 32-bit range, then ours |
+| Written at | entry word 0, clobbering the `sethi` | entry word 1, leaving it | 
+| Write order | ascending | **first word last**, so the entry is never half-valid |
+| `r_addend != 0` | not handled | a *data* pointer update — PLT index ≥ 32768 |
+| Instruction cache | not flushed | `iflush` after every store |
+
+Neither limit can be reached today: Haiku's user address space is under 2 GB, and no library here has
+32768 PLT entries. Both are worth writing down rather than discovering later. The write order is only
+safe because our binding is eager and nothing is executing the entry while it changes; that is a
+property of the design, not of the code, and the code should say so.
+
+The flush is not a limit, it is a bug, and it is the one the plan already warned about — §5.5 names
+`arch_cpu_sync_icache()` as the standing example of what QEMU will never punish. It is an empty body,
+and now there is code that needs it.
+
+**One gap: the corpus has no SPARC V9 psABI.** Everything this port does with relocations was reasoned
+from the architecture manual and the linker's output. That worked, and it is also why the two limits
+above were found by reading someone else's implementation rather than a specification. Recorded in the
+plan's §11 with the NetBSD substitute.
+
+### The plan
+
+Ordered so that the cheap correctness work happens while its subject matter is fresh, and the phase
+gate gets the bulk of the session.
+
+**1. Give the port a `flush`.** Implement `arch_cpu_sync_icache()` and both memory barriers, then call
+`sync_icache` from the `R_SPARC_JMP_SLOT` paths in *both* relocators — the runtime loader's and the
+kernel's ELF loader. Small, and the argument for doing it now rather than when hardware arrives is that
+"a few at a time from Phase 1 onward rather than one pile at Phase 7" was the plan's own advice and we
+are at Phase 7. While there: write the PLT entry's first word last, and record the two limits in the
+comment.
+
+Not verifiable on QEMU. That is the point of it.
+
+**2. Answer a ping** — the rest of Phase 7. Staged so that every step is observable, because the
+alternative is inferring what the wire did:
+
+| | | proves |
+| --- | --- | --- |
+| a | QEMU `-netdev` plus `-object filter-dump`, so every frame lands in a pcap | nothing yet — it is the instrument |
+| b | build and install `ipv4`, `icmp` and `arp`; the image has only `stack`, `ethernet_frame` and `devices/ethernet` | they compile for a 64-bit big-endian target at all |
+| c | a small program in the `hellodyn` mould that assigns an address to `/dev/net/hme/0` | the userland reaches the stack |
+| d | an ARP request appears in the pcap, well formed | hme transmits — never yet demonstrated |
+| e | the reply is accepted | hme receives, and the interrupt path works under load |
+| f | ICMP echo out, echo reply in and delivered | **the exit criterion** |
+
+Expect trouble at (b) and after. This is the first time Haiku's network stack has run on a big-endian
+machine, and the bugs that produces — checksums, header field access, anything that reads a wire
+format as a number — are exactly the class that has cost this port the most so far. The pcap exists so
+that they are read rather than guessed at: the rule from the rtl8814au work applies unchanged, which
+is that "what the capture shows" is a claim to be earned by printing the bytes.
+
+**3. Clear the CMD646's interrupt latch**, in a chip-specific ATA bus driver beside
+`silicon_image_3112`. Fully specified above. Self-contained, and a reasonable thing to fall back to if
+(2) turns into a long endianness hunt and needs a break.
+
+**4. Test syscall restart**, by extending the userland rig: block in an interruptible call, deliver a
+signal, check the call resumes rather than returning an error. Cheap now that the rig can be a real
+program.
+
+### What is not in the plan, and why
+
+**The real Haiku image.** Everything so far runs from a BFS volume this port assembles by hand — a
+kernel, its add-ons, and one test program installed where the launch daemon belongs. There is no
+package, no `launch_daemon`, no registrar. Getting the genuine image built is the gate on everything
+in Phase 8 and it is a substantial piece of work in its own right, so it should start when it can have
+a session to itself rather than as the tail of one.
+
+**Hardware-only work.** The ALi M5229, the framebuffer path on a real monitor, USB HID for the Blade
+150's keyboard. All of Phase 8, and the reason §5.5 says to buy early regardless.
