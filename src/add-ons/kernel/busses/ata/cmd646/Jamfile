@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons kernel busses ata cmd646 ;
+
+UsePrivateHeaders kernel ;
+UsePrivateHeaders drivers ;
+
+KernelAddon cmd646 :
+	cmd646.c
+	;

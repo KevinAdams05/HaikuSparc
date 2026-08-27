@@ -2559,6 +2559,12 @@ this is left alone on purpose, because the fix does not belong in `generic_ide_p
 interrupt register is what a chip-specific bus driver is for, alongside `silicon_image_3112` and the
 others in `busses/ata/`. Noted as its own piece of work rather than smuggled into shared code.
 
+> **Corrected in [§54](#54-a-defect-that-was-not-one).** The mechanism above is wrong. Reading CFR is
+> indeed what clears the latch — the datasheet and Linux agree, and the driver written for it is in
+> the tree — but the extra unhandled interrupts have nothing to do with it. They are all on the *idle*
+> channel, whose handler shares a vector with the active one and correctly reports that the interrupt
+> was not its own. Measured: `ch0 0/90 unhandled, ch1 90/102`. There was no defect to fix.
+
 ### Where the phase stands
 
 The bus-manager phase is done. PCI configuration space, resource ranges, interrupt routing, mondo

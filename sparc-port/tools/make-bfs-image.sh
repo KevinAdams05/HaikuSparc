@@ -48,6 +48,7 @@ addon_paths=(
 	bus_managers/pci
 	bus_managers/ata
 	bus_managers/scsi
+	busses/ata/cmd646
 	busses/ata/generic_ide_pci
 	generic/ata_adapter
 	generic/dpc
