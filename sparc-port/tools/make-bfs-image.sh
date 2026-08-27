@@ -85,10 +85,21 @@ declare -A ondemand_dev=(
 #   pci_unreserve_device(1, 1, 1, hme)
 #
 # which reads like a driver problem and is a missing file.
+#
+# The three protocol modules below are what turns a link into an address. The
+# stack loads them by name when something asks -- ipv4 when a socket is opened
+# in that family, arp when an ethernet interface needs to turn an address into a
+# station address, icmp when a datagram wants an error back or a ping wants an
+# answer -- so a missing one presents as a socket call failing rather than as
+# anything about a module.
 module_paths=(
 	network/stack
 	network/datalink_protocols/ethernet_frame
+	network/datalink_protocols/arp
 	network/devices/ethernet
+	network/protocols/ipv4
+	network/protocols/icmp
+	network/protocols/udp
 )
 
 output=bfs.img
@@ -119,6 +130,9 @@ Usage: make-bfs-image.sh [options]
                   the way to test the kernel, this one puts it all back.
                   Mutually exclusive with --user-test, which installs a stand-in
                   where the real runtime_loader goes.
+  --net-test      as --dynamic-test, but installs sparc-port/tools/hellonet --
+                  which brings up the hme interface and pings QEMU's gateway.
+                  Needs the network modules, which the image always carries.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
                   framebuffer blue screen where nothing can read it.
@@ -135,6 +149,12 @@ EOF
 user_test=${user_test:-0}
 dynamic_test=${dynamic_test:-0}
 
+# Which program --dynamic-test installs where the launch daemon goes. They are
+# built and linked identically; what differs is only what they exercise once the
+# loader has done its work, so there is one recipe below rather than one per
+# program.
+dynamic_program=${dynamic_program:-hellodyn}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--kernel)  kernel="$2"; shift 2 ;;
@@ -145,6 +165,7 @@ while [[ $# -gt 0 ]]; do
 		--serial-debug) serial_debug=1; shift ;;
 		--user-test) user_test=1; shift ;;
 		--dynamic-test) dynamic_test=1; shift ;;
+		--net-test) dynamic_test=1; dynamic_program=hellonet; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -339,15 +360,15 @@ if [[ $dynamic_test -eq 1 ]]; then
 		fi
 	done
 
-	hellodyn_binary="$(dirname "$output")/hellodyn"
+	dynamic_binary="$(dirname "$output")/$dynamic_program"
 
 	# Haiku's headers are not in the cross compiler's sysroot, so they are named
 	# here the same way the build names them. The link order is the one
 	# ArchitectureRules calls HAIKU_EXECUTABLE_BEGIN_GLUE_CODE and
 	# HAIKU_EXECUTABLE_END_GLUE_CODE, and -soname=_APP_ is what marks an image as
 	# an application rather than a library.
-	"$cc" -c -o "$hellodyn_binary.o" \
-		"$repo/sparc-port/tools/hellodyn/hellodyn.c" \
+	"$cc" -c -o "$dynamic_binary.o" \
+		"$repo/sparc-port/tools/$dynamic_program/$dynamic_program.c" \
 		-I"$repo/headers" -I"$repo/headers/os" -I"$repo/headers/os/support" \
 		-I"$repo/headers/os/kernel" -I"$repo/headers/posix"
 
@@ -355,10 +376,10 @@ if [[ $dynamic_test -eq 1 ]]; then
 	# sparc binary: without it the linker leaves 1 MB between text and data,
 	# and runtime_loader's map_image() refuses the image as Bad data.
 	"$cc" -nostdlib -Xlinker -soname=_APP_ \
-		-Xlinker -z -Xlinker max-page-size=0x2000 -o "$hellodyn_binary" \
+		-Xlinker -z -Xlinker max-page-size=0x2000 -o "$dynamic_binary" \
 		"$glue/arch/sparc/crti.o" "$gcc_dir/crtbeginS.o" \
 		"$glue/start_dyn.o" "$glue/init_term_dyn.o" \
-		"$hellodyn_binary.o" \
+		"$dynamic_binary.o" \
 		-L"$libroot_dir" -lroot \
 		"$gcc_dir/crtendS.o" "$glue/arch/sparc/crtn.o"
 
@@ -372,13 +393,13 @@ if [[ $dynamic_test -eq 1 ]]; then
 	# routines the compiler emits calls to -- and runtime_loader resolves that by
 	# name at load time, so it has to be on the volume beside it.
 	shell_command cp -f ":$libgcc" /myfs/system/lib/libgcc_s.so.1
-	shell_command cp -f ":$hellodyn_binary" \
+	shell_command cp -f ":$dynamic_binary" \
 		/myfs/system/servers/launch_daemon
 
 	echo "  system/runtime_loader          $(stat -c%s "$loader") bytes"
 	echo "  system/lib/libroot.so          $(stat -c%s "$libroot_dir/libroot.so") bytes"
 	echo "  system/lib/libgcc_s.so.1       $(stat -c%s "$libgcc") bytes"
-	echo "  system/servers/launch_daemon   $(stat -c%s "$hellodyn_binary") bytes (hellodyn)"
+	echo "  system/servers/launch_daemon   $(stat -c%s "$dynamic_binary") bytes ($dynamic_program)"
 fi
 
 if [[ $user_test -eq 1 ]]; then

@@ -45,6 +45,7 @@ logfile=
 use_gdb=0
 gdb_port=1234
 tftp_dir=
+pcap=
 serial_socket=
 monitor_socket=
 extra=()
@@ -65,6 +66,9 @@ Usage: qemu-sun4u.sh [options] [-- extra qemu args]
   --monitor SOCK     Put the QEMU monitor on a Unix socket. Worth having even
                      when nothing is wrong -- see the note below.
   --kernel FILE      Boot an ELF directly, bypassing boot media (early bring-up)
+  --pcap FILE        Write every frame the NIC sees to FILE, in pcap format.
+                     Costs nothing when the machine is idle and is the only way
+                     to find out what the driver actually put on the wire.
   --tftp DIR         Serve DIR over the built-in TFTP server, for netboot
   --gdb [PORT]       Freeze at reset and wait for gdb (default port 1234)
   --timeout SECS     Kill after SECS, default 60. 0 disables.
@@ -88,6 +92,7 @@ while [[ $# -gt 0 ]]; do
 		--cdrom)   cdrom="$2"; shift 2 ;;
 		--kernel)  kernel="$2"; shift 2 ;;
 		--tftp)    tftp_dir="$2"; shift 2 ;;
+		--pcap)    pcap="$2"; shift 2 ;;
 		--timeout) timeout_secs="$2"; shift 2 ;;
 		--log)     logfile="$2"; shift 2 ;;
 		--serial)  serial_socket="$2"; shift 2 ;;
@@ -124,9 +129,22 @@ args=(
 # "no slot/function available". sunhme is what a real Ultra 10 carries, so the
 # driver we eventually write against it is not throwaway. The user-mode backend
 # also gives us a built-in TFTP server for netboot testing.
-nic="user,model=sunhme"
+#
+# Given an explicit id so that a filter can name it. `-nic` accepts one, and
+# without it QEMU picks the id itself and -object filter-dump has nothing to
+# attach to.
+nic="user,id=net0,model=sunhme"
 [[ -n "$tftp_dir" ]] && nic+=",tftp=${tftp_dir}"
 args+=(-nic "$nic")
+
+# Every frame, in and out, to a pcap. The driver work this port has left is the
+# kind where "what the capture shows" has to be a decoded fact rather than an
+# inference from whether something worked, and a capture the host writes is the
+# one piece of evidence the guest cannot be wrong about.
+if [[ -n "$pcap" ]]; then
+	rm -f "$pcap"
+	args+=(-object "filter-dump,id=dump0,netdev=net0,file=${pcap}")
+fi
 
 # Explicit indices, because which IDE slot a drive lands in decides which device
 # the firmware and the kernel see it as: index 0 and 1 are channel 0's master and

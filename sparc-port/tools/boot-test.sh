@@ -23,6 +23,7 @@
 #   TAG.txt     the same, stripped -- this is the one to grep
 #   qemu-TAG.log        QEMU's own stderr, which is where "Failed to get write
 #                       lock" appears when a previous run is still alive
+#   TAG.pcap    every frame the NIC saw, in and out
 #   loader-TAG.img, bfs-TAG.img     the media, kept for post-mortems
 #   mon-TAG.sock        the monitor, live while the guest is
 #
@@ -85,6 +86,7 @@ rm -f "$socket" "$monitor" "$log"
 	--disk "$loader" --disk "$bfs" \
 	--disk "$work/filler0.img" --disk "$work/filler1.img" \
 	--serial "$socket" --monitor "$monitor" \
+	--pcap "$work/$tag.pcap" \
 	--timeout "${BOOT_QEMU_TIMEOUT:-0}" \
 	-- -fda "$work/blank.fd" \
 	</dev/null >"$work/qemu-$tag.log" 2>&1 &
@@ -134,3 +136,14 @@ printf '  %s panic(s), %s winfixup(s), %s line(s)\n' \
 	"$(grep -c 'PANIC' "$text" || true)" \
 	"$(grep -c 'winfixup' "$text" || true)" \
 	"$(grep -c '' "$text" || true)"
+
+# A pcap with only its 24-byte header means the NIC transmitted nothing, which is
+# worth saying out loud rather than leaving to be discovered by an empty decode.
+if [[ -f "$work/$tag.pcap" ]]; then
+	pcap_size=$(stat -c%s "$work/$tag.pcap")
+	if [[ "$pcap_size" -le 24 ]]; then
+		printf '  %s: no frames\n' "$work/$tag.pcap"
+	else
+		printf '  %s: %s bytes captured\n' "$work/$tag.pcap" "$pcap_size"
+	fi
+fi
