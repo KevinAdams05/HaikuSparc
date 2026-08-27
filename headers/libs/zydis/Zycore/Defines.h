@@ -147,6 +147,10 @@
 #   define ZYAN_PPC
 #elif defined(__riscv) && __riscv_xlen == 64
 #   define ZYAN_RISCV64
+#elif defined(__sparc__) && defined(__arch64__)
+#   define ZYAN_SPARC64
+#elif defined(__sparc__)
+#   define ZYAN_SPARC
 #else
 #   error "Unsupported architecture detected"
 #endif
