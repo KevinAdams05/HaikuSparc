@@ -266,10 +266,16 @@ getnetanswer(res_state res, querybuf *answer, int anslen, int net_i)
 			break;
 		}
 		net_entry.n_aliases++;
-#if (defined(__sparc__) && defined(_LP64)) ||		\
+/* Not on Haiku: __n_pad0 is a NetBSD ABI artifact. Its struct netent carries
+ * explicit padding on these platforms; Haiku's does not have the member at all,
+ * and does not need it -- two pointers, an int and an in_addr_t pack without a
+ * hole on LP64. The condition is true on exactly one Haiku architecture, 64-bit
+ * SPARC, which is why this only ever failed to compile there. */
+#if !defined(__HAIKU__) &&				\
+    ((defined(__sparc__) && defined(_LP64)) ||		\
     defined(__alpha__) ||				\
     (defined(__i386__) && defined(_LP64)) ||		\
-    (defined(__sh__) && defined(_LP64))
+    (defined(__sh__) && defined(_LP64)))
 		net_entry.__n_pad0 = 0;
 #endif
 		return &net_entry;
@@ -626,10 +632,16 @@ _ypnetent(char *line)
 	if (p != NULL)
 		*p++ = '\0';
 	net_entry.n_net = inet_network(cp);
-#if (defined(__sparc__) && defined(_LP64)) ||		\
+/* Not on Haiku: __n_pad0 is a NetBSD ABI artifact. Its struct netent carries
+ * explicit padding on these platforms; Haiku's does not have the member at all,
+ * and does not need it -- two pointers, an int and an in_addr_t pack without a
+ * hole on LP64. The condition is true on exactly one Haiku architecture, 64-bit
+ * SPARC, which is why this only ever failed to compile there. */
+#if !defined(__HAIKU__) &&				\
+    ((defined(__sparc__) && defined(_LP64)) ||		\
     defined(__alpha__) ||				\
     (defined(__i386__) && defined(_LP64)) ||		\
-    (defined(__sh__) && defined(_LP64))
+    (defined(__sh__) && defined(_LP64)))
 	net_entry.__n_pad0 = 0;
 #endif
 	net_entry.n_addrtype = AF_INET;

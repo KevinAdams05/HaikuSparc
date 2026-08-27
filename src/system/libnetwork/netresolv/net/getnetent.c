@@ -133,10 +133,16 @@ getnetent(void)
 			return (NULL);
 	}
 
-#if (defined(__sparc__) && defined(_LP64)) ||		\
+/* Not on Haiku: __n_pad0 is a NetBSD ABI artifact. Its struct netent carries
+ * explicit padding on these platforms; Haiku's does not have the member at all,
+ * and does not need it -- two pointers, an int and an in_addr_t pack without a
+ * hole on LP64. The condition is true on exactly one Haiku architecture, 64-bit
+ * SPARC, which is why this only ever failed to compile there. */
+#if !defined(__HAIKU__) &&				\
+    ((defined(__sparc__) && defined(_LP64)) ||		\
     defined(__alpha__) ||				\
     (defined(__i386__) && defined(_LP64)) ||		\
-    (defined(__sh__) && defined(_LP64))
+    (defined(__sh__) && defined(_LP64)))
 	net.__n_pad0 = 0;
 #endif
 again:
