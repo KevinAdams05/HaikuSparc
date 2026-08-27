@@ -134,6 +134,9 @@ Usage: make-bfs-image.sh [options]
   --net-test      as --dynamic-test, but installs sparc-port/tools/hellonet --
                   which brings up the hme interface and pings QEMU's gateway.
                   Needs the network modules, which the image always carries.
+  --sig-test      as --dynamic-test, but installs sparc-port/tools/hellosig --
+                  which checks that a system call interrupted by a signal is
+                  restarted rather than failed.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
                   framebuffer blue screen where nothing can read it.
@@ -167,6 +170,7 @@ while [[ $# -gt 0 ]]; do
 		--user-test) user_test=1; shift ;;
 		--dynamic-test) dynamic_test=1; shift ;;
 		--net-test) dynamic_test=1; dynamic_program=hellonet; shift ;;
+		--sig-test) dynamic_test=1; dynamic_program=hellosig; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -371,7 +375,8 @@ if [[ $dynamic_test -eq 1 ]]; then
 	"$cc" -c -o "$dynamic_binary.o" \
 		"$repo/sparc-port/tools/$dynamic_program/$dynamic_program.c" \
 		-I"$repo/headers" -I"$repo/headers/os" -I"$repo/headers/os/support" \
-		-I"$repo/headers/os/kernel" -I"$repo/headers/posix"
+		-I"$repo/headers/os/kernel" -I"$repo/headers/os/storage" \
+		-I"$repo/headers/posix"
 
 	# -z max-page-size matches what ArchitectureRules now gives every other
 	# sparc binary: without it the linker leaves 1 MB between text and data,
