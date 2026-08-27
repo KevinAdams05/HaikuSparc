@@ -105,6 +105,8 @@ main(int argc, char** argv)
 	sem_id semaphore;
 	bigtime_t start;
 	bigtime_t elapsed;
+	bigtime_t userStart;
+	bigtime_t userElapsed;
 	status_t status;
 
 	say("hellosig: start");
@@ -126,6 +128,7 @@ main(int argc, char** argv)
 	say("hellosig: alarm in %dus, then a %dus wait", ALARM_DELAY, WAIT_TIMEOUT);
 
 	start = _kern_system_time();
+	userStart = system_time();
 	set_alarm(ALARM_DELAY, B_ONE_SHOT_RELATIVE_ALARM);
 
 	/*	B_CAN_INTERRUPT is what makes this the interesting case. Without it the
@@ -135,11 +138,20 @@ main(int argc, char** argv)
 	status = acquire_sem_etc(semaphore, 1,
 		B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT, WAIT_TIMEOUT);
 	elapsed = _kern_system_time() - start;
+	userElapsed = system_time() - userStart;
 
 	delete_sem(semaphore);
 
 	say("hellosig: handler ran %d time(s), wait returned %s after %dus",
 		(int)sHandlerRuns, strerror(status), (int)elapsed);
+
+	/*	The same interval measured through libroot, which reads the cycle counter
+		itself instead of asking the kernel. The two should agree to well within
+		the rounding in the conversion factor; a zero here means the commpage
+		clock is not working, which is how it was found.
+	 */
+	say("hellosig: libroot system_time() says %dus over the same wait",
+		(int)(userElapsed));
 
 	if (sHandlerRuns == 0) {
 		say("hellosig: the alarm never arrived -- nothing was tested");

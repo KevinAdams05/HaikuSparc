@@ -223,6 +223,50 @@ arch_timer_clear_hardware_timer()
 }
 
 
+/*!	Cycles per second, for the one other file that needs it.
+
+	arch_rtc_init() turns it into the factor userspace multiplies %TICK by, and
+	nothing else outside this file has any business with it -- which is why it is
+	an accessor rather than a shared variable.
+*/
+uint64
+sparc_clock_frequency()
+{
+	return sClockFrequency;
+}
+
+
+/*!	Lets userspace read %TICK.
+
+	Bit 63 is NPT, and "if set, an attempt by non-privileged software to read the
+	TICK register causes a privileged_action trap" -- and it "is set ... after
+	both a Power-On-Reset (POR) and an Externally Initiated Reset (XIR)"
+	(UltraSPARC-IIi manual TABLE 14-1, printed p.186). So out of reset the
+	register is privileged, and stays that way until something clears the bit.
+
+	Which is why libroot's system_time() could not read it and shipped a fake
+	counter instead. The whole of that file was a placeholder: an incrementing
+	static, multiplied by a conversion factor nothing ever set, which returned
+	zero forever.
+
+	Read-modify-write rather than a plain store, because bits 62:0 are the counter
+	and writing zero to them would restart time. The few cycles that pass between
+	the read and the write are lost from the count, which is the only cost and is
+	measured in nanoseconds.
+
+	Privileged software only, per the same table -- so this belongs here and not
+	in a commpage routine.
+*/
+static void
+sparc_allow_user_tick_reads()
+{
+	uint64 tick;
+	asm volatile("rdpr %%tick, %0" : "=r"(tick));
+	tick &= TICK_COUNTER_MASK;
+	asm volatile("wrpr %0, 0, %%tick" : : "r"(tick));
+}
+
+
 int
 arch_init_timer(kernel_args *args)
 {
@@ -237,6 +281,7 @@ arch_init_timer(kernel_args *args)
 		sClockFrequency, sClockFrequency / 1000000);
 
 	sparc_verify_system_time();
+	sparc_allow_user_tick_reads();
 
 	return B_OK;
 }

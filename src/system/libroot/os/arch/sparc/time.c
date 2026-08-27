@@ -21,7 +21,7 @@ __arch_init_time(struct real_time_data *data, bool setDefaults)
 		sRealTimeData->system_time_conversion_factor = 1000000000LL;
 	}
 
-	// __sparc_setup_system_time(&sRealTimeData->system_time_conversion_factor);
+	__sparc_setup_system_time(&sRealTimeData->system_time_conversion_factor);
 }
 
 

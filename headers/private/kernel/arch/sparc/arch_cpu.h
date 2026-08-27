@@ -48,4 +48,11 @@ arch_cpu_idle(void)
 }
 #endif
 
+/*	Hands libroot's system_time() the factor the kernel worked out from the CPU's
+	clock frequency. Declared here for the same reason ppc declares its own in
+	the matching header: the definition is in libroot and the caller is in
+	libroot, but the prototype has to be somewhere both can see.
+*/
+void __sparc_setup_system_time(vuint32 *cvFactor);
+
 #endif	/* _KERNEL_ARCH_SPARC_CPU_H */
