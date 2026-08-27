@@ -10,9 +10,37 @@
 
 #include <KernelExport.h>
 
+#include <arch/cpu.h>
 #include <elf_priv.h>
 #include <boot/elf.h>
 #include <arch/elf.h>
+
+
+/*!	Makes a procedure linkage table entry this file just wrote executable.
+
+	SPARC's PLT is code, so filling in an `R_SPARC_JMP_SLOT` is a store to
+	instruction space -- and UltraSPARC does not keep its instruction cache
+	coherent with stores. See arch_cpu_sync_icache(), which is the whole
+	explanation and, in the kernel, the implementation.
+
+	The boot loader has no arch_cpu.cpp -- `src/system/boot/arch/sparc` is a
+	Jamfile and nothing else -- so it gets the same three instructions inline
+	rather than a link error. It needs them for the same reason and on the same
+	silicon: it is what relocates the kernel's add-ons.
+*/
+static inline void
+sync_plt_entry(addr_t address, size_t length)
+{
+#ifdef _BOOT_MODE
+	asm volatile("membar #StoreStore" ::: "memory");
+	for (addr_t doubleword = address & ~(addr_t)7; doubleword < address + length;
+			doubleword += 8) {
+		asm volatile("flush %0" :: "r"(doubleword) : "memory");
+	}
+#else
+	arch_cpu_sync_icache((void*)address, length);
+#endif
+}
 
 
 //#define TRACE_ARCH_ELF
@@ -332,10 +360,20 @@ arch_elf_relocate_rela(struct elf_image_info *image,
 					// small enough, but it probably isn't.
 					// So, we store o7 in g1 before the call, and restore it
 					// in the branch delay slot. Crazy, but it works!
-					instructions[0] = 0x01000000; // NOP to preserve the alignment?
-					instructions[1] = 0x8210000f; // MOV %o7, %g1
-					instructions[2] = 0x40000000 | ((jumpOffset >> 2) & 0x3fffffff);
+					//
+					// Written back to front, so that the word the entry is
+					// entered at is the last one to change. Every intermediate
+					// state then still runs the *old* entry rather than half of
+					// each -- which costs nothing here, where binding happens
+					// before anything can call through it, and is the difference
+					// between working and not if this ever becomes lazy.
+					// NetBSD's sparc64 loader orders it the same way and says so.
 					instructions[3] = 0x9e100001; // MOV %g1, %o7
+					instructions[2] = 0x40000000 | ((jumpOffset >> 2) & 0x3fffffff);
+					instructions[1] = 0x8210000f; // MOV %o7, %g1
+					instructions[0] = 0x01000000; // NOP to preserve the alignment?
+
+					sync_plt_entry(P, 4 * sizeof(uint32));
 				}
 				break;
 			}

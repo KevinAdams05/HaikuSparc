@@ -364,12 +364,34 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 					return B_BAD_DATA;
 				}
 
+				/*	Written back to front, so the word the entry is entered at
+					is the last one to change. Every intermediate state then
+					still runs the *old* entry rather than half of each. That
+					costs nothing here -- binding is eager, and nothing can call
+					through the entry while this runs -- and it is the difference
+					between working and not if it ever becomes lazy. NetBSD's
+					sparc64 loader orders it the same way and says why.
+				 */
 				uint32* instructions = (uint32*)P;
-				instructions[0] = 0x01000000;	// nop
-				instructions[1] = 0x8210000f;	// mov %o7, %g1
+				instructions[3] = 0x9e100001;	// mov %g1, %o7
 				instructions[2] = 0x40000000
 					| ((jumpOffset >> 2) & 0x3fffffff);	// call
-				instructions[3] = 0x9e100001;	// mov %g1, %o7
+				instructions[1] = 0x8210000f;	// mov %o7, %g1
+				instructions[0] = 0x01000000;	// nop
+
+				/*	And made visible to instruction fetches, because UltraSPARC
+					does not keep its instruction cache coherent with stores.
+					`flush` operates on at least the doubleword containing its
+					address, so two of them cover the four words -- and the
+					MEMBAR before them is what makes the stores visible system
+					wide (UltraSPARC-IIi manual 14.4.4, printed p.196).
+
+					Inline rather than through a helper because runtime_loader
+					links against neither the kernel nor libroot.
+				 */
+				asm volatile("membar #StoreStore" ::: "memory");
+				asm volatile("flush %0" :: "r"(P) : "memory");
+				asm volatile("flush %0" :: "r"(P + 8) : "memory");
 				break;
 			}
 
@@ -415,18 +437,29 @@ arch_relocate_image(image_t *rootImage, image_t *image,
 			return status;
 	}
 
-	/*	The instruction cache is deliberately not flushed here, and on real
-		hardware it will have to be.
+	/*	The instruction cache is flushed by the R_SPARC_JMP_SLOT case itself,
+		per entry, rather than once over the table here -- which is what the
+		architecture asks for: "it must issue a FLUSH instruction for each
+		modified doubleword of instructions" (SPARC V9 manual H.1.6, printed
+		p.308). Nothing else in this file writes code.
 
-		R_SPARC_JMP_SLOT writes *instructions*, and UltraSPARC does not keep its
-		instruction cache coherent with stores -- the psABI requires a `flush`
-		after modifying code. QEMU does not punish the omission, so leaving it out
-		would be invisible until the port meets a Blade 150.
+		**Two things this implementation does not do**, both discovered by
+		reading NetBSD's `sys/arch/sparc64/include/elf_support.h`, which is the
+		same job done properly and is BSD-licensed if either is ever needed:
 
-		It is not done here because it is not this file's to do: the same
-		obligation applies to the kernel's own R_SPARC_JMP_SLOT handling, and
-		arch_cpu_sync_icache() is an empty body on this port. One fix, in one
-		place, when there is hardware to prove it against.
+		  - It writes one encoding. NetBSD picks among four by range -- a single
+		    `ba,a` within 8 MB, `sethi`/`jmp` for a 32-bit address, `sethi`/`xor`/
+		    `jmp` for the top 32-bit range, and the `call` form above -- and has a
+		    six-instruction general case beyond them. Ours reports and fails
+		    instead, which cannot happen while Haiku's user address space is under
+		    2 GB and the whole of it is within a `call`'s reach.
+		  - It ignores `r_addend`. A non-zero addend means a PLT index of 32768 or
+		    more, where the entry is a *pointer* to a stub rather than code, and
+		    the fix is arithmetic on that pointer rather than four stores. No
+		    library here has anything like that many entries.
+
+		Both are limits rather than bugs, and both would present as a jump into
+		nothing, so they are worth having written down.
 	 */
 
 	return B_OK;
