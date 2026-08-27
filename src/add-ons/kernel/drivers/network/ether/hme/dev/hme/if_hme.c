@@ -1358,7 +1358,10 @@ hme_intr(void *v)
 	u_int32_t status;
 
 	HME_LOCK(sc);
-	status = HME_SEB_READ_4(sc, HME_SEBI_STAT);
+	/* Haiku: from the fast handler in glue.c, not from the chip. The register
+	 * is read-to-clear and the fast handler had to read it to quiesce the
+	 * interrupt, so reading it again here would return zero. */
+	status = sc->haiku_interrupt_status;
 	CTR1(KTR_HME, "hme_intr: status %#x", (u_int)status);
 
 	if ((status & HME_SEB_STAT_ALL_ERRORS) != 0)

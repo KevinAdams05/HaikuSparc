@@ -140,6 +140,15 @@ struct hme_softc {
 #define	HME_LINK	(1 << 0)	/* link is up */
 #define	HME_PCI		(1 << 1)	/* PCI busses are little-endian */
 
+	/* Haiku: the Global Status Register, read by the fast interrupt handler.
+	 *
+	 * That register is read-to-clear, and reading it is also what deasserts the
+	 * interrupt -- so on a system that services interrupts in a thread, the fast
+	 * handler has to read it and hand the value on. hme_intr() below takes it
+	 * from here rather than from the chip; glue.c puts it here. The same field
+	 * exists in if_mskreg.h under the same name for the same reason. */
+	uint32_t	haiku_interrupt_status;
+
 	int		sc_ifflags;
 	int		sc_csum_features;
 
