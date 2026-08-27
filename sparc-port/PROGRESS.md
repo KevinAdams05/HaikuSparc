@@ -4598,8 +4598,32 @@ says `2000766us` — three microseconds apart, with no system call in the second
 part of `hellosig`, so a commpage clock that stops being read from userspace fails a test rather than
 going unnoticed for another year.
 
-`libnetwork` is still the outstanding one of these, and still the first thing a real image build would
-surface.
+### And `libnetwork`, which now compiles
+
+The other one, fixed in the same session and for a smaller reason than expected. Three sites in the
+vendored NetBSD resolver set `net.__n_pad0` under this guard:
+
+```c
+#if (defined(__sparc__) && defined(_LP64)) || \
+    defined(__alpha__) || \
+    (defined(__i386__) && defined(_LP64)) || \
+    (defined(__sh__) && defined(_LP64))
+```
+
+which is true on exactly one Haiku architecture — this one. x86_64 defines `__x86_64__` rather than
+`__i386__`, and nothing else in the tree is alpha or sh. So the whole library had never compiled here,
+and nowhere else had reason to notice.
+
+`__n_pad0` is a NetBSD ABI artifact: their `struct netent` carries explicit padding on those
+platforms, Haiku's does not have the member, and does not need it — two pointers, an `int` and an
+`in_addr_t` pack without a hole on LP64. The assignment is meaningless here rather than missing, so
+the guard now excludes `__HAIKU__`, which is how the rest of that vendored tree marks the same kind of
+divergence.
+
+288 KB, 296 exported functions, `socket()` and `getaddrinfo()` among them. **It has not been run.**
+`hellonet` reaches the stack through `_kern_socket()` and friends deliberately — to keep an untested
+library out from between a test and the thing it tests — and that reasoning did not change just
+because the library started linking. What will exercise it is a real image build.
 
 ### Where that leaves the port
 
@@ -4607,5 +4631,5 @@ Four userland tests, all passing: `usertest` (freestanding), `hellodyn` (dynamic
 `hellonet` (a ping), `hellosig` (an interrupted call). Phases 0 through 7 done.
 
 Still untested: `winfixup`'s fill side, and context id recycling, which needs 8191 simultaneously live
-teams to reach. Still open: `libnetwork`, and a real Haiku image — which is the gate on Phase 8 and
-the largest piece of work that does not need hardware.
+teams to reach. Still open: a real Haiku image — the gate on Phase 8, the largest piece of work that
+does not need hardware, and now the thing that will run `libnetwork` for the first time.
