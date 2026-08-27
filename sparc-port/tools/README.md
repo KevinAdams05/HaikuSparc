@@ -2,6 +2,48 @@
 
 Development harness for the SPARC port. Everything here is ours; nothing upstream depends on it.
 
+**Start with `boot-test.sh`.** Everything below it is a piece that script drives, and the pieces are
+documented because a run that goes wrong is diagnosed at their level.
+
+## `boot-test.sh`
+
+The whole loop in one command: build the media from the current tree, boot it headless, drive the
+console, and leave a log worth grepping.
+
+```sh
+./boot-test.sh plain                      # kernel and add-ons only
+./boot-test.sh user --user-test           # + the freestanding userland
+./boot-test.sh dyn  --dynamic-test        # + runtime_loader, libroot, hellodyn
+./boot-test.sh net  --net-test            # + the network stack and hellonet
+./boot-test.sh sig  --sig-test            # + hellosig
+BOOT_SETTLE=200 ./boot-test.sh slow --user-test    # capture longer past the last step
+```
+
+Anything after the tag goes to `make-bfs-image.sh`. It leaves, in `$BOOT_TEST_WORK` (default
+`/tmp/haiku-sparc-boot`):
+
+| | |
+| --- | --- |
+| `TAG.log` | the serial console, with the escape sequences OpenBIOS emits |
+| `TAG.txt` | the same, stripped — **this is the one to grep** |
+| `TAG.pcap` | every frame the NIC saw, in and out |
+| `qemu-TAG.log` | QEMU's own stderr, which is where a write-lock clash appears |
+| `mon-TAG.sock` | the monitor, live while the guest is |
+| `loader-TAG.img`, `bfs-TAG.img` | the media, kept for post-mortems |
+
+It prints a one-line summary — panics, winfixups, lines, and whether any frames were captured — and
+kills a previous guest that is still holding the disk images rather than failing with a write-lock
+error in a log nobody reads.
+
+**The monitor socket is the reason to use this rather than `qemu-sun4u.sh` directly.** A kernel that
+wedges prints nothing at all, and `info registers` on the still-running guest is the only way to find
+out where it stopped. It has found an interrupt storm (PC moving, PIL pinned at 15) and a silent park
+loop (PC not moving at all, at trap level 2) that no amount of log reading would have.
+
+The settle at the end is a plain `sleep` rather than a match on an expected line, deliberately: the
+runs worth having this for are the ones that stop saying anything, and waiting for output that will
+never come reports a timeout instead of a log.
+
 ## `qemu-sun4u.sh`
 
 Launches QEMU's `sun4u` machine, which is modelled on the Sun Ultra 5/10 — one of our two target
@@ -14,13 +56,21 @@ machines. Serial is the only console, so its output *is* the debugging channel.
 ./qemu-sun4u.sh --kernel haiku_loader.openfirmware --timeout 0
 ./qemu-sun4u.sh --gdb --timeout 0                 # freeze at reset, wait for gdb
 ./qemu-sun4u.sh --log boot.log                    # tee serial to a file
+./qemu-sun4u.sh --pcap frames.pcap --disk ...     # every frame, in and out
 ```
+
+`--pcap` costs nothing when the machine is idle and is the only evidence about the wire that the
+guest cannot be wrong about. It is what proved `hme` transmits: a well-formed ARP request in the
+capture, before any program could read a reply.
 
 `--timeout` defaults to 60 seconds so an unattended run can never hang a script; a timeout
 expiry exits 0 because that is the normal end of a scripted boot, not a failure. Use
 `--timeout 0` for interactive sessions. `ctrl-a x` quits, `ctrl-a c` reaches the QEMU monitor.
 
 ### The recipe that actually boots
+
+`boot-test.sh` does all of this. It is spelled out here because when a run goes wrong, it goes wrong
+at one of these steps, and the script's own output will not say which.
 
 ```sh
 ./make-boot-disk.sh --output loader.img          # the loader, on ext2 + a Sun label
@@ -41,6 +91,12 @@ index 1.
 minutes produced no further output — and a real ISO 9660 image in the CD-ROM rather than a
 zero-filled file makes no difference, so this is the ATAPI path itself and not the media. Any two
 files will do for the spare slots. That bug is still open.
+
+**Attach a floppy as well**, which `boot-test.sh` does for you. Without one the loader gets as far as
+enumerating all four disks, looks for a partition map on each, and then stops — no menu, no error, no
+further output. With a zero-filled 1.44 MB image on `-fda` it boots. The floppy is never read; what
+matters is that the firmware has a node to answer for. It is a separate trap from the four slots and
+it presents identically, which is as nothing at all.
 
 **Close QEMU's stdin when the console is on a socket**, which `--serial` now does for you. With
 `-nographic` and an explicit `-serial`, the *monitor* lands on stdio, and a monitor that reads EOF
@@ -108,6 +164,12 @@ settings file.
 ./make-bfs-image.sh --output bfs.img --serial-debug     # see the warning below
 ```
 
+It also carries the kernel modules the network stack needs — `stack`, `ethernet_frame`, `arp`,
+`devices/ethernet`, `ipv4`, `icmp`, `udp` — because a missing one presents as a socket call failing
+rather than as anything about a module. `udp` in particular: without it
+`socket(AF_INET, SOCK_DGRAM)` returns *Protocol wrong type for socket*, and that socket is only
+there to carry the interface ioctls.
+
 Needs two host tools built first, and will tell you so if they are missing:
 
 ```sh
@@ -129,6 +191,31 @@ Endianness is not a problem here, though it looks like it should be: the host to
 little-endian volume, Haiku's BFS is built `BFS_LITTLE_ENDIAN_ONLY`, and the big-endian SPARC
 loader byte-swaps on read.
 
+### The four userlands
+
+Each of these installs one program where the launch daemon goes, so the kernel's own boot path runs
+it. They are ordered by how much they put between themselves and the thing they test.
+
+| Option | Program | Tests | Says |
+| --- | --- | --- | --- |
+| `--user-test` | `usertest/usertest.S` | the kernel alone — freestanding, no libroot, no loader | `usertest deep`, `winok`, `sig`, `ok` |
+| `--dynamic-test` | `hellodyn/hellodyn.c` | the loader, relocations, libroot's stdio | `hellodyn ok, argc 1` |
+| `--net-test` | `hellonet/hellonet.c` | the network stack, `hme`, and the wire | `hellonet ok` |
+| `--sig-test` | `hellosig/hellosig.c` | a system call interrupted by a signal, and resumed | `hellosig ok` |
+
+The last three are built and linked identically — against the real `runtime_loader`, `libroot.so` and
+`libgcc_s.so.1`, all installed on the volume — so there is one recipe in the script rather than one
+per program. `--net-test` and `--sig-test` are `--dynamic-test` with a different program.
+
+All four report through `_kern_debug_output()` rather than `printf()`, and the reason is worth knowing
+before wondering why a program that clearly works prints nothing: they run as the launch daemon, which
+the kernel starts before there is anything on the other end of file descriptor one.
+
+`hellonet` reaches the stack through `_kern_socket()` and friends rather than through `libnetwork`,
+deliberately — the point is to test the stack, and a library between the two would be a second
+untested thing. `hellosig` reads the clock through `_kern_system_time()` *and* `system_time()` and
+compares them, which is how the commpage clock returning zero was found.
+
 ### `--user-test`, and where it installs
 
 Builds `usertest/usertest.S` with the cross compiler and puts it on the volume **twice** — as
@@ -149,17 +236,24 @@ names. Installed where the loader goes, the same binary is entered by exactly th
 loader will use. The program file still has to exist for team creation to get that far, hence both
 copies.
 
-A successful run prints two lines on the same serial console as the kernel:
+A successful run prints four lines on the same serial console as the kernel, and the order is the
+test:
 
 ```
+usertest deep
+usertest winok
 usertest sig
 usertest ok
 ```
 
-`sig` comes from a `SIGUSR1` handler the program registered and sent itself, `ok` from after the
-handler returned — so the order is the test. Silence after the boot's last kernel message means the
-window machinery or the ELF entry failed; `sig` with no `ok` means delivery worked and the return
-did not.
+`deep` comes after a 300-deep recursion that crosses stack pages, `winok` after six windows are
+stamped, driven through 64 system calls, and read back intact, `sig` from a `SIGUSR1` handler the
+program registered and sent itself, `ok` from after the handler returned.
+
+Where it stops is the diagnosis. Silence before `deep` means the ELF entry or the spill path failed.
+`deep` with no `winok` means the register window machinery loses a live window across a trap — which
+is how three trap-entry bugs were found, none of them reachable by a shallower test. `sig` with no
+`ok` means delivery worked and the return did not.
 
 ## `make-sun-image.py`
 

@@ -551,10 +551,20 @@ See [PROGRESS §51](PROGRESS.md), which also corrects §46.
 
 `winfixup` is done and runs six times a boot, one per 8 KB of stack the test recurses across.
 
-**Still owed from this phase:** syscall restart, which is implemented but needs a signal arriving while
-a thread is blocked in an interruptible call — now *testable*, because arranging that needs a userland
-and there is one; the fill side of `winfixup`, which the spill side's fix should cover and nothing has
-exercised; and context id recycling, which needs 8191 simultaneously live teams to reach.
+**Syscall restart is done too, and testing it was not a formality.** It had been implemented since
+this phase and never once run, because arranging the situation needs a userland: a thread has to be
+*blocked* in an interruptible call when a signal arrives. The first test found three bugs — the
+restart read the wrong call's saved state, `%o7` was never restored on the way out, and the flag
+saying "this call is running for the second time" was being erased by the timer before the call could
+read it. See [PROGRESS §54](PROGRESS.md).
+
+That test also found `system_time()` returning zero from userspace, which it had done for the whole
+life of the port: `TICK.NPT` was never cleared, so the cycle counter was privileged, and libroot
+shipped a placeholder that counted its own calls.
+
+**Still owed from this phase:** the fill side of `winfixup`, which the spill side's fix should cover
+and nothing has exercised; and context id recycling, which needs 8191 simultaneously live teams to
+reach.
 
 **The design for the rest of it is written down separately**, in
 [USERSPACE_DESIGN.md](USERSPACE_DESIGN.md), because it is the one subsystem where the reasoning is
