@@ -329,12 +329,32 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 	// Warm it with what the firmware has mapped. These are the translations
 	// the kernel inherits, and the ones it must be able to service itself once
 	// it stops being able to fall back on the firmware.
+	/*	Each of these says what it wanted, because the caller cannot.
+	 *
+	 *	The status returned here becomes arch_vm_translation_map_init()'s, and by
+	 *	the time anything reports it the specific cause is gone -- what reaches a
+	 *	log is that the VM failed to initialise, which is true of a great many
+	 *	things. These three are the port's whole dependency on the firmware
+	 *	describing its own mappings, and the first machine to describe them
+	 *	differently will be a real one, reachable only over a serial cable. A
+	 *	name in the message is the difference between an afternoon and a week.
+	 *
+	 *	The sibling walk in sparc_dump_openfirmware_translations() reads the same
+	 *	three and has always reported them; this path was written later and did
+	 *	not.
+	 */
 	int mmuInstance;
-	if (of_getprop(gChosen, "mmu", &mmuInstance, sizeof(int)) == OF_FAILED)
+	if (of_getprop(gChosen, "mmu", &mmuInstance, sizeof(int)) == OF_FAILED) {
+		dprintf("sparc_mmu: /chosen has no \"mmu\" property; cannot inherit "
+			"the firmware's translations\n");
 		return B_ERROR;
+	}
 	intptr_t mmu = of_instance_to_package(mmuInstance);
-	if (mmu == OF_FAILED)
+	if (mmu == OF_FAILED) {
+		dprintf("sparc_mmu: the \"mmu\" instance does not resolve to a "
+			"package\n");
 		return B_ERROR;
+	}
 
 	struct translation {
 		void*		virtual_address;
@@ -344,8 +364,11 @@ sparc_mmu_init_tsb(struct kernel_args *args)
 
 	int length = of_getprop(mmu, "translations", &translations,
 		sizeof(translations));
-	if (length == OF_FAILED)
+	if (length == OF_FAILED) {
+		dprintf("sparc_mmu: the mmu package has no \"translations\" "
+			"property\n");
 		return B_ERROR;
+	}
 	length /= sizeof(struct translation);
 
 	uint32 inserted = 0;
