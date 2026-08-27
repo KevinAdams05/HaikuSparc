@@ -4570,11 +4570,36 @@ was supposed to end. 2.012 seconds means the deadline survived the trip through 
 
 ### One thing found and not fixed
 
-**`system_time()` returns zero from userspace.** libroot's version reads the commpage, and the first
-run of this test reported a two-second wait as having taken `0us`. The test now reads the clock
-through `_kern_system_time()` instead, which is the syscall behind the commpage. The commpage side is
-its own bug and worth chasing separately — it is the second thing this port has found that a real
-image build would have surfaced, after `libnetwork`.
+**`system_time()` returned zero from userspace** — and was fixed the same session, so this section is
+where it is recorded rather than a note for later.
+
+The file said what it was: *"XXX: this is a hack / remove me when platform code works"*, around an
+incrementing static multiplied by a conversion factor that nothing ever set, because the call that
+would have set it was commented out. Zero, to every program that asked, for the whole life of the
+port. Nothing had noticed because nothing running on this port had yet measured an interval.
+
+Three small pieces were missing:
+
+  - **The kernel never cleared `TICK.NPT`.** Bit 63 of `%TICK` is not part of the count — "if set, an
+    attempt by non-privileged software to read the TICK register causes a `privileged_action` trap",
+    and it "is set ... after both a Power-On-Reset (POR) and an Externally Initiated Reset (XIR)"
+    (UltraSPARC-IIi manual TABLE 14-1, printed p.186). The register is privileged until something
+    clears it, which is why a userspace implementation was not possible before. Read-modify-write,
+    because bits 62:0 are the counter and writing zero to them would restart time.
+  - **`arch_rtc_init()` published nothing.** It does now, and it could not have done so much earlier:
+    `main.cpp` runs `timer_init()` before `rtc_init()`, and the frequency comes from Open Firmware in
+    the first of those. The factor is `10^6 * 2^32 / frequency` — 42949672 on the 100 MHz part QEMU
+    models — scaled that way because the arithmetic on the far side is `(ticks * factor) >> 32`, split
+    in half so a 64-bit counter times a 32-bit factor cannot overflow.
+  - **libroot counted its own calls** instead of reading `%TICK`.
+
+Measured against the syscall over the same two-second wait: the kernel says `2000769us` and libroot
+says `2000766us` — three microseconds apart, with no system call in the second. That comparison is now
+part of `hellosig`, so a commpage clock that stops being read from userspace fails a test rather than
+going unnoticed for another year.
+
+`libnetwork` is still the outstanding one of these, and still the first thing a real image build would
+surface.
 
 ### Where that leaves the port
 
@@ -4582,5 +4607,5 @@ Four userland tests, all passing: `usertest` (freestanding), `hellodyn` (dynamic
 `hellonet` (a ping), `hellosig` (an interrupted call). Phases 0 through 7 done.
 
 Still untested: `winfixup`'s fill side, and context id recycling, which needs 8191 simultaneously live
-teams to reach. Still open: the commpage clock, `libnetwork`, and a real Haiku image — which is the
-gate on Phase 8 and the largest piece of work that does not need hardware.
+teams to reach. Still open: `libnetwork`, and a real Haiku image — which is the gate on Phase 8 and
+the largest piece of work that does not need hardware.

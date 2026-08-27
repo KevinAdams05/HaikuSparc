@@ -816,11 +816,10 @@ reasoning behind the order is in [PROGRESS §52](PROGRESS.md) and what came of i
 1. ~~Give the port a `flush`~~ — **done.** `arch_cpu_sync_icache()` and both memory barriers are
    implemented, and both relocators call the first after writing a PLT entry.
 2. ~~Answer a ping~~ — **done**, and Phase 7 with it.
-3. **Clear the CMD646's interrupt latch**, in a chip-specific ATA bus driver beside
-   `silicon_image_3112`. Fully specified by the datasheet on disk — see Phase 7 above. The hme work
-   is the worked example of what such a driver is for, and of how much the datasheet decides.
-4. **Test syscall restart**, which Phase 6 implemented and nothing has exercised. A userland program
-   that blocks in an interruptible call and takes a signal is now something this port can run.
+3. ~~Clear the CMD646's interrupt latch~~ — **done**, in `busses/ata/cmd646`. The defect it was
+   written for turned out not to exist; the driver is right for silicon anyway. See
+   [PROGRESS §54](PROGRESS.md).
+4. ~~Test syscall restart~~ — **done**, and it found three bugs, plus a fourth in the commpage clock.
 5. **Build a real Haiku image.** Everything so far runs from a volume assembled by hand, with one
    test program where the launch daemon belongs. That is the gate on Phase 8 and on every userland
    question after it — `libnetwork` does not compile for this architecture yet, which is the first
@@ -829,9 +828,10 @@ reasoning behind the order is in [PROGRESS §52](PROGRESS.md) and what came of i
    appears at a sensible price. Order a null-modem serial cable and USB-serial adapter alongside.
 7. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
 
-Items 6–7 gate nothing before Phase 9. Phases 0 through 7 are now complete, which means the next
-thing that blocks is hardware: Phase 8 needs a monitor and a keyboard, and the ALi M5229 in the
-Blade 150 is not emulated at all.
+Items 6–7 gate nothing before Phase 9. Phases 0 through 7 are complete, which means the next thing
+that blocks is hardware: Phase 8 needs a monitor and a keyboard, and the ALi M5229 in the Blade 150
+is not emulated at all. Item 5 is the largest piece of work that does not, and `libnetwork` — which
+does not compile for this architecture — is the first thing it will run into.
 
 ---
 
