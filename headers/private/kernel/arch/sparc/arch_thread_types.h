@@ -117,6 +117,34 @@ struct arch_thread {
 	// used to track interrupts on this thread
 	struct iframe_stack	iframes;
 
+	/*	An interrupted system call's restart state, carried across a signal.
+	 *
+	 *	Restarting one means going back to its `ta` with its first argument in
+	 *	%o0, and iframe holds both -- but the frame that reaches the trap return
+	 *	after a handler has run is `_kern_restore_signal_frame`'s, not the
+	 *	interrupted call's, and its copies describe the wrong system call. Taking
+	 *	them from there sends the thread into the middle of the commpage
+	 *	trampoline with a signal frame pointer in %o0.
+	 *
+	 *	They cannot be recomputed on the far side, either. The trap return could
+	 *	step %tpc back one instruction, which is what x86 does, but a `ta` in a
+	 *	delay slot has a %tnpc that is not %tpc + 4 and the pair is then not
+	 *	recoverable from the advanced values -- which is why sparc_syscall()
+	 *	copies them rather than computing them.
+	 *
+	 *	So they are kept here, per thread, between the signal frame being built
+	 *	and being restored.
+	 *
+	 *	**One interrupted call at a time**, which is the limit of this. A handler
+	 *	that itself makes a restartable call and is itself interrupted would
+	 *	overwrite these before the outer restore reads them. Haiku carries its own
+	 *	restart state in the signal frame precisely to avoid that, and this cannot
+	 *	join it there without a second field the generic structure does not have.
+	 */
+	uint64	signalSyscallTpc;
+	uint64	signalSyscallTnpc;
+	uint64	signalSyscallArg0;
+
 	// See sparc_window_save. Aligned so a slot never straddles a cache line.
 	struct sparc_window_save	windowSave __attribute__((aligned(16)));
 };

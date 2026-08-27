@@ -1551,9 +1551,21 @@ sparc_winfixup:
 	 *	has already touched rather than of a page the fill would have to fault on.
 	 *	A fault in a fill is winfixup, and winfixup does not exist yet.
 	 *
-	 *	%o7 is still never restored: it is the trapped window's return address,
-	 *	which the `restore` brings back correctly on its own, and nothing on this
-	 *	path has a reason to change it.
+	 *	%o7 as well, and it is the one that took a signal test to find. It is the
+	 *	trapped window's return address, which the `restore` below brings back on
+	 *	its own -- so reloading it is a no-op for every trap whose frame nobody
+	 *	edited, which is all of them but one.
+	 *
+	 *	The exception is _kern_restore_signal_frame(). It puts a whole *different*
+	 *	context into this frame, one that was interrupted somewhere else entirely,
+	 *	and its return address is part of that context. Leaving %o7 alone meant
+	 *	resuming the interrupted code with the *trampoline's* return address, so
+	 *	the restarted call returned into the commpage and the trampoline called
+	 *	_kern_restore_signal_frame() a second time, on a signal frame that was no
+	 *	longer there.
+	 *
+	 *	This comment previously said "nothing on this path has a reason to change
+	 *	it", which was true of every path that existed when it was written.
 	 */
 	ldx	[%l7 + IFRAME_TSTATE], %l5
 	andcc	%l5, TSTATE_PRIV, %g0
@@ -1561,6 +1573,7 @@ sparc_winfixup:
 	 nop
 	ldx	[%l7 + IFRAME_OUT + (0 * 8)], %i0
 	ldx	[%l7 + IFRAME_OUT + (6 * 8)], %i6
+	ldx	[%l7 + IFRAME_OUT + (7 * 8)], %i7
 6:
 
 	/* Reload the trap state from the frame rather than from this window's

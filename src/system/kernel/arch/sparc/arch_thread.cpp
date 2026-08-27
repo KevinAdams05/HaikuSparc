@@ -270,7 +270,23 @@ sparc_kernel_exit(struct iframe* frame)
 	 */
 	disable_interrupts();
 
-	atomic_and(&thread->flags, ~(int32)THREAD_FLAGS_SYSCALL_RESTARTED);
+	/*	And only for a system call's own return.
+	 *
+	 *	The flag says "this call is running for the second time", and the call is
+	 *	what has to see it -- some of them care, and `acquire_sem_etc` is one:
+	 *	syscall_restart_handle_timeout_pre() reads it to decide whether to take
+	 *	the deadline it stored on the first attempt or to convert the caller's
+	 *	relative timeout afresh.
+	 *
+	 *	This used to clear it on *every* return to userspace, which meant any trap
+	 *	at all between the restart and the re-executed `ta` erased it. The timer
+	 *	fires about every millisecond, so in practice one always did: the call
+	 *	restarted correctly and then waited its full two seconds over again,
+	 *	having been told it was a first attempt. x86 clears it in its post-syscall
+	 *	path for the same reason.
+	 */
+	if (frame->tt == TRAP_SYSCALL)
+		atomic_and(&thread->flags, ~(int32)THREAD_FLAGS_SYSCALL_RESTARTED);
 
 	if ((thread->flags & (THREAD_FLAGS_SIGNALS_PENDING
 			| THREAD_FLAGS_DEBUG_THREAD
@@ -510,6 +526,14 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
 
 	signalFrameData->syscall_restart_return_value = frame->out[0];
 
+	/*	And the state a restart of the interrupted call will need, which the
+		frame reaching the trap return after the handler will not have. See
+		arch_thread::signalSyscallTpc.
+	 */
+	thread->arch_info.signalSyscallTpc = frame->syscallTpc;
+	thread->arch_info.signalSyscallTnpc = frame->syscallTnpc;
+	thread->arch_info.signalSyscallArg0 = frame->syscallArg0;
+
 	signal_get_user_stack((addr_t)frame->out[6] + SPARC_STACK_BIAS,
 		&signalFrameData->context.uc_stack);
 
@@ -608,6 +632,20 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
 	frame->tpc = registers.pc;
 	frame->tnpc = registers.npc;
 	frame->y = registers.y;
+
+	/*	The interrupted call's restart state, put back where the trap return
+		looks for it.
+
+		This frame belongs to _kern_restore_signal_frame(), so its own copies
+		describe that call rather than the one the signal interrupted -- and the
+		generic code restores THREAD_FLAGS_RESTART_SYSCALL just before calling
+		this, so the trap return is about to act on them. Without this the thread
+		resumes in the middle of the commpage trampoline with a signal frame
+		pointer where the first argument belongs.
+	 */
+	frame->syscallTpc = thread->arch_info.signalSyscallTpc;
+	frame->syscallTnpc = thread->arch_info.signalSyscallTnpc;
+	frame->syscallArg0 = thread->arch_info.signalSyscallArg0;
 
 	// Only the condition codes go back, and only into the field they came from.
 	// A handler that scribbled on the rest of the context must not be able to
