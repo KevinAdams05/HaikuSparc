@@ -567,7 +567,7 @@ window spills cannot store to the user stack from a spill handler at all, becaus
 at TL>0 and §2.6's watchdog reset is what follows; they have to land in a per-thread kernel save area
 and be copied out at TL=0.
 
-### Phase 7 — Device stack  **[IN PROGRESS]**
+### Phase 7 — Device stack  **[DONE]**
 
 PCI bus manager over sabre and simba, with Open Firmware providing config-space access and the
 device tree. The sabre IOMMU for DVMA — the second software-managed TSB from §4.1. ATA on
@@ -608,10 +608,25 @@ What actually stood between DMA and working was a byte swap applied twice — se
 [PROGRESS §31](PROGRESS.md), which also corrects the mechanism this plan previously attributed the
 first DMA attempt's memory corruption to.
 
-`hme` attaches, finds its station address in the machine's IDPROM, and negotiates 100baseTX-FDX. **No
-packet has moved through it yet** — the other half of this phase's exit criterion is the whole of what
-remains, and it is now unblocked: assigning an address to an interface needs a userland, and Phase 6
-finished producing one.
+**And it answers.** `hme` finds its station address in the machine's IDPROM, negotiates 100baseTX-FDX,
+and moves packets in both directions. A userland program brings the interface up and pings, and the
+host's own capture of the wire — which is the one piece of evidence the guest cannot be wrong about —
+shows the whole exchange:
+
+```
+ARP Request who-has 10.0.2.2 tell 10.0.2.15
+ARP Reply 10.0.2.2 is-at 52:55:0a:00:02:02
+10.0.2.15 > 10.0.2.2: ICMP echo request, id 18497, seq 1
+10.0.2.2 > 10.0.2.15: ICMP echo reply,   id 18497, seq 1
+```
+
+with the reply delivered to the program that asked for it. That is the second half of the exit
+criterion, and it needed Phase 6 first: assigning an address to an interface needs a userland.
+
+The driver had never been asked to transmit before, and the first frame it received panicked the
+kernel — see [PROGRESS §53](PROGRESS.md) for the three faults stacked behind that, of which the
+interesting one is that reading this chip's status register is what *deasserts* its interrupt, so a
+system servicing interrupts in a thread has to read it in the fast handler and hand the value on.
 
 One deliberate omission stands: the CMD646's own interrupt latch is never cleared, costing one
 unhandled interrupt per transfer. It is a chip-specific register and belongs in a chip-specific bus
@@ -793,30 +808,30 @@ Branching follows the existing convention: never push to `main` directly; releas
 
 ## 10. Immediate next actions
 
-Phases 0 through 6 are done. What follows closes Phase 7. The detailed staging, and the reasoning
-behind the order, is in [PROGRESS §52](PROGRESS.md).
+Phases 0 through **7** are done — the machine boots, runs a dynamically linked program, mounts BFS
+from a real disk and answers on the network. What follows is what the next session picks up; the
+reasoning behind the order is in [PROGRESS §52](PROGRESS.md) and what came of it in
+[§53](PROGRESS.md).
 
-1. **Give the port a `flush`.** `arch_cpu_sync_icache()` and both memory barriers are empty bodies,
-   and §5.5 named them as the standing example of what QEMU will never punish. The obligation is now
-   concrete rather than theoretical: `R_SPARC_JMP_SLOT` writes *instructions* into a PLT entry, in
-   both the runtime loader and the kernel's own ELF loader, and UltraSPARC does not keep its
-   instruction cache coherent with stores. Implement the three, then call `sync_icache` from both
-   relocators.
-2. **Answer a ping**, which is the rest of Phase 7's exit criterion and is now unblocked — assigning
-   an address to an interface needs a userland, and there is one. Staged so that each step is
-   observable: capture every frame to a pcap first, then the missing protocol modules, then interface
-   configuration from a small userland program, then ARP, then ICMP. Expect big-endian bugs; this is
-   the first time Haiku's network stack has run on a big-endian machine.
+1. ~~Give the port a `flush`~~ — **done.** `arch_cpu_sync_icache()` and both memory barriers are
+   implemented, and both relocators call the first after writing a PLT entry.
+2. ~~Answer a ping~~ — **done**, and Phase 7 with it.
 3. **Clear the CMD646's interrupt latch**, in a chip-specific ATA bus driver beside
-   `silicon_image_3112`. Fully specified by the datasheet on disk — see Phase 7 above.
+   `silicon_image_3112`. Fully specified by the datasheet on disk — see Phase 7 above. The hme work
+   is the worked example of what such a driver is for, and of how much the datasheet decides.
 4. **Test syscall restart**, which Phase 6 implemented and nothing has exercised. A userland program
    that blocks in an interruptible call and takes a signal is now something this port can run.
-5. **Source a Sun Blade 150** — *in parallel, blocking nothing* (see §5.5). An Ultra 10 when one
+5. **Build a real Haiku image.** Everything so far runs from a volume assembled by hand, with one
+   test program where the launch daemon belongs. That is the gate on Phase 8 and on every userland
+   question after it — `libnetwork` does not compile for this architecture yet, which is the first
+   thing a real image would have found. It wants a session to itself.
+6. **Source a Sun Blade 150** — *in parallel, blocking nothing* (see §5.5). An Ultra 10 when one
    appears at a sensible price. Order a null-modem serial cable and USB-serial adapter alongside.
-6. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
+7. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
 
-Items 5–6 gate nothing before Phase 9, and item 1 is the one that most wants hardware to prove it —
-which is the argument for writing it now and having it already in place when a machine arrives.
+Items 6–7 gate nothing before Phase 9. Phases 0 through 7 are now complete, which means the next
+thing that blocks is hardware: Phase 8 needs a monitor and a keyboard, and the ALi M5229 in the
+Blade 150 is not emulated at all.
 
 ---
 

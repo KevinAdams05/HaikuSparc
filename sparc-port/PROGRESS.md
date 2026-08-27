@@ -4351,3 +4351,131 @@ a session to itself rather than as the tail of one.
 
 **Hardware-only work.** The ALi M5229, the framebuffer path on a real monitor, USB HID for the Blade
 150's keyboard. All of Phase 8, and the reason §5.5 says to buy early regardless.
+
+
+## 53. A packet, both ways
+
+Phase 7 is finished. The machine answers on the network:
+
+```
+ARP Request who-has 10.0.2.2 tell 10.0.2.15
+ARP Reply 10.0.2.2 is-at 52:55:0a:00:02:02
+10.0.2.15 > 10.0.2.2: ICMP echo request, id 18497, seq 1
+10.0.2.2 > 10.0.2.15: ICMP echo reply,   id 18497, seq 1
+```
+
+read out of a capture the *host* took, and with the reply delivered to the program that asked for
+it. `id 18497` is `0x4841`, which is what the test program stamps into its echo request, so those
+four lines are one exchange rather than four plausible ones.
+
+§52 planned this in six stages and it took all six, plus three faults nobody had planned for.
+
+### The flush, which is the part that cannot be tested
+
+`arch_cpu_sync_icache()` and both memory barriers are implemented. The manual settled two details
+that recall had wrong:
+
+  - `FLUSH` "operates on at least the doubleword containing the addressed location", and bit 2 of the
+    address is ignored for exactly that reason (SPARC V9 A.20, printed p.167). One per modified
+    doubleword, not one per range (H.1.6, printed p.308).
+  - `MEMBAR #StoreStore` comes first, and the guarantee is specific: "When a MEMBAR #StoreStore,
+    FLUSH sequence is performed, UltraSPARC-IIi guarantees that earlier code modifications will be
+    visible across the whole system" (14.4.4, printed p.196).
+  - And `FLUSH`'s address is translated by the D-MMU, so it can take a fault of its own -- worth
+    knowing before calling it on an address the caller has not written to.
+
+The two barriers are a weaker case honestly stated. Both are empty of work in TSO, which is the model
+this port runs in because nothing here writes `PSTATE.MM`, and the manual's own worked example says
+so in as many words: `#StoreStore` is "needed in PSO, RMO", `#LoadLoad | #LoadStore` is "needed in
+RMO" (CODE EXAMPLE 8-1, printed p.71). They are written out anyway, because "correct because of a
+mode nothing establishes" is a shape this port has paid for before.
+
+**Erratum 51** came out of the same reading and is worth more than the code it constrains: a MEMBAR
+in the delay slot of a control transfer can deadlock the processor, and it is "only a performance
+loss, except when pstate.ie==0 ... (for instance, in trap handlers)" — where it hangs (Appendix K.2,
+printed p.476). No assembly in this port has a membar at all, so nothing is wrong today. It is
+recorded next to the barriers for whoever writes the next handler by hand.
+
+None of it can be exercised on QEMU, which invalidates its translations on any store. It is written
+from the manual against the day this port meets a Blade 150.
+
+### The test loop, which had been living in a scratch directory
+
+§5.4 has asked since the plan was written for one script that takes a source tree to a serial log. It
+existed, as an ad-hoc wrapper in a session-scoped directory, and that directory evaporated between
+two sessions. `sparc-port/tools/boot-test.sh` is the same thing where it belongs.
+
+Rebuilding it cost a boot to rediscover something that had never been written down: **a floppy is not
+optional.** Without one the loader enumerates all four IDE disks, looks for a partition map on each,
+and then stops — no menu, no error, no further output. With a zero-filled 1.44 MB image attached it
+boots. The floppy is never read. It is a separate trap from the four-IDE-slots one already documented
+in `qemu-sun4u.sh`, and it presents identically, which is as nothing at all.
+
+### Three faults between a link and a ping
+
+| | what happened | what it was |
+| --- | --- | --- |
+| 1 | `socket(AF_INET, SOCK_DGRAM)` returned Protocol wrong type for socket | no `udp` module on the volume. The image carried `stack`, `ethernet_frame` and `devices/ethernet`; it now also carries `arp`, `ipv4`, `icmp` and `udp` |
+| 2 | the first frame ever received panicked the kernel | `NO_HAIKU_CHECK_DISABLE_INTERRUPTS()`, whose body is `panic("should never be called.")` |
+| 3 | implementing that as "mask and claim" hung the machine silently | masking does not deassert the interrupt on this part |
+
+The second is the one worth keeping. A driver that hands `bus_setup_intr()` a handler and no filter
+gets `intr_wrapper` installed as its real interrupt handler, and that wrapper asks the driver, at
+interrupt time, whether the interrupt is ours and to quieten the chip before it wakes the thread.
+`hme` declared it did not need to be asked. It had been attaching cleanly for weeks, because nothing
+had ever made it raise an interrupt.
+
+The third is the one worth understanding. The Global Status Register is documented `R-AC` — "all the
+bits are automatically cleared to 0 when the Status Register is read by the software" (PCIO manual
+TABLE 6-9, printed p.81) — and on this part **reading it is also what deasserts the interrupt**. The
+Global Interrupt Mask decides which events raise the pin, not whether an already-latched one keeps it
+raised. So masking left the interrupt asserted, the machine took it again immediately, and the boot
+ended with a processor pinned at PIL 15 in the interrupt entry path: no panic, no output, and the
+thread that would have serviced it starved by the interrupt it was waiting for.
+
+Which means the fast handler has to read the register, and `hme_intr()` cannot — by the time the
+thread runs it is empty. The value goes through the softc, which is a two-line change to the donor
+and is the same one `marvell_yukon` carries, under the same field name, for a chip with the same
+property. Recorded in THIRD_PARTY.md.
+
+The status the storm was made of, once it could be printed, was `0x03010000`: `HOSTTOTX`, `TXALL`,
+`RXTOHOST`. Our packet went out, theirs came in. Nothing was wrong with the chip at any point.
+
+### What the capture was for
+
+Every one of those three was diagnosed from something other than the driver's own opinion of itself —
+the panic from a stack trace, the storm from `info registers` on a still-running guest, the status
+bits from a bounded print. But the thing that made the *result* trustworthy was the pcap, and it is
+worth being precise about why: at the point where the program still could not read its reply, the
+capture already showed the full exchange. That located the remaining bug in the last ten feet — a
+`_kern_recvfrom()` that validates its address and length arguments rather than treating a null pair
+as "do not tell me" — rather than anywhere in the stack, the driver, or the wire.
+
+`qemu-sun4u.sh --pcap` costs nothing when the machine is idle and is the only evidence about the wire
+that the guest cannot be wrong about.
+
+### One thing found and not fixed
+
+**`libnetwork` does not build for this architecture.** Its vendored NetBSD resolver sets a `__n_pad0`
+member that Haiku's own `struct netent` does not have, in `getnetent.c` and `getnetnamadr.c`. The
+test program sidesteps it by calling `_kern_socket()` and friends directly — which it wanted to do
+anyway, to keep an untested library out from between itself and the stack — but every real userland
+program will need the library, and it is the first thing a real image build would have hit.
+
+### Where that leaves the port
+
+| Phase | | |
+| --- | --- | --- |
+| 0–6 | done | |
+| 7 Device stack | **done** | mounts BFS from a real disk; answers on the network |
+| 8 Desktop | not started | needs hardware |
+| 9 Hardware validation | blocked | no machine yet |
+
+Still carried, and still untested: syscall restart, `winfixup`'s fill side, context id recycling.
+Still deliberately omitted: the CMD646's interrupt latch, which the datasheet on disk specifies
+exactly and which the hme work is now the worked example for.
+
+**The next thing that blocks is hardware.** Phase 8 needs a monitor and a keyboard, and the Blade
+150's ALi M5229 is not emulated at all. The largest piece of work that does not need hardware is a
+real Haiku image — everything so far runs from a volume this port assembles by hand, with one test
+program where the launch daemon belongs.
