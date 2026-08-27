@@ -4485,3 +4485,102 @@ exactly and which the hme work is now the worked example for.
 150's ALi M5229 is not emulated at all. The largest piece of work that does not need hardware is a
 real Haiku image — everything so far runs from a volume this port assembles by hand, with one test
 program where the launch daemon belongs.
+
+
+## 54. A defect that was not one, and three that were
+
+Two items off the list from §53, and between them a good illustration of why the port keeps a log:
+one of them turned out not to exist, and the other turned out to be three.
+
+### The CMD646's interrupt latch
+
+`src/add-ons/kernel/busses/ata/cmd646/` is the chip-specific bus driver §31 asked for. It is a
+forwarding shim to the same shared code `generic_ide_pci` reaches, scoring 1.0 against this exact
+device where the generic driver scores 0.3, and differing from it in one function.
+
+The registers are as the datasheet describes and §31 had one detail backwards. The primary channel's
+status is CFR bit 2 at configuration offset `0x50`, the secondary's is ARTTIM23 bit 4 at `0x57`, and
+both are cleared by being **read** — "Read CFR will clear this bit", and the same sentence for
+ARTTIM23. Linux's `pata_cmd64x` says so twice in comments and does exactly that. §31 recorded them as
+"written back to clear".
+
+**And the defect it was written for does not exist.** §31 said the unclearable latch held the PCI line
+asserted, so the sabre re-delivered once and every transfer cost an extra interrupt that returned
+`B_UNHANDLED_INTERRUPT`. Counted per channel:
+
+```
+ch0 0/90 unhandled, ch1 90/102 unhandled
+```
+
+Every interrupt on the *active* channel is handled. The unhandled ones are all on the idle channel,
+whose handler is registered on the same vector — both channels are multiplexed onto INTA — and which
+correctly reports that the interrupt was not its own. Reading the latch changes that ratio not at all,
+which is how it was ruled out. There was no extra interrupt per transfer; there was one extra handler
+*invocation* per interrupt, which is what sharing a vector between two channel handlers looks like.
+
+The driver stays anyway, and the reason is §5.5's rather than any measurement here. QEMU's
+`cmd646-ide` sets CFR bit 2 and does not implement read-to-clear — two consecutive reads from an
+interrupt handler return `0x4` and `0x4` — so nothing about it can be verified in emulation and on the
+emulator the read is inert. The datasheet documents the latch, Linux clears it, and the failure mode
+on silicon that implements it is an interrupt that will not go away.
+
+### Syscall restart, which had never once run
+
+The other item was "test syscall restart", implemented in Phase 6 and never exercised. Testing it
+needs a userland, because the situation is a thread *blocked* in an interruptible call when a signal
+arrives — which needs a signal that comes on its own schedule rather than one the program raises
+against itself. `tools/hellosig` arranges it: a SIGALRM handler with `SA_RESTART`, an alarm half a
+second out, and a two-second wait on a semaphore nobody will release.
+
+Three bugs, stacked so each was invisible until the one before it was fixed.
+
+| | | |
+| --- | --- | --- |
+| 1 | resumed at `commpage+0x248` with a signal frame pointer in `%o0` | the restart read the wrong call's state |
+| 2 | the restarted call returned into the trampoline, which called `_kern_restore_signal_frame` again | `%o7` was never restored |
+| 3 | the call resumed and then waited its full two seconds *again* | `THREAD_FLAGS_SYSCALL_RESTARTED` was erased before it could be read |
+
+**The wrong call's state.** A restart goes back to the `ta` with the caller's first argument in `%o0`,
+and `iframe` keeps both — but the frame reaching the trap return after a handler has run belongs to
+`_kern_restore_signal_frame()`, not to the call that was interrupted. They are now carried across the
+signal in `arch_thread`. They cannot be recomputed on the far side either: x86 steps its instruction
+pointer back by the length of `syscall`, and a `ta` in a delay slot has a `%tnpc` that is not
+`%tpc + 4` — which is exactly why `sparc_syscall()` copies the pair rather than computing it.
+
+**`%o7`.** The comment saying it is never restored gave a reason, and the reason was sound when it was
+written: the `restore` brings it back correctly on its own, and "nothing on this path has a reason to
+change it". `_kern_restore_signal_frame()` is that reason. It puts a whole *different* context into
+the frame, interrupted somewhere else entirely, and a return address is part of a context.
+
+**The flag.** `THREAD_FLAGS_SYSCALL_RESTARTED` means "this call is running for the second time", and
+the call is what has to see it — `acquire_sem_etc()` reads it through
+`syscall_restart_handle_timeout_pre()` to decide whether to take the deadline it stored on the first
+attempt or convert the caller's relative timeout afresh. It was being cleared on *every* return to
+userspace, so the timer interrupt — about one a millisecond — always erased it in the gap between the
+restart and the re-executed `ta`. It is now cleared on a system call's own return, where x86 clears it.
+
+The number is the assertion, not the status:
+
+```
+hellosig: handler ran 1 time(s), wait returned Operation timed out after 2012435us
+```
+
+`Interrupted` would have meant no restart. 2.5 seconds would have meant a restart that forgot when it
+was supposed to end. 2.012 seconds means the deadline survived the trip through the handler.
+
+### One thing found and not fixed
+
+**`system_time()` returns zero from userspace.** libroot's version reads the commpage, and the first
+run of this test reported a two-second wait as having taken `0us`. The test now reads the clock
+through `_kern_system_time()` instead, which is the syscall behind the commpage. The commpage side is
+its own bug and worth chasing separately — it is the second thing this port has found that a real
+image build would have surfaced, after `libnetwork`.
+
+### Where that leaves the port
+
+Four userland tests, all passing: `usertest` (freestanding), `hellodyn` (dynamically linked),
+`hellonet` (a ping), `hellosig` (an interrupted call). Phases 0 through 7 done.
+
+Still untested: `winfixup`'s fill side, and context id recycling, which needs 8191 simultaneously live
+teams to reach. Still open: the commpage clock, `libnetwork`, and a real Haiku image — which is the
+gate on Phase 8 and the largest piece of work that does not need hardware.
