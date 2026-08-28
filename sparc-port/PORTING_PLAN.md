@@ -819,9 +819,9 @@ Branching follows the existing convention: never push to `main` directly; releas
 ## 10. Immediate next actions
 
 Phases 0 through **7** are done — the machine boots, runs a dynamically linked program, mounts BFS
-from a real disk and answers on the network. What follows is what the next session picks up; the
-reasoning behind the order is in [PROGRESS §52](PROGRESS.md) and what came of it in
-[§53](PROGRESS.md).
+from a real disk and answers on the network. What follows is what the next session picks up, ordered
+so that the day a machine arrives is productive rather than exploratory. The reasoning is in
+[PROGRESS §55](PROGRESS.md).
 
 1. ~~Give the port a `flush`~~ — **done.** `arch_cpu_sync_icache()` and both memory barriers are
    implemented, and both relocators call the first after writing a PLT entry.
@@ -830,18 +830,28 @@ reasoning behind the order is in [PROGRESS §52](PROGRESS.md) and what came of i
    written for turned out not to exist; the driver is right for silicon anyway. See
    [PROGRESS §54](PROGRESS.md).
 4. ~~Test syscall restart~~ — **done**, and it found three bugs, plus a fourth in the commpage clock.
-5. **Build a real Haiku image.** Everything so far runs from a volume assembled by hand, with one
-   test program where the launch daemon belongs. That is the gate on Phase 8 and on every userland
-   question after it — `libnetwork` does not compile for this architecture yet, which is the first
-   thing a real image would have found. It wants a session to itself.
-6. **Source a Sun Blade 150** — *in parallel, blocking nothing* (see §5.5). An Ultra 10 when one
-   appears at a sensible price. Order a null-modem serial cable and USB-serial adapter alongside.
-7. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
+5. **Get hardware-ready, which is now the priority.** The remaining items are small and each one
+   converts a silent failure on real silicon into a diagnosable one:
+   **(a)** fix `--serial-debug`, documented broken since §15 — serial is the *only* channel on an
+   Ultra 10, and the settings-file route to it currently kills the loader;
+   **(b)** a first-boot checklist, much cheaper than it looks now that the device tree is dumped on
+   every boot already.
+   The categories QEMU cannot punish are otherwise closed — instruction cache, barriers, TLB/TSB
+   locking, Erratum 51, and firmware failures that name what they wanted. See
+   [PROGRESS §55](PROGRESS.md).
+6. **Source a machine, and read [the note on §8 of the matrix](HARDWARE_MATRIX.md#8-sourcing-recommendation)
+   first.** That recommendation predates `hme` and the CMD646 driver existing, and the Blade 150's ALi
+   M5229 still has neither driver nor emulator. The day-one experience is no longer the one it
+   describes.
+7. **A real Haiku image — after hardware, not before.** It builds 4786 targets and fails 37, of which
+   24 were Zydis (fixed) and 13 are a `gcc_syslibs` version mismatch that blocks only the Installer,
+   the HTTP kit, printing and one MIME tool. It gates Phase 8, which needs hardware regardless, and
+   for a first boot on silicon the hand-assembled test volume is the better thing to carry anyway.
+8. **Resolve the open verification items** in the matrix's §9 as soon as hardware is on the bench.
 
-Items 6–7 gate nothing before Phase 9. Phases 0 through 7 are complete, which means the next thing
-that blocks is hardware: Phase 8 needs a monitor and a keyboard, and the ALi M5229 in the Blade 150
-is not emulated at all. Item 5 is the largest piece of work that does not, and `libnetwork` — which
-does not compile for this architecture — is the first thing it will run into.
+Phases 0 through 7 are complete and the next thing that blocks is hardware, so the order above is
+what makes the day a machine arrives productive rather than exploratory. Phase 8 needs a monitor and
+a keyboard regardless.
 
 ---
 

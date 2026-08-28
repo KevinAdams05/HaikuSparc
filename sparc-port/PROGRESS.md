@@ -4633,3 +4633,116 @@ Four userland tests, all passing: `usertest` (freestanding), `hellodyn` (dynamic
 Still untested: `winfixup`'s fill side, and context id recycling, which needs 8191 simultaneously live
 teams to reach. Still open: a real Haiku image — the gate on Phase 8, the largest piece of work that
 does not need hardware, and now the thing that will run `libnetwork` for the first time.
+
+
+## 55. How far the image actually gets, and an audit that found less than expected
+
+Two things this session: a measurement of the real image build, and a pass over every Open Firmware
+dependency asking what a first boot on real hardware would print. The second was prompted by a
+question worth recording — *are we chasing a tangent, when the goal is to be ready the day a machine
+arrives?* — and the answer was partly yes.
+
+### The image builds almost completely
+
+`jam @minimum-raw`: **4786 targets built, 37 failed**, 353 skipped as dependents. `libbe.so` (5.1 MB),
+`app_server` (2.2 MB), `registrar` and `launch_daemon` all compile for SPARC already. The plan calls a
+real image "a substantial piece of work in its own right"; it is two specific blockers.
+
+**Zydis had no SPARC arm — 24 of the 37.** Its architecture switch knows x86, aarch64, arm, wasm,
+loongarch, ppc64, ppc and riscv64, and falls through to `#error "Unsupported architecture detected"`.
+Added in the ppc64/ppc shape, and listed the 64-bit define in the two places it is consumed — both
+`#if <is 64-bit>` choosing a direct path over a fallback that computes the same answer more slowly.
+That is the entire commitment of naming an architecture there.
+
+**The other 13 are a toolchain mismatch, and the pin cannot be bumped.**
+
+| | |
+| --- | --- |
+| cross compiler | GCC **13.3.0** |
+| `gcc_syslibs` headers | **8.3.0**, from 2019 |
+
+`__remove_cv` became a compiler built-in in GCC 13, and libstdc++ 8.3 uses it as an identifier. Two
+lines reproduce it with no Haiku involved.
+
+Bumping the pin was the obvious fix and does not work. The download URL is not
+`baseUrl/<file>` but **`baseUrl/<checksum>/packages/<file>`, where the checksum hashes the entire
+package list** — so changing one pin changes the snapshot identity. Against the current snapshot
+`9d923b1a…`:
+
+```
+gcc_syslibs-8.3.0_2019_05_24-2-sparc.hpkg    HTTP 200
+gcc_syslibs-13.2.0_2023_08_10-2-sparc.hpkg   HTTP 404
+```
+
+No newer sparc build is published, and editing the pin would request a directory that does not exist
+at all. Upstream's own sparc repository still pins 8.3.0 while riscv64 moved to 13.2.0, which is what
+an unmaintained architecture looks like.
+
+The cheap workaround was also tested and does not work: pinning `-std` changes nothing, 7 errors at
+gnu++11, gnu++14 and gnu++17 alike. The alias is unconditional, not a C++17 code path.
+
+**But it blocks nothing that matters yet.** The 13 targets are `apps/installer/WorkerThread.o`,
+`bin/setmime.o`, six files of `kits/network/libnetservices2` (the HTTP kit) and five of
+`libs/print/libprint`. The Installer, an HTTP client, a MIME utility and printing — none on the path
+to booting. When it does bite, the options are to build `gcc_syslibs` 13.x for sparc through the
+bootstrap profile, or to live without those four things.
+
+### The image is on-plan, and not what "hardware ready" needs
+
+It is item 5 in the plan's §10, so not a tangent in the off-plan sense. But it exists to serve Phase 8,
+which needs hardware anyway — and for a first boot on real silicon the hand-assembled test volume is
+*better*: smaller, faster to rebuild, and each test aimed at one thing. It does not shorten the
+hardware path at all.
+
+### The firmware audit, which found one gap
+
+Every Open Firmware dependency in the kernel and drivers — 19 distinct properties across
+`arch_platform`, `arch_mmu`, `arch_int`, `arch_timer`, the sabre driver and `hme` — checked against a
+single question: if this fails on a real Ultra 10, what does the serial cable show?
+
+Nearly all of them already answer:
+
+| | |
+| --- | --- |
+| `arch_timer` | panics naming `clock-frequency`, "system_time() would stand still" |
+| sabre | reports a missing `ranges` by name |
+| `arch_int` | "no host bridge to take interrupts from; devices will have to poll" |
+| `hme` | walks four places for a station address and says so when all four fail |
+| `arch_mmu` (reporting path) | names all three of its properties distinctly |
+
+**One gap, now fixed.** `sparc_mmu_init_tsb()` reads the `mmu` instance, its package and
+`translations` to inherit the loader's mappings, and returned `B_ERROR` for all three in silence. That
+status becomes the VM's, so what reached a log was that the VM failed to initialise — true of a great
+many things. The sibling walk 200 lines above reads the same three and has always reported them; this
+path was written later and did not.
+
+**And a better find: the device tree is already dumped on every boot** — node names, device types, PCI
+vendor:device ids, `reg`, `interrupts`, and full `interrupt-map`/`interrupt-map-mask` cell values. That
+is the Phase 9 deliverable, "record `show-devs`, `banner` and `.properties` the day they arrive",
+happening automatically in the same log as everything else.
+
+That was nearly reported as the opposite. A first grep said the dump never runs — but `/tmp` had been
+cleared between sessions and the file being grepped did not exist. Booting and looking corrected it,
+which is the same lesson as [§54](#54-a-defect-that-was-not-one-and-three-that-were): a measurement
+against nothing is not a measurement.
+
+### Where hardware readiness actually stands
+
+Better than the plan implies. The categories QEMU cannot punish are closed:
+
+| | |
+| --- | --- |
+| instruction cache flush, memory barriers | written from the manual, §54 |
+| TLB/TSB locking | done — handlers, table, trap data block and the TSB are all in locked entries |
+| Erratum 51 (membar in a delay slot) | documented; no assembly in the port violates it |
+| firmware failures | diagnosable, as of this section |
+| device tree capture | automatic |
+
+Left: `--serial-debug`, which is documented broken and matters because serial is the *only* channel on
+hardware; and a first-boot checklist, which just became much cheaper.
+
+**The sourcing recommendation needs revisiting before money is spent.** The matrix says buy a Blade 150
+first, on reasoning that was correct when written and included the words "`hme` ... does not exist
+yet". It does now, and so does a CMD646 driver, while the Blade 150's ALi M5229 still has neither a
+driver nor an emulator. Video and networking do not get a machine to a filesystem. See the note added
+to [HARDWARE_MATRIX §8](HARDWARE_MATRIX.md#8-sourcing-recommendation).

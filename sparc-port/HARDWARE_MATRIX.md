@@ -274,6 +274,31 @@ which makes an `hme` driver the single highest-leverage network driver in the wh
 though it does not exist yet. Its ebus keyboard path differs from the Blade's USB path, so
 between the two machines both console input designs get exercised.
 
+### The ranking's inputs changed — revisit before buying
+
+**This recommendation was made before Phase 7, and two of the facts under it have moved.** It is
+left standing rather than rewritten, because the case for the Blade 150 — video and network already
+claimed by device id, fastest, most memory, most available in working condition — is untouched. What
+changed is the *first day*:
+
+| | then | now |
+| --- | --- | --- |
+| `hme` (Ultra 10 NIC) | "does not exist yet" | **written, and moves packets** — ARP and ICMP both ways, verified from a host-side capture |
+| CMD646 IDE (Ultra 10) | driven by `generic_ide_pci` | plus a chip-specific driver for its interrupt latch |
+| ALi M5229 IDE (Blade 150) | "a conventional PC-style part" | **still has no driver, and QEMU does not emulate it** |
+
+So the Ultra 10's whole storage and network path is now written and exercised, and the Blade 150's
+storage path is not. Video and networking do not get a machine to a filesystem; IDE does.
+
+That argues for taking the **Ultra 10 first** — everything it needs to mount a disk and answer a ping
+exists today, and it is the machine the emulator models, so a failure on it is attributable to
+hardware-versus-QEMU rather than to a driver nobody has ever run. The Blade 150 then follows as the
+machine that exercises the ALi southbridge, the USB keyboard path, and the `ati` framebuffer.
+
+The counter-argument is availability and condition, which no amount of driver work changes. **Buy
+whichever appears first in good order**; the point of this note is that the day-one experience is no
+longer the one the paragraphs above describe.
+
 **What not to buy.** Ultra 1/2 (SBus — every driver from scratch, no PCI). Ultra 30/60/80 (SCSI
 plus UPA framebuffers, neither supported). Anything Blade 1000 and up (a different CPU
 generation with its own errata, no QEMU model, SCSI, and unsupported graphics). None of these
