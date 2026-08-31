@@ -139,13 +139,11 @@ Usage: make-bfs-image.sh [options]
                   restarted rather than failed.
   --serial-debug  write a kernel settings file enabling serial_debug_output, so
                   the kernel's early output goes to serial rather than the
-                  framebuffer blue screen where nothing can read it.
-                  CURRENTLY BROKEN, and off by default: merely having the file
-                  present makes the loader die before the kernel, with a
-                  mem_address_not_aligned trap on a "call %g1" in
-                  of_finddevice, meaning gCallOpenFirmware itself has been
-                  corrupted. Reading driver settings damages loader state
-                  somehow -- see PROGRESS.md section 15.
+                  framebuffer blue screen where nothing can read it. This is the
+                  route that matters on real hardware, where serial is the only
+                  channel there is.
+                  Off by default only because the boot menu reaches the same
+                  place without a file on the volume; both work.
   -h, --help
 EOF
 }
@@ -447,10 +445,21 @@ if [[ "$serial_debug" == "1" ]]; then
 	# (src/system/boot/loader/load_driver_settings.cpp). Without
 	# serial_debug_output the kernel's early output -- including any panic --
 	# goes to the framebuffer blue screen instead of the serial console.
+	#
+	# `serial_debug_output` and nothing else. This file used to also set
+	# `debug_screen true`, which is what made the option unusable: that flag
+	# makes every dprintf() call blue_screen_puts() as well, so all kernel
+	# output goes through the framebuffer console -- and that hangs this port
+	# during PCI initialisation, at the point the bus manager maps I/O space,
+	# every time. Bisected: serial_debug_output alone boots to userland
+	# normally; debug_screen alone hangs at "sabre: buses 0 to 2".
+	#
+	# It was also working against the purpose of the option, which is to get
+	# output *off* the screen and onto the serial line. The framebuffer console
+	# is Phase 8's subject and the hang is recorded for it.
 	settings="$work/kernel-settings"
 	cat > "$settings" <<-'SETTINGS'
 	serial_debug_output true
-	debug_screen true
 	SETTINGS
 	volume_mkdir_p home/config/settings/kernel/drivers
 	shell_command cp -f ":$settings" \
