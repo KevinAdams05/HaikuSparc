@@ -11,14 +11,26 @@ kernel architecture layer is stubs. This repository is the work of closing that 
 | | |
 | --- | --- |
 | **[Porting plan](sparc-port/PORTING_PLAN.md)** | Current state of the port, the four hard problems, the phased plan with exit criteria, licensing policy, and upstream-sync strategy. |
-| **[Hardware support matrix](sparc-port/HARDWARE_MATRIX.md)** | Every 64-bit Sun workstation mapped onto its silicon, against what Haiku already has drivers for. Drives the hardware sourcing decision. |
+| **[Hardware support matrix](sparc-port/HARDWARE_MATRIX.md)** | Every 64-bit Sun workstation mapped onto its silicon, against what Haiku already has drivers for. Drives the hardware sourcing decision — and §8 carries a note on how that decision changed once `hme` and the CMD646 driver existed. |
+| **[First boot on hardware](sparc-port/FIRST_BOOT.md)** | **Read this before powering on a machine.** The serial console has a condition attached that will otherwise give a silent kernel, and there are two `setenv` lines to type before anything else. |
+| **[Progress log](sparc-port/PROGRESS.md)** | Every experiment, failed approach and correction, in order. Long, and the place to look when something does not make sense. |
+| **[Upstream delta](sparc-port/UPSTREAM_DELTA.md)** | Every change to shared, cross-architecture Haiku files — the entire merge-conflict surface, one row each. |
 
 ## Status
 
-**The kernel boots from a real disk, mounts BFS, and runs userland programs.** A freestanding SPARC
-binary loaded by the kernel's own ELF loader runs unprivileged, nests register windows across the
-privilege boundary, makes real system calls into `libroot`'s stubs, receives a signal it sent
-itself, and exits cleanly. Phases 0 through 6 are complete and Phase 7 is most of the way there.
+**Phases 0 through 7 are complete, and the next thing that blocks the project is owning a machine.**
+
+The kernel boots from a real disk, mounts BFS over DMA, runs dynamically linked programs against the
+real `runtime_loader` and `libroot`, and answers on the network — ARP both ways, an ICMP echo request
+out and the reply delivered to the program that asked for it, read out of a capture the *host* took
+rather than from the driver's own opinion.
+
+Four userland tests exist and pass, each installed where the launch daemon goes and ordered by how
+much it puts between itself and the thing it tests: a freestanding assembly rig for the kernel alone,
+a dynamically linked program for the loader and `libroot`, one that brings up the interface and pings,
+and one that gets a system call interrupted by a signal and checks it resumes with its deadline
+intact. `boot-test.sh TAG --user-test|--dynamic-test|--net-test|--sig-test` runs any of them from a
+clean tree in one command.
 
 The whole chain works. The loader boots from Sun-disklabelled media; the kernel takes the MMU and
 trap table over from Open Firmware, builds its own three-level page table, brings up the slab
@@ -43,22 +55,69 @@ inference from the boot getting further:
 
 KDL works: `sc` prints a symbolised backtrace and `threads` prints the thread table.
 
-What is left in Phase 7 is `winfixup` — a fault taken *during* a register-window spill or fill, the
-one case the window machinery does not yet survive — and an `hme` driver for the Ultra 10's onboard
-Ethernet, which is the other half of the phase's exit criterion and would validate DMA and
-interrupts on a second device. Phase 8 is graphics, and needs hardware.
+### What is left, and why it waits
 
-Around forty genuine bugs have been found and fixed along the way, a good many of them
+**Hardware.** Phase 8 is graphics and input, and the plan has always said it gets validated on real
+silicon rather than in the emulator: QEMU's sun4u graphics "work during firmware and early boot but
+fail when an OS switches into graphics mode". So does everything else outstanding — netboot, which
+fails under OpenBIOS and should work under real OpenBoot; confirming the CMD646's read-to-clear
+interrupt latch, which QEMU does not model; and the Blade 150's ALi M5229 IDE controller, which has
+neither driver nor emulator.
+
+Everything that *could* be done from the manuals ahead of a machine has been. The instruction-cache
+flush and memory barriers are written; the TLB/TSB locking the manual requires and an emulator
+forgives is in place for the trap handlers, the trap table, the trap data block and the TSB;
+Erratum 51 is documented and unviolated; every Open Firmware property the kernel reads now names
+itself when missing; the device tree is dumped on every boot, which is the day-one capture the plan
+asks for, automatically.
+
+**A real Haiku image, deliberately behind hardware.** `jam @minimum-raw` builds 4786 targets and fails
+37 — `libbe.so`, `app_server`, `registrar` and `launch_daemon` all compile. Of the 37, 24 were Zydis
+not knowing about SPARC (fixed) and 13 are a `gcc_syslibs` version mismatch that **cannot** be fixed
+by bumping the package pin, and which blocks only the Installer, the HTTP kit, printing and one MIME
+utility. None of that is on the path to booting, and for a first boot on silicon the hand-assembled
+test volume is the better thing to carry: smaller, faster to rebuild, one thing per test.
+
+Somewhere over fifty genuine bugs have been found and fixed along the way, a good many of them
 architecture-neutral. Two are still carried by the PowerPC Open Firmware port. One, `PAGE_SHIFT`,
 had been quietly corrupting physical memory for as long as the port existed. Several were not merely
 untested but unreachable — Haiku's kernel never enters a program directly, and nothing on this port
 called the trap-return hook that delivers signals, so an entire subsystem had been written, verified
 by disassembly, and could not have run.
 
-The running log is [PROGRESS.md](sparc-port/PROGRESS.md) — read it first on resume; it carries every
-experiment, every failed approach and why. Design documents:
+The running log is [PROGRESS.md](sparc-port/PROGRESS.md) — read the last two or three sections first
+on resume, not the whole thing; it carries every experiment, every failed approach and why, and it is
+long. §10 of the plan says what to do next in one place. Design documents:
 [PHASE2_MMU_DESIGN.md](sparc-port/PHASE2_MMU_DESIGN.md) for the MMU and trap table,
 [USERSPACE_DESIGN.md](sparc-port/USERSPACE_DESIGN.md) for the privilege boundary.
+
+## Resuming after a break
+
+Everything needed to get back to a booting kernel in one command is in the tree; nothing lives in a
+scratch directory any more.
+
+```sh
+cd generated.sparc
+../../buildtools/jam/bin.linuxx86/jam -q -j8 kernel_sparc     # jam is not on PATH
+cd ..
+./sparc-port/tools/boot-test.sh check --user-test              # expect: usertest deep/winok/sig/ok
+```
+
+Then read **[§10 of the plan](sparc-port/PORTING_PLAN.md#10-immediate-next-actions)** for what is
+next, and the last two or three sections of the progress log for how the previous session ended.
+
+**What will have gone stale, and is expected to:**
+
+- **The work directory.** `boot-test.sh` writes to `/tmp/haiku-sparc-boot`, which `/tmp` cleaning
+  removes. It recreates itself; only old logs are lost. Set `BOOT_TEST_WORK` to keep them.
+- **Numbers in the documents.** Target counts, failure counts and package versions were measured on
+  the date beside them. Re-measure rather than quote — that is a habit the log has had to learn
+  twice, most recently in §54 and §55.
+- **`jam` does not rebuild on a Jamfile change.** Remove the target first, or a stale object will be
+  linked without a word about it.
+- **Hardware availability.** The matrix's sourcing advice is about silicon, not about what is for sale
+  in any given month, and §8 now carries a note on how the ranking changed once `hme` and the CMD646
+  driver existed.
 
 ## Scope
 
