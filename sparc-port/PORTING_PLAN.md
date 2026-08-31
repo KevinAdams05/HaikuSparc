@@ -7,7 +7,8 @@ work is in [PROGRESS.md](PROGRESS.md), not here. Supersedes the scratch notes in
 directory.
 
 **Companion documents:** [Hardware support matrix](HARDWARE_MATRIX.md) ·
-[Phase 2 MMU design](PHASE2_MMU_DESIGN.md) · [Progress log](PROGRESS.md)
+[Phase 2 MMU design](PHASE2_MMU_DESIGN.md) · [First boot on hardware](FIRST_BOOT.md) ·
+[Progress log](PROGRESS.md)
 
 ---
 
@@ -830,15 +831,12 @@ so that the day a machine arrives is productive rather than exploratory. The rea
    written for turned out not to exist; the driver is right for silicon anyway. See
    [PROGRESS §54](PROGRESS.md).
 4. ~~Test syscall restart~~ — **done**, and it found three bugs, plus a fourth in the commpage clock.
-5. **Get hardware-ready, which is now the priority.** The remaining items are small and each one
-   converts a silent failure on real silicon into a diagnosable one:
-   **(a)** fix `--serial-debug`, documented broken since §15 — serial is the *only* channel on an
-   Ultra 10, and the settings-file route to it currently kills the loader;
-   **(b)** a first-boot checklist, much cheaper than it looks now that the device tree is dumped on
-   every boot already.
-   The categories QEMU cannot punish are otherwise closed — instruction cache, barriers, TLB/TSB
-   locking, Erratum 51, and firmware failures that name what they wanted. See
-   [PROGRESS §55](PROGRESS.md).
+5. ~~Get hardware-ready~~ — **done, as far as it can be done without a machine.** `--serial-debug`
+   works (the loader bug had already been fixed by the alignment work; what remained was
+   `debug_screen`, which routes every `dprintf` through the frame buffer console and hangs this port
+   during PCI init). [FIRST_BOOT.md](FIRST_BOOT.md) is the checklist. The categories QEMU cannot
+   punish are closed — instruction cache, barriers, TLB/TSB locking, Erratum 51, and firmware
+   failures that name what they wanted. See [PROGRESS §§55–56](PROGRESS.md).
 6. **Source a machine, and read [the note on §8 of the matrix](HARDWARE_MATRIX.md#8-sourcing-recommendation)
    first.** That recommendation predates `hme` and the CMD646 driver existing, and the Blade 150's ALi
    M5229 still has neither driver nor emulator. The day-one experience is no longer the one it

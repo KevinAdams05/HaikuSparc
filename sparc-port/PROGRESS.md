@@ -4746,3 +4746,95 @@ first, on reasoning that was correct when written and included the words "`hme` 
 yet". It does now, and so does a CMD646 driver, while the Blade 150's ALi M5229 still has neither a
 driver nor an emulator. Video and networking do not get a machine to a filesystem. See the note added
 to [HARDWARE_MATRIX §8](HARDWARE_MATRIX.md#8-sourcing-recommendation).
+
+
+## 56. `--serial-debug`, and the end of what can be done without a machine
+
+The last item on the hardware-readiness list, and it was two bugs stacked with the interesting one
+underneath.
+
+### The documented bug was already fixed
+
+`--serial-debug` has carried a warning since §15: "merely having the file present makes the loader die
+before the kernel, with `mem_address_not_aligned` on a `call %g1` in `of_finddevice`, meaning
+`gCallOpenFirmware` itself has been corrupted."
+
+That was true when written. It is not now — the loader survives and loads the kernel. Nothing was done
+about it deliberately; it is presumably one of the alignment fixes since, most likely
+`kernel_args_malloc()` aligning to a byte unless told otherwise, or the related note that `of_read()`
+stores into the caller's buffer with whatever access width the firmware finds convenient. Reading a
+file off the volume was exactly the path those fixes were about.
+
+**Which is the argument for re-testing a documented failure before chasing it.** The note was fifteen
+months of port-work old and described a machine that no longer exists.
+
+### The remaining bug was not serial output at all
+
+The settings file set two options:
+
+```
+serial_debug_output true
+debug_screen true
+```
+
+Bisected across three boots:
+
+| | |
+| --- | --- |
+| both | hangs at `sabre: buses 0 to 2`, 3090 lines |
+| `serial_debug_output` alone | boots to `usertest ok`, 3440 lines |
+| `debug_screen` alone | hangs at `sabre: buses 0 to 2`, 3090 lines |
+
+`debug_screen` makes every `dprintf()` also call `blue_screen_puts()` — all kernel output through the
+frame buffer console — and this port stops dead during PCI initialisation, at the point the bus
+manager maps I/O space. Same line every time.
+
+It was also working directly against the option's purpose, which is to get output *off* the screen and
+onto the serial line, so it is simply gone. All four userland tests pass with `--serial-debug` now.
+The frame buffer console hang belongs to Phase 8, whose whole subject it is, and is recorded rather
+than chased.
+
+### The route to serial is Open Firmware's stdout, which has a condition attached
+
+Worth writing down because it decides what to do at the `ok` prompt.
+`arch_debug_serial_putchar()` calls `SparcPlatform::SerialDebugPutChar()`, which is an `of_write()` —
+so "serial debug output" on this port means OF's stdout, not a UART this kernel drives. And
+`InitSerialDebug()` **deliberately suppresses it** when the frame buffer is enabled and OF's stdout is
+a display, to avoid writing to a screen Haiku is also drawing on.
+
+So a machine consoled to a monitor gives a silent kernel *by design*. Serial console is not a
+convenience on this port; it is the contract. [FIRST_BOOT.md](FIRST_BOOT.md) leads with two `setenv`
+lines for that reason, rather than relying on the keyboard-absence convention — which is real, and is
+Sun's rather than IEEE 1275's, and costs nothing to make explicit.
+
+### FIRST_BOOT.md
+
+The other outstanding item. A checklist written before there is any hardware, so it is to be corrected
+on contact rather than trusted — but writing it surfaced two things worth having early.
+
+`9600,8,n,1` is cited rather than recalled (Solaria 650 Technical Reference Manual, printed p.110 for
+the NVRAM defaults, p.131 for the terminal). And a dead NVRAM battery — which every one of these
+machines has, soldered — turns out to be survivable: `hme` looks for a station address in four places,
+and real OpenBoot publishes `local-mac-address`, which is consulted before the `idprom` whose checksum
+it verifies. QEMU exercises the idprom path precisely *because* OpenBIOS does not publish the first
+one, so the fallback chain that looked like belt-and-braces under emulation is the part that matters
+on silicon.
+
+### Where the port stands
+
+Phases 0 through 7 done. Hardware readiness done as far as it can be without a machine:
+
+| | |
+| --- | --- |
+| instruction cache flush, memory barriers | written from the manual |
+| TLB/TSB locking | handlers, table, trap data block, TSB |
+| Erratum 51 | documented; no violations |
+| firmware failures | each names what it wanted |
+| device tree capture | automatic, every boot |
+| serial console | works, and the condition on it is documented |
+| first-boot procedure | [FIRST_BOOT.md](FIRST_BOOT.md) |
+
+**The next thing that blocks is a machine.** Everything else on the list either needs one (Phase 8,
+netboot, the CMD646 latch, the ALi M5229) or is deliberately deferred behind it (a real Haiku image,
+which serves Phase 8 and for which the hand-assembled test volume is the better thing to carry on a
+first boot anyway).
